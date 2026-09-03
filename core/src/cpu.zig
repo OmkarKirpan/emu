@@ -359,12 +359,25 @@ pub const Cpu = struct {
 
         // Vector hijacking: the vector address is not decided until the fetch,
         // so an NMI that arrives during an IRQ sequence steals the vector.
+        //
+        // As of M1 this branch is unreachable, exactly like BRK's twin of it:
+        // `step` clears `nmi_pending` before calling us with `.nmi`, and tests
+        // it before ever reaching the `.irq` call, so it cannot be set here.
+        // Interrupts are only dispatched at instruction boundaries. The logic
+        // is written out so it is already correct in M2, when a cycle-stepped
+        // core lets an NMI arrive part-way through this sequence.
         var vector: u16 = if (kind == .nmi) nmi_vector else irq_vector;
         if (self.nmi_pending) {
             vector = nmi_vector;
             self.nmi_pending = false;
         }
 
+        // Deliberate deviation from the reference doc, which claims (in its
+        // interrupt section) that NMI "does not affect" the I flag. That is
+        // wrong for real 65xx silicon: the interrupt sequence sets I for NMI
+        // just as it does for IRQ and BRK, and NES software relies on it --
+        // an NMI handler that does not want to be re-entered by an IRQ would
+        // otherwise have to set I itself. Keep this line.
         self.p.i = true;
         const lo = self.read(vector); // 6
         const hi = self.read(vector + 1); // 7
@@ -678,6 +691,18 @@ pub const Cpu = struct {
                 self.push(@truncate(self.pc));
                 self.pushP(true); // B set — this is a software interrupt
                 var vector: u16 = irq_vector;
+                // M2: this test is in the wrong place, and only harmlessly so
+                // while interrupts are dispatched at instruction boundaries.
+                // The doc puts the hijack window *before* the flags-saving
+                // cycle ("if a hardware interrupt occurs before the fourth
+                // (flags saving) cycle of BRK, the BRK instruction will be
+                // skipped"), i.e. the decision must be latched before the
+                // `pushP` above, not read after it. Today `nmi_pending` cannot
+                // change across those two statements, so the two orderings are
+                // equivalent; once a cycle-stepped core lets an NMI land
+                // mid-instruction, an NMI arriving between `pushP` and here
+                // would hijack when hardware would not. Move the latch above
+                // `pushP` when making `step` cycle-accurate.
                 if (self.nmi_pending) {
                     // NMI hijacks BRK's vector; the pushed B flag is the only
                     // trace left that a BRK ever happened. Note this branch is
@@ -1154,11 +1179,25 @@ pub const Cpu = struct {
             },
 
             // ANE / LXA: genuinely unstable. See `unstable_magic`.
-            0x8B => {
+            0x8B => { // ANE: A = (A | $EE) & X & imm, the doc's usual case.
                 self.a = (self.a | unstable_magic) & self.x & self.fetch();
                 self.setZN(self.a);
             },
-            0xAB => {
+            0xAB => { // LXA
+                // Deliberate deviation from the reference doc. The doc gives
+                // $AB's usual case as "A = X = ANE", i.e. including `& X`
+                // (see its ANE/LXA section: "the most usual operation is to
+                // store ((A | #$ee) & X & #$nn)"), and lists `A = X = A & imm`
+                // as the other observed behavior. We implement
+                // `A = X = (A | $EE) & imm` -- no `& X` -- which is the
+                // convention essentially every NES emulator settles on, and
+                // which sits between the doc's two variants.
+                //
+                // The opcode is unstable on real silicon regardless (the OR
+                // value depends on chip revision, temperature, and what the
+                // video chip left on the bus), no NES software depends on it,
+                // and nestest never executes it. Do not "fix" this back to
+                // match the doc without a test ROM that actually pins it down.
                 self.a = (self.a | unstable_magic) & self.fetch();
                 self.x = self.a;
                 self.setZN(self.a);

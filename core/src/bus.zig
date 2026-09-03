@@ -23,6 +23,17 @@ const Nrom = mapper_mod.Nrom;
 ///     $6000-$7FFF  cartridge PRG-RAM         -- absent on NROM
 ///     $8000-$FFFF  cartridge PRG-ROM         -- `Mapper.prgRead`/`prgWrite`
 ///
+/// **Known interface gap (M7).** `$4020-$7FFF` currently folds into the
+/// open-bus arm. That is correct for NROM, which populates neither cartridge
+/// expansion space nor PRG-RAM — but it is *only* correct for NROM. MMC1 and
+/// MMC3 put battery-backed PRG-RAM at `$6000-$7FFF`, and `Mapper` has no entry
+/// point for it: `prgRead`/`prgWrite` are documented as requiring
+/// `0x8000..=0xFFFF`, so this bus cannot route a `$6000` access to the
+/// cartridge even if a mapper wanted it. Adding that entry point is M7's call
+/// (it decides the shape, and whether save-RAM persistence rides along), not
+/// something to speculate on here. Flagged so the omission reads as known
+/// rather than as an oversight.
+///
 /// **Open-bus convention.** Every region that is not backed by real storage
 /// reads back `open_bus`: the last value the CPU actually drove onto or
 /// latched off the data bus. This is what the hardware does — the bus
