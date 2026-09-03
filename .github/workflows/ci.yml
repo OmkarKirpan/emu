@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: zig build test (native — this is where correctness is checked)
+        working-directory: core
+        run: zig build test --summary all
+      - name: zig build wasm (delivery target — compiles only, no test)
+        working-directory: core
+        run: zig build wasm

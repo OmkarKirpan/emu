@@ -1,0 +1,9 @@
+# Zig
+.zig-cache/
+zig-out/
+
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
