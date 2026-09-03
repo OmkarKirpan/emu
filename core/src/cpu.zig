@@ -649,7 +649,13 @@ pub const Cpu = struct {
                 var vector: u16 = irq_vector;
                 if (self.nmi_pending) {
                     // NMI hijacks BRK's vector; the pushed B flag is the only
-                    // trace left that a BRK ever happened.
+                    // trace left that a BRK ever happened. Note this branch is
+                    // currently only reachable by calling `execute` directly:
+                    // `step` polls at instruction boundaries, so an NMI that is
+                    // already pending gets serviced before BRK is even fetched.
+                    // The logic is here so it is already right when a
+                    // cycle-stepped core (M2, once the PPU can raise NMI
+                    // mid-instruction) makes the case real.
                     vector = nmi_vector;
                     self.nmi_pending = false;
                 }
@@ -1565,6 +1571,128 @@ test "SBX subtracts from A&X into X with CMP-style carry" {
     h.cpu.step();
     try testing.expectEqual(@as(u8, 0x03), h.cpu.x); // ($FF & $08) - 5
     try testing.expect(h.cpu.p.c); // 8 >= 5
+}
+
+// The opcodes below are the ones nestest never executes (its documented test
+// list stops at NOP/LAX/SAX/SBC/DCP/ISB/SLO/RLA/SRE/RRA), so the log diff says
+// nothing about them. These tests are the only coverage they have.
+
+test "ASR ANDs then shifts right, taking carry from the pre-shift bit 0" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x4B, 0x03 }); // ASR #$03
+    h.cpu.a = 0xFF;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x01), h.cpu.a); // ($FF & $03) >> 1
+    try testing.expect(h.cpu.p.c); // bit 0 of $03
+    try testing.expectEqual(@as(u64, 2), h.cpu.cycles);
+}
+
+test "LAS ANDs memory with S into A, X and S alike" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0xBB, 0x10, 0x02 }); // LAS $0210,Y
+    h.cpu.y = 0x01;
+    h.cpu.s = 0x3C;
+    h.bus.wram[0x0211] = 0xF0;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x30), h.cpu.a); // $F0 & $3C
+    try testing.expectEqual(@as(u8, 0x30), h.cpu.x);
+    try testing.expectEqual(@as(u8, 0x30), h.cpu.s);
+}
+
+test "SHY stores Y AND (base high byte + 1)" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x9C, 0x10, 0x02 }); // SHY $0210,X
+    h.cpu.x = 0x01;
+    h.cpu.y = 0xFF;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x03), h.bus.wram[0x0211]); // $FF & ($02+1)
+    try testing.expectEqual(@as(u64, 5), h.cpu.cycles);
+}
+
+test "SHY on a page cross also drops the ANDed value into the address high byte" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x9C, 0xFF, 0x01 }); // SHY $01FF,X
+    h.cpu.x = 0x01; // -> $0200, page crossed
+    h.cpu.y = 0xFF;
+    h.cpu.step();
+    // value = $FF & ($01 + 1) = $02, and the target becomes $0200.
+    try testing.expectEqual(@as(u8, 0x02), h.bus.wram[0x0200]);
+}
+
+test "SHX and SHA use X and A&X respectively" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x9E, 0x10, 0x02 }); // SHX $0210,Y
+    h.cpu.y = 0x01;
+    h.cpu.x = 0xFF;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x03), h.bus.wram[0x0211]);
+
+    h.init(&[_]u8{ 0x9F, 0x10, 0x02 }); // SHA $0210,Y
+    h.cpu.y = 0x01;
+    h.cpu.a = 0xF1;
+    h.cpu.x = 0x0F;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x01), h.bus.wram[0x0211]); // ($F1 & $0F) & $03
+}
+
+test "SHS loads S with A AND X before storing" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x9B, 0x10, 0x02 }); // SHS $0210,Y
+    h.cpu.y = 0x01;
+    h.cpu.a = 0xFF;
+    h.cpu.x = 0x3F;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x3F), h.cpu.s);
+    try testing.expectEqual(@as(u8, 0x03), h.bus.wram[0x0211]); // $3F & ($02+1)
+}
+
+test "ANE and LXA use the documented $EE magic constant" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x8B, 0x0F }); // ANE #$0F
+    h.cpu.a = 0x00;
+    h.cpu.x = 0xFF;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0x0E), h.cpu.a); // (($00|$EE) & $FF) & $0F
+
+    h.init(&[_]u8{ 0xAB, 0xFF }); // LXA #$FF
+    h.cpu.a = 0x01;
+    h.cpu.step();
+    try testing.expectEqual(@as(u8, 0xEF), h.cpu.a); // ($01|$EE) & $FF
+    try testing.expectEqual(@as(u8, 0xEF), h.cpu.x);
+}
+
+test "undocumented NOPs still perform their memory read and pay for page crosses" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x1C, 0xFF, 0x02 }); // NOP $02FF,X
+    h.cpu.x = 0x01; // crosses into $0300
+    const a_before = h.cpu.a;
+    h.cpu.step();
+    try testing.expectEqual(@as(u64, 5), h.cpu.cycles);
+    try testing.expectEqual(a_before, h.cpu.a); // no register or flag effect
+    try testing.expectEqual(@as(u16, 0xC003), h.cpu.pc);
+
+    h.init(&[_]u8{ 0x04, 0x10 }); // NOP $10 (zero page)
+    h.cpu.step();
+    try testing.expectEqual(@as(u64, 3), h.cpu.cycles);
+    try testing.expectEqual(@as(u16, 0xC002), h.cpu.pc);
+}
+
+test "a pending NMI hijacks BRK's vector but the pushed B flag stays set" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x00, 0x00 }); // BRK
+    h.prg[0x7FFA] = 0x00;
+    h.prg[0x7FFB] = 0xE0; // NMI vector -> $E000
+    h.prg[0x7FFE] = 0x00;
+    h.prg[0x7FFF] = 0xD0; // IRQ vector -> $D000
+    h.cpu.setNmiLine(true);
+    h.cpu.nmi_pending = true;
+    // step() would service the NMI first; call execute directly to exercise
+    // the hijack path inside BRK itself.
+    _ = h.cpu.fetch();
+    h.cpu.execute(0x00);
+    try testing.expectEqual(@as(u16, 0xE000), h.cpu.pc);
+    try testing.expectEqual(@as(u8, 0x30), h.bus.wram[0x01FB] & 0x30);
+    try testing.expect(!h.cpu.nmi_pending);
 }
 
 test "JAM halts the CPU without advancing PC" {
