@@ -4,7 +4,7 @@
 
 ### Issue tracker
 
-Linear (workspace: OmkarKirpan, team: Engineering). See [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
+Linear (workspace: OmkarKirpan, team: Engineering, project: [NES Emulator (WebAssembly)](https://linear.app/okirpan/project/nes-emulator-webassembly-ce94d622c29f)). See [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md).
 
 ### Triage labels
 

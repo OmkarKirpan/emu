@@ -4,7 +4,9 @@ Issues for this repo live in Linear.
 
 - **Workspace:** OmkarKirpan (https://linear.app/okirpan)
 - **Team:** Engineering (only team in the workspace — no ambiguity, no per-issue team prompt needed)
+- **Project:** [NES Emulator (WebAssembly)](https://linear.app/okirpan/project/nes-emulator-webassembly-ce94d622c29f) — assign every issue for this effort to it (`save_issue`'s `project` param)
 - **PRs as a request surface:** off (default)
+- **Custom views:** not manageable via this MCP tool (no `save_view`/`create_view` in its surface — Linear views are UI-only here). If a saved filter would help, describe the filter criteria to the user and have them create it in the Linear UI; the project board/timeline above already gives most of what a view would.
 
 ## Wayfinding operations
 
