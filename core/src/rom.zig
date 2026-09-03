@@ -67,11 +67,18 @@ pub const Rom = struct {
     }
 };
 
-pub const MapperError = error{UnsupportedMapper};
+pub const MapperError = error{ UnsupportedMapper, InvalidRomGeometry };
 
 pub fn createMapper(rom: Rom) MapperError!Mapper {
     return switch (rom.header.mapper) {
-        0 => Mapper{ .nrom = Nrom.init(rom.prg_rom, rom.chr_rom) },
+        0 => blk: {
+            // NROM: 16KB or 32KB PRG, and 0 (CHR-RAM) or 8KB CHR-ROM.
+            if (rom.prg_rom.len != 0x4000 and rom.prg_rom.len != 0x8000)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len != 0 and rom.chr_rom.len != 0x2000)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .nrom = Nrom.init(rom.prg_rom, rom.chr_rom) };
+        },
         else => MapperError.UnsupportedMapper,
     };
 }
@@ -161,6 +168,24 @@ test "createMapper returns UnsupportedMapper for anything but mapper 0" {
     buf[6] = 0x10; // mapper number 1 (MMC1) — not implemented until M7
     const rom = try Rom.load(&buf);
     try testing.expectError(MapperError.UnsupportedMapper, createMapper(rom));
+}
+
+test "createMapper rejects a ROM with 0 PRG banks" {
+    const buf = buildMinimalNrom(0, 1);
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a ROM with 3 PRG banks (48KB, neither 16 nor 32KB)" {
+    const buf = buildMinimalNrom(3, 1);
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a ROM with 2 CHR banks (16KB, not 0 or 8KB)" {
+    const buf = buildMinimalNrom(2, 2);
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
 }
 
 test "createMapper wires an NROM ROM's bytes through to the Mapper interface" {
