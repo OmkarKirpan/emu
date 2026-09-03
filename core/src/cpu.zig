@@ -71,11 +71,17 @@ pub const AddrMode = enum {
 };
 
 pub const Op = struct {
-    mnemonic: []const u8,
+    /// Every 6502 mnemonic — official and undocumented alike — is exactly
+    /// three characters, so this is a pointer to a fixed-size array rather
+    /// than a slice. A `[]const u8` would make each of the 256 table entries
+    /// carry a redundant 8-byte length field and, in the wasm build, a
+    /// relocation to go with it. Coerces to `[]const u8` wherever a slice is
+    /// wanted (see `Trace.mnemonic`).
+    mnemonic: *const [3]u8,
     mode: AddrMode,
 };
 
-fn op(mnemonic: []const u8, mode: AddrMode) Op {
+fn op(mnemonic: *const [3]u8, mode: AddrMode) Op {
     return .{ .mnemonic = mnemonic, .mode = mode };
 }
 
@@ -1749,7 +1755,10 @@ test "a mapper-asserted IRQ is seen by the CPU without mapper-specific code" {
 
 test "the decode table covers all 256 opcodes with sane lengths" {
     for (opcodes) |entry| {
-        try testing.expect(entry.mnemonic.len == 3);
+        // `mnemonic`'s type pins the length to 3 at compile time, so all that
+        // is left to check at runtime is that the three bytes are a plausible
+        // mnemonic rather than punctuation or padding.
+        for (entry.mnemonic) |c| try testing.expect(c >= 'A' and c <= 'Z');
         const len = entry.mode.length();
         try testing.expect(len >= 1 and len <= 3);
     }
