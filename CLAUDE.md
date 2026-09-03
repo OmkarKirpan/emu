@@ -16,4 +16,4 @@ Single-context (one `CONTEXT.md` + `docs/adr/` at the repo root, not yet created
 
 ## Planning status
 
-This project is in the wayfinder planning phase — no emulator code yet. Current map: [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear. Read it before writing any code.
+Planning is complete — see [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear for the full decision record. Execution is underway per the milestone roadmap in [Milestone roadmap & build sequencing](https://linear.app/okirpan/issue/ENG-63/milestone-roadmap-and-build-sequencing) (ENG-63): `core/` (Zig) and `web/` (React+TS+Vite) exist; M0 (repo scaffolding & mapper interface) is done.
