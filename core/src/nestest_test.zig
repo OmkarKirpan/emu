@@ -1,9 +1,10 @@
 //! nestest correctness gate for the CPU core.
 //!
-//! nestest (Kevin Horton, 2004) has two documented pass/fail protocols and
-//! this file uses both, because they check different things:
+//! nestest (Kevin Horton, 2004) documents two pass/fail protocols. Only the
+//! first is a real gate here; the second is reduced to a tripwire, for the
+//! measured reason spelled out below.
 //!
-//!  1. **Log diff.** Started in "automation" mode — PC forced to `$C000`, which
+//!  1. **Log diff — the gate.** Started in "automation" mode — PC forced to `$C000`, which
 //!     the ROM's author added specifically so the suite runs without a PPU or
 //!     controllers — nestest executes 8991 instructions in a fixed sequence.
 //!     `nestest.log` is a known-good Nintendulator trace of exactly that run.
@@ -13,12 +14,30 @@
 //!     and wrong dummy-read behavior at the moment they happen, rather than
 //!     thousands of instructions later when control flow finally diverges.
 //!
-//!  2. **Result codes.** The same run writes its verdict to zero page: `$02`
-//!     holds the last failing test's code for the documented opcodes and `$03`
-//!     the same for the undocumented ones (`nestest.txt` lists every code).
-//!     `$00` in both means everything passed. This is an independent check —
-//!     it is possible to match the log for a while and still fail a test — so
-//!     both are asserted.
+//!  2. **Result codes — a tripwire, not a second gate.** nestest also reports
+//!     verdicts in zero page: `$02` holds the last failing test's code for the
+//!     documented opcodes and `$03` the same for the undocumented ones
+//!     (`nestest.txt` lists every code). That protocol is real on hardware,
+//!     but this harness cannot reach it, and treating it as an independent
+//!     check would be self-deception. Two things were measured:
+//!
+//!       * On a *correct* CPU, `$02` and `$03` are never written at all —
+//!         not during the 8991 logged instructions, and not afterwards. The
+//!         log stops at `C66E RTS`, before nestest's epilogue, and with no PPU
+//!         (M2) the ROM then runs off into open bus and JAMs ~95 instructions
+//!         later at `$0068`. `Bus.wram` is zero-initialized, so an
+//!         `expect($02 == $00)` on those bytes is an assertion that *cannot
+//!         fail*, no matter what the CPU did.
+//!
+//!       * `$00` is not even a reliable pass value. With a deliberate BIT
+//!         V-flag bug injected, control flow diverged, the ROM *did* reach a
+//!         store path within the logged run, and wrote `$02 = $00` — the
+//!         "tests completed successfully" code — on a demonstrably broken CPU.
+//!
+//!     So what is asserted below is the only honest thing available: a
+//!     poisoned sentinel in those two bytes must *survive* the run. That is a
+//!     genuine (if weak) tripwire — it fires if a future change lets the ROM
+//!     reach its store path — and nothing more. Protocol (1) is the gate.
 //!
 //! The log's `PPU:` column is deliberately not compared: with no PPU yet
 //! (M2), those numbers are a pure function of the CPU cycle count
@@ -198,6 +217,14 @@ test "nestest automation run matches nestest.log instruction for instruction" {
     cpu.reset();
     cpu.pc = automation_entry;
 
+    // Poison the two result-code bytes. See the file docstring: a correct run
+    // never reaches nestest's store path, so these must still hold their
+    // sentinels at the end. Any other value means control flow diverged.
+    const sentinel_02: u8 = 0xA5;
+    const sentinel_03: u8 = 0x5A;
+    bus.wram[0x02] = sentinel_02;
+    bus.wram[0x03] = sentinel_03;
+
     var lines = std.mem.splitScalar(u8, nestest_log, '\n');
     var instruction: usize = 0;
     while (lines.next()) |raw| {
@@ -247,16 +274,24 @@ test "nestest automation run matches nestest.log instruction for instruction" {
     // the parser changed, not the CPU.
     try testing.expectEqual(@as(usize, 8991), instruction);
 
-    // Protocol 2: zero-page result codes. $02 covers the documented opcodes,
-    // $03 the undocumented ones. See nestest.txt for the failure-code tables.
-    if (bus.wram[0x02] != 0x00 or bus.wram[0x03] != 0x00) {
+    // Protocol 2, as a tripwire only (see the file docstring). Note the sense:
+    // we require the sentinels to be *untouched*. `$00` here would be a
+    // failure, not a pass — nestest writing anything at all means the run took
+    // a path a correct CPU does not take.
+    if (bus.wram[0x02] != sentinel_02 or bus.wram[0x03] != sentinel_03) {
         std.debug.print(
-            "\nnestest result codes: $02 = ${X:0>2}, $03 = ${X:0>2} (both must be $00; see nestest.txt)\n",
-            .{ bus.wram[0x02], bus.wram[0x03] },
-        );
+            \\
+            \\nestest stored a zero-page result code during the logged run.
+            \\  $02 = ${X:0>2} (sentinel ${X:0>2}), $03 = ${X:0>2} (sentinel ${X:0>2})
+            \\A correct CPU never reaches nestest's store path inside these 8991
+            \\instructions, so control flow diverged. nestest.txt lists what each
+            \\code means -- but the log diff above is the authoritative signal,
+            \\and `$00` here is NOT a pass.
+            \\
+        , .{ bus.wram[0x02], sentinel_02, bus.wram[0x03], sentinel_03 });
     }
-    try testing.expectEqual(@as(u8, 0x00), bus.wram[0x02]);
-    try testing.expectEqual(@as(u8, 0x00), bus.wram[0x03]);
+    try testing.expectEqual(sentinel_02, bus.wram[0x02]);
+    try testing.expectEqual(sentinel_03, bus.wram[0x03]);
 }
 
 test "the log parser reads a known line correctly" {

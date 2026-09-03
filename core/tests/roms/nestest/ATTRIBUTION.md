@@ -31,11 +31,19 @@ FCEUX, puNES, and the NESdev-endorsed `christopherpow/nes-test-roms` mirror).
 
 **How they are used:** `core/src/nestest_test.zig` embeds the ROM and the
 reference log at build time (via anonymous imports declared in
-`core/build.zig`) and runs both of nestest's documented pass/fail protocols —
-the instruction-by-instruction log diff, and the zero-page `$02`/`$03` result
-codes. They are pulled into the **native test binary only**; the
-`zig build wasm` delivery target never sees them.
+`core/build.zig`) and runs nestest's instruction-by-instruction log diff, which
+is the milestone's actual correctness gate. They are pulled into the **native
+test binary only**; the `zig build wasm` delivery target never sees them.
+
+nestest's *other* documented protocol — the zero-page `$02`/`$03` result codes
+— is **not** usable as a second gate here, and the test file says so at length.
+`nestest.log` stops at `C66E RTS`, before nestest's epilogue, and with no PPU
+(M2) the ROM then jams ~95 instructions later. Measured: on a correct CPU those
+two bytes are never written at all, so asserting they read `$00` on
+zero-initialized WRAM is an assertion that cannot fail. The harness therefore
+poisons them with sentinels and asserts the sentinels *survive* — a tripwire
+for control-flow divergence, not a pass signal.
 
 `nestest.txt` is kept alongside the binaries because it is the authoritative
-list of what each failure code means — needed to interpret a nonzero `$02`
-or `$03`.
+list of what each failure code means — needed to interpret `$02` or `$03` if a
+future harness ever does run far enough to reach them.
