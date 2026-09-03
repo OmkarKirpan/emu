@@ -12,6 +12,12 @@ pub const Nrom = struct {
     chr: [0x2000]u8 = [_]u8{0} ** 0x2000,
     chr_is_ram: bool,
 
+    /// PRG-ROM is borrowed, not copied: `prg_rom` is a slice into the
+    /// caller-owned ROM file bytes, so the caller must keep the original ROM
+    /// buffer (whatever `Rom.load` sliced from) alive for as long as this
+    /// `Mapper` is in use. CHR, in contrast, is always copied into `chr`
+    /// (owned inline storage) — this keeps CHR-RAM writes safe without a
+    /// second lifetime to track, at the cost of an 8KB copy at init time.
     pub fn init(prg_rom: []const u8, chr_rom: []const u8) Nrom {
         var self = Nrom{ .prg_rom = prg_rom, .chr_is_ram = chr_rom.len == 0 };
         if (!self.chr_is_ram) @memcpy(self.chr[0..chr_rom.len], chr_rom);
@@ -84,6 +90,20 @@ test "Nrom.chrWrite is a no-op for CHR-ROM but honored for CHR-RAM" {
     try testing.expectEqual(@as(u8, 0xFF), m_ram.chrRead(0)); // honored: CHR-RAM
 }
 
+test "prgRead(0xFFFF) returns the last byte of a 32KB PRG ROM" {
+    var prg = [_]u8{0xAA} ** 0x8000;
+    prg[0x7FFF] = 0x99; // last byte of the 32KB bank, mapped to addr 0xFFFF
+    var m = Mapper{ .nrom = Nrom.init(&prg, &.{}) };
+    try testing.expectEqual(@as(u8, 0x99), m.prgRead(0xFFFF));
+}
+
+test "chrRead(0x1FFF) returns the last byte of an 8KB CHR" {
+    var chr = [_]u8{0xAA} ** 0x2000;
+    chr[0x1FFF] = 0x77; // last byte of the 8KB CHR window
+    var m = Mapper{ .nrom = Nrom.init(&.{}, &chr) };
+    try testing.expectEqual(@as(u8, 0x77), m.chrRead(0x1FFF));
+}
+
 test "Nrom never raises an IRQ" {
     var m = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
     try testing.expect(!m.irqPending());
@@ -98,6 +118,12 @@ test "Nrom never raises an IRQ" {
 /// gets a pointer straight into the active variant. That matters once a
 /// variant holds real state (MMC1/MMC3 bank-switch registers) and matters a
 /// lot in a cycle-accurate core dispatching this millions of times/sec.
+///
+/// Callers (the future CPU memory bus and PPU) are responsible for
+/// masking/routing addresses into range before calling: `prgRead`/`prgWrite`
+/// require `addr` in `0x8000..=0xFFFF`; `chrRead`/`chrWrite` require `addr`
+/// in `0x0000..=0x1FFF`. Out-of-range addresses panic rather than wrapping
+/// or returning an error — the mapper interface trusts its caller.
 pub const Mapper = union(enum) {
     nrom: Nrom,
 
