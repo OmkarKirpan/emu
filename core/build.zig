@@ -4,16 +4,34 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // The native module: this is what `zig build test` compiles and runs.
-    // Per "Test-ROM harness architecture" (ENG-64), correctness is established
-    // ONLY on the native target — the wasm32 build below is pure delivery.
-    const mod = b.addModule("nes_core", .{
+    // The published native module, for anything that wants to depend on the
+    // core as a library. Per "Test-ROM harness architecture" (ENG-64),
+    // correctness is established ONLY on the native target — the wasm32 build
+    // below is pure delivery.
+    _ = b.addModule("nes_core", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const mod_tests = b.addTest(.{ .root_module = mod });
+    // A separate module for the test binary, sharing the same root source but
+    // carrying the vendored nestest fixtures as anonymous imports. Keeping
+    // them off the published module means it stays a pure code dependency,
+    // and — more importantly — the wasm build below never sees the ~900KB of
+    // test data.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_mod.addAnonymousImport("nestest_rom", .{
+        .root_source_file = b.path("tests/roms/nestest/nestest.nes"),
+    });
+    test_mod.addAnonymousImport("nestest_log", .{
+        .root_source_file = b.path("tests/roms/nestest/nestest.log"),
+    });
+
+    const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
