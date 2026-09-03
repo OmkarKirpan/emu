@@ -88,9 +88,19 @@ fn op(mnemonic: []const u8, mode: AddrMode) Op {
 /// tracer/disassembler and produces readable names in failure messages. The
 /// actual execution is the explicit `switch` in `execute`, so a typo here
 /// cannot silently change emulated behavior.
+///
+/// **BRK is two bytes, not one.** The reference doc's own BRK timing table
+/// (cycle 2: "read next instruction byte (and throw it away), increment PC")
+/// is unambiguous — the CPU skips a signature byte and pushes PC+2, which is
+/// what `execute` does. It is listed under the matrix's `Impl/immed` column,
+/// and `.immediate` is the entry that makes `AddrMode.length()` agree with
+/// that PC advance. Marking it `.implied` made `Trace.length` report 1 while
+/// the core consumed 2, which would desync any disassembler that steps by
+/// `length` and would show up as a byte-count mismatch in a future log diff.
+/// nestest never executes BRK, so nothing here catches it.
 pub const opcodes: [256]Op = .{
     // $00
-    op("BRK", .implied),     op("ORA", .indexed_indirect), op("JAM", .implied),     op("SLO", .indexed_indirect),
+    op("BRK", .immediate),   op("ORA", .indexed_indirect), op("JAM", .implied),     op("SLO", .indexed_indirect),
     op("NOP", .zero_page),   op("ORA", .zero_page),        op("ASL", .zero_page),   op("SLO", .zero_page),
     op("PHP", .implied),     op("ORA", .immediate),        op("ASL", .accumulator), op("ANC", .immediate),
     op("NOP", .absolute),    op("ORA", .absolute),         op("ASL", .absolute),    op("SLO", .absolute),
@@ -256,13 +266,26 @@ pub const Cpu = struct {
 
     // ---------------------------------------------------------------- bus
 
-    fn read(self: *Cpu, addr: u16) u8 {
+    /// Advance the emulated clock by one CPU cycle.
+    ///
+    /// **This is the only place `cycles` is incremented, deliberately.** Every
+    /// cycle the core spends — bus accesses and the idle cycle a jammed CPU
+    /// burns alike — funnels through here, so M2's cycle-stepped refactor has
+    /// exactly one site to turn into a "tick the PPU/APU three dots and yield"
+    /// point. A cycle that bypassed `tick` would be a cycle during which video
+    /// stops advancing: a jammed CPU would freeze the picture instead of
+    /// hanging the game, which is not what hardware does.
+    fn tick(self: *Cpu) void {
         self.cycles += 1;
+    }
+
+    fn read(self: *Cpu, addr: u16) u8 {
+        self.tick();
         return self.bus.read(addr);
     }
 
     fn write(self: *Cpu, addr: u16, value: u8) void {
-        self.cycles += 1;
+        self.tick();
         self.bus.write(addr, value);
     }
 
@@ -379,7 +402,9 @@ pub const Cpu = struct {
     /// exists (M2).
     pub fn step(self: *Cpu) void {
         if (self.jammed) {
-            self.cycles += 1;
+            // A jammed core still consumes bus cycles, so this must go through
+            // `tick` like every other cycle -- see the note there.
+            self.tick();
             return;
         }
 
@@ -1438,6 +1463,11 @@ test "BRK pushes PC+2, sets B and I, and vectors through $FFFE" {
     h.init(&[_]u8{ 0x00, 0x00 });
     h.prg[0x7FFE] = 0x00;
     h.prg[0x7FFF] = 0xD0; // IRQ vector -> $D000
+    // The decode table must agree with the PC advance below: BRK consumes a
+    // signature byte, so a tracer stepping by `length` has to skip 2.
+    try testing.expectEqual(@as(u2, 2), opcodes[0x00].mode.length());
+    const before = h.cpu.trace();
+    try testing.expectEqual(@as(u2, 2), before.length);
     h.cpu.step();
     try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
     try testing.expectEqual(@as(u64, 7), h.cpu.cycles);
