@@ -1,0 +1,6 @@
+# Vendored third-party fixtures must stay byte-identical to their upstream
+# sources. This repo is developed on Windows with core.autocrlf enabled, which
+# would otherwise rewrite line endings in the text fixtures (and risk
+# corrupting the ROM if Git ever misclassified it as text).
+core/tests/roms/** -text
+docs/reference/6502_cpu.txt -text
