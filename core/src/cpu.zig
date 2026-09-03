@@ -6,6 +6,7 @@ const mapper_mod = @import("mapper.zig");
 const Bus = bus_mod.Bus;
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
+const TestStub = mapper_mod.TestStub;
 
 /// The processor status register.
 ///
@@ -1339,11 +1340,25 @@ const TestHarness = struct {
     /// Assemble `code` at $C000 (mid-PRG) with the reset vector pointing at
     /// it, then run reset so the CPU starts in a realistic post-boot state.
     fn init(self: *TestHarness, code: []const u8) void {
+        self.initWith(code, .nrom);
+    }
+
+    /// Same, but installs `mapper.TestStub` instead of NROM, so a test can
+    /// drive the cartridge IRQ line or read back the exact PRG writes an
+    /// instruction emitted. Everything else is identical.
+    fn initStub(self: *TestHarness, code: []const u8) void {
+        self.initWith(code, .test_stub);
+    }
+
+    fn initWith(self: *TestHarness, code: []const u8, comptime which: enum { nrom, test_stub }) void {
         self.prg = [_]u8{0} ** 0x8000;
         @memcpy(self.prg[0x4000..][0..code.len], code); // $C000
         self.prg[0x7FFC] = 0x00; // reset vector low  ($FFFC)
         self.prg[0x7FFD] = 0xC0; // reset vector high ($FFFD)
-        self.bus = Bus.init(Mapper{ .nrom = Nrom.init(&self.prg, &.{}) });
+        self.bus = Bus.init(switch (which) {
+            .nrom => Mapper{ .nrom = Nrom.init(&self.prg, &.{}) },
+            .test_stub => Mapper{ .test_stub = TestStub.init(&self.prg) },
+        });
         self.cpu = Cpu.init(&self.bus);
         self.cpu.reset();
         self.cpu.cycles = 0;
@@ -1393,8 +1408,21 @@ test "absolute,X write always costs 5 cycles, page cross or not" {
     var h: TestHarness = undefined;
     h.init(&[_]u8{ 0x9D, 0x00, 0x02 }); // STA $0200,X
     h.cpu.x = 0x00;
+    h.cpu.a = 0x5A;
     h.cpu.step();
     try testing.expectEqual(@as(u64, 5), h.cpu.cycles);
+    try testing.expectEqual(@as(u8, 0x5A), h.bus.wram[0x0200]);
+
+    // The half that matters: a write cannot be un-done, so the CPU always
+    // performs the dummy read at the un-fixed address and the cost stays 5
+    // even when the index carries. (A read would have paid 4 vs 5 here.)
+    h.init(&[_]u8{ 0x9D, 0xFF, 0x02 }); // STA $02FF,X
+    h.cpu.x = 0x01; // -> $0300, page crossed
+    h.cpu.a = 0xA5;
+    h.cpu.step();
+    try testing.expectEqual(@as(u64, 5), h.cpu.cycles);
+    try testing.expectEqual(@as(u8, 0xA5), h.bus.wram[0x0300]);
+    try testing.expectEqual(@as(u8, 0x00), h.bus.wram[0x0200]); // not the un-fixed address
 }
 
 test "zero-page indexed addressing wraps inside the zero page" {
@@ -1455,6 +1483,30 @@ test "taken branches cost +1, and +2 when they cross a page" {
     h.cpu.step();
     try testing.expectEqual(@as(u64, 3), h.cpu.cycles); // taken, same page
     try testing.expectEqual(@as(u16, 0xC004), h.cpu.pc);
+
+    // The crossing case the name promises. Place the branch at $C0FD so the
+    // target lands in the next page: the CPU fixes PCL first, pre-fetches from
+    // the wrong page, and only then fixes PCH -- a fourth cycle.
+    h.init(&[_]u8{});
+    h.prg[0x40FD] = 0xB0; // BCS at $C0FD
+    h.prg[0x40FE] = 0x7F; // +127
+    h.cpu.pc = 0xC0FD;
+    h.cpu.cycles = 0;
+    h.cpu.p.c = true;
+    h.cpu.step();
+    try testing.expectEqual(@as(u64, 4), h.cpu.cycles); // taken, page crossed
+    try testing.expectEqual(@as(u16, 0xC17E), h.cpu.pc); // $C0FF + $7F
+
+    // ...and a not-taken branch pays nothing extra even at the same spot.
+    h.init(&[_]u8{});
+    h.prg[0x40FD] = 0xB0;
+    h.prg[0x40FE] = 0x7F;
+    h.cpu.pc = 0xC0FD;
+    h.cpu.cycles = 0;
+    h.cpu.p.c = false;
+    h.cpu.step();
+    try testing.expectEqual(@as(u64, 2), h.cpu.cycles);
+    try testing.expectEqual(@as(u16, 0xC0FF), h.cpu.pc);
 }
 
 test "RMW writes the unmodified value back before the modified one" {
@@ -1464,6 +1516,28 @@ test "RMW writes the unmodified value back before the modified one" {
     h.cpu.step();
     try testing.expectEqual(@as(u8, 0x42), h.bus.wram[0x0010]);
     try testing.expectEqual(@as(u64, 5), h.cpu.cycles);
+}
+
+test "the RMW dummy write carries the unmodified value, not the modified one" {
+    // The cycle count above proves a middle write *happened*; it cannot prove
+    // what that write carried. An implementation that wrote the modified value
+    // twice would pass it — and would silently break every hardware register
+    // that latches on the first write (the `LSR $D019` interrupt-acknowledge
+    // trick on a C64, `INC $2007` on a NES). WRAM cannot show the difference,
+    // since both writes land on the same byte, so drive the RMW at PRG space
+    // and read the log off the test-double mapper.
+    var h: TestHarness = undefined;
+    h.initStub(&[_]u8{ 0xEE, 0x00, 0x80 }); // INC $8000
+    h.prg[0x0000] = 0x41; // $8000 reads back $41
+    h.cpu.step();
+
+    const stub = &h.bus.mapper.test_stub;
+    try testing.expectEqual(@as(usize, 2), stub.write_count);
+    try testing.expectEqual(@as(u16, 0x8000), stub.writes[0].addr);
+    try testing.expectEqual(@as(u8, 0x41), stub.writes[0].value); // unmodified
+    try testing.expectEqual(@as(u16, 0x8000), stub.writes[1].addr);
+    try testing.expectEqual(@as(u8, 0x42), stub.writes[1].value); // modified
+    try testing.expectEqual(@as(u64, 6), h.cpu.cycles);
 }
 
 test "ADC sets carry and signed overflow, and never uses decimal mode" {
@@ -1549,6 +1623,78 @@ test "SEI defers its I-flag change past the interrupt poll" {
     h.cpu.step(); // SEI — poll sees I still clear
     try testing.expect(h.cpu.p.i);
     h.cpu.step(); // ...so this IRQ is still taken
+    try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
+}
+
+// The interrupt poll happens during an instruction's penultimate cycle, so an
+// instruction that writes the I flag on its *final* cycle is "one instruction
+// late": CLI/SEI/PLP defer, RTI does not. nestest never executes $58 (CLI) at
+// all and never runs PLP with an IRQ pending, so the log diff says nothing
+// about any of this. RTI's exemption is the asymmetry the whole design rests
+// on, and the one M2's NMI timing will build on.
+
+test "CLI defers its I-flag change past the interrupt poll" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x58, 0xEA, 0xEA }); // CLI ; NOP ; NOP
+    h.prg[0x7FFE] = 0x00;
+    h.prg[0x7FFF] = 0xD0; // IRQ vector -> $D000
+    h.cpu.p.i = true;
+    h.cpu.setIrqLine(true);
+
+    h.cpu.step(); // CLI — the poll at its end still sees I *set*
+    try testing.expect(!h.cpu.p.i); // the flag itself did change...
+    try testing.expect(!h.cpu.irq_ready); // ...but the poll missed it
+
+    h.cpu.step(); // so the next instruction runs normally
+    try testing.expectEqual(@as(u16, 0xC002), h.cpu.pc);
+    try testing.expect(h.cpu.irq_ready); // *its* poll sees I clear
+
+    h.cpu.step(); // and only now is the IRQ taken
+    try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
+}
+
+test "PLP defers its I-flag change past the interrupt poll, exactly like CLI" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x28, 0xEA, 0xEA }); // PLP ; NOP ; NOP
+    h.prg[0x7FFE] = 0x00;
+    h.prg[0x7FFF] = 0xD0;
+    h.cpu.p.i = true;
+    h.cpu.s = 0xFC;
+    h.bus.wram[0x01FD] = 0x20; // pulled P: I clear (bit 5 always reads back set)
+    h.cpu.setIrqLine(true);
+
+    h.cpu.step(); // PLP
+    try testing.expect(!h.cpu.p.i);
+    try testing.expect(!h.cpu.irq_ready); // deferred, same as CLI
+
+    h.cpu.step();
+    try testing.expectEqual(@as(u16, 0xC002), h.cpu.pc);
+    try testing.expect(h.cpu.irq_ready);
+
+    h.cpu.step();
+    try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
+}
+
+test "RTI's I-flag change is visible to the poll immediately, unlike PLP" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{0x40}); // RTI
+    h.prg[0x7FFE] = 0x00;
+    h.prg[0x7FFF] = 0xD0;
+    h.cpu.p.i = true;
+    h.cpu.s = 0xFA;
+    h.bus.wram[0x01FB] = 0x20; // pulled P: I clear
+    h.bus.wram[0x01FC] = 0x00; // PCL
+    h.bus.wram[0x01FD] = 0xC0; // PCH -> return to $C000
+    h.cpu.setIrqLine(true);
+
+    h.cpu.step(); // RTI
+    try testing.expectEqual(@as(u16, 0xC000), h.cpu.pc);
+    try testing.expect(!h.cpu.p.i);
+    // The asymmetry: no `poll_i_override`, so this poll saw the *new* I.
+    // PLP above needed one extra instruction to reach this state.
+    try testing.expect(h.cpu.irq_ready);
+
+    h.cpu.step(); // IRQ taken on the very next step, with no delay instruction
     try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
 }
 
@@ -1710,6 +1856,42 @@ test "SHX and SHA use X and A&X respectively" {
     try testing.expectEqual(@as(u8, 0x01), h.bus.wram[0x0211]); // ($F1 & $0F) & $03
 }
 
+// $93 is the only opcode routed through `addrIndirectIndexedRaw`; the SHA test
+// above covers $9F, which goes through the *absolute* raw helper instead. So
+// without this test that helper's pointer read, `base` and `crossed` flag are
+// exercised by nothing at all.
+
+test "SHA (indirect),Y ANDs with the pointer's high byte, not the pointer's address" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x93, 0x40 }); // SHA ($40),Y
+    h.bus.wram[0x0040] = 0x10; // pointer low
+    h.bus.wram[0x0041] = 0x02; // pointer high -> base $0210
+    h.cpu.y = 0x01; // -> $0211, no page cross
+    h.cpu.a = 0xFF;
+    h.cpu.x = 0x0F;
+    h.cpu.step();
+    // value = ($FF & $0F) & ($02 + 1) = $0F & $03 = $03
+    try testing.expectEqual(@as(u8, 0x03), h.bus.wram[0x0211]);
+    // 6 cycles: opcode, pointer operand, two pointer reads, the unconditional
+    // dummy read at the un-fixed address, then the store.
+    try testing.expectEqual(@as(u64, 6), h.cpu.cycles);
+
+    // On a page cross the ANDed value also replaces the address's high byte,
+    // so the store lands somewhere else entirely.
+    h.init(&[_]u8{ 0x93, 0x40 });
+    h.bus.wram[0x0040] = 0xFE; // pointer low
+    h.bus.wram[0x0041] = 0x02; // pointer high -> base $02FE
+    h.cpu.y = 0x03; // -> $0301, page crossed
+    h.cpu.a = 0x0D;
+    h.cpu.x = 0x07;
+    h.cpu.step();
+    // value = ($0D & $07) & ($02 + 1) = $05 & $03 = $01,
+    // so the target becomes ($01 << 8) | $01 = $0101, *not* $0301.
+    try testing.expectEqual(@as(u8, 0x01), h.bus.wram[0x0101]);
+    try testing.expectEqual(@as(u8, 0x00), h.bus.wram[0x0301]);
+    try testing.expectEqual(@as(u64, 6), h.cpu.cycles);
+}
+
 test "SHS loads S with A AND X before storing" {
     var h: TestHarness = undefined;
     h.init(&[_]u8{ 0x9B, 0x10, 0x02 }); // SHS $0210,Y
@@ -1784,11 +1966,33 @@ test "JAM halts the CPU without advancing PC" {
 
 test "a mapper-asserted IRQ is seen by the CPU without mapper-specific code" {
     var h: TestHarness = undefined;
-    h.init(&[_]u8{ 0xEA, 0xEA });
+    h.initStub(&[_]u8{ 0xEA, 0xEA, 0xEA });
+    h.prg[0x7FFE] = 0x00;
+    h.prg[0x7FFF] = 0xD0; // IRQ vector -> $D000
     h.cpu.p.i = false;
-    // NROM never asserts, so the line stays clear and no interrupt is taken.
+
+    // Baseline: nothing asserting.
     h.cpu.step();
     try testing.expect(!h.cpu.irq_ready);
+
+    // Now the *cartridge* alone pulls the line down. The CPU's own /IRQ input
+    // is untouched, so the only thing that can carry this into the interrupt
+    // logic is the OR in `irqAsserted` — the single line MMC3's scanline IRQ
+    // (M7) will depend on, and the reason no mapper-specific code belongs in
+    // this file.
+    h.bus.mapper.test_stub.irq = true;
+    try testing.expect(!h.cpu.irq_line);
+    try testing.expect(h.bus.mapper.irqPending());
+
+    h.cpu.step(); // NOP, whose poll now sees the cartridge line
+    try testing.expect(h.cpu.irq_ready);
+    h.cpu.step();
+    try testing.expectEqual(@as(u16, 0xD000), h.cpu.pc);
+    try testing.expect(h.cpu.p.i);
+    try testing.expectEqual(@as(u8, 0x20), h.bus.wram[0x01FB] & 0x30); // B clear
+
+    // Acknowledging through the same interface drops it again.
+    h.bus.mapper.irqAcknowledge();
     try testing.expect(!h.bus.mapper.irqPending());
 }
 

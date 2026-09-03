@@ -55,6 +55,90 @@ pub const Nrom = struct {
     }
 };
 
+/// A test double, not a cartridge — the only non-hardware `Mapper` variant.
+///
+/// It exists because NROM can never reach two parts of this interface, so
+/// without it nothing in the tree exercises them at all:
+///
+///   * **`irqPending` returning true.** The CPU wire-ORs the cartridge IRQ into
+///     its own /IRQ input (`Cpu.irqAsserted`); that OR is the single line
+///     MMC3's scanline IRQ (M7) depends on. With only NROM installed, a test
+///     can assert nothing stronger than "false stays false", which is exactly
+///     what the CPU test used to do while reading as if it covered the OR.
+///   * **`prgWrite` as an observable event.** An NMOS read-modify-write emits
+///     *two* writes — the unmodified value, then the modified one — and real
+///     hardware registers latch on the first. WRAM cannot show the difference,
+///     because both writes land on the same byte; a write log can.
+///
+/// This is deliberately not a step toward M7's real variants: it models no
+/// cartridge, and M7 should add MMC1/MMC3 alongside it rather than growing it.
+/// It costs the union nothing (Nrom's inline 8KB CHR dominates the size) and
+/// adds no state to any shipping code path.
+pub const TestStub = struct {
+    pub const Write = struct { addr: u16, value: u8 };
+
+    prg_rom: []const u8,
+    /// Drive the cartridge IRQ line. `irqAcknowledge` clears it.
+    irq: bool = false,
+    /// Ring-free write log: entries past `writes.len` are counted but not
+    /// stored, so `write_count` is always the true total.
+    writes: [8]Write = undefined,
+    write_count: usize = 0,
+
+    pub fn init(prg_rom: []const u8) TestStub {
+        return .{ .prg_rom = prg_rom };
+    }
+
+    pub fn prgRead(self: *const TestStub, addr: u16) u8 {
+        const offset = (addr - 0x8000) % @as(u16, @intCast(self.prg_rom.len));
+        return self.prg_rom[offset];
+    }
+
+    pub fn prgWrite(self: *TestStub, addr: u16, value: u8) void {
+        if (self.write_count < self.writes.len) {
+            self.writes[self.write_count] = .{ .addr = addr, .value = value };
+        }
+        self.write_count += 1;
+    }
+
+    pub fn chrRead(self: *const TestStub, addr: u16) u8 {
+        _ = self;
+        _ = addr;
+        return 0;
+    }
+
+    pub fn chrWrite(self: *TestStub, addr: u16, value: u8) void {
+        _ = self;
+        _ = addr;
+        _ = value;
+    }
+
+    pub fn irqPending(self: *const TestStub) bool {
+        return self.irq;
+    }
+
+    pub fn irqAcknowledge(self: *TestStub) void {
+        self.irq = false;
+    }
+};
+
+test "TestStub logs PRG writes and drives the IRQ line through the interface" {
+    var prg = [_]u8{0x11} ** 0x8000;
+    var m = Mapper{ .test_stub = TestStub.init(&prg) };
+    try testing.expect(!m.irqPending());
+
+    m.test_stub.irq = true;
+    try testing.expect(m.irqPending()); // visible through the union, not the variant
+    m.irqAcknowledge();
+    try testing.expect(!m.irqPending());
+
+    m.prgWrite(0x8000, 0xAA);
+    m.prgWrite(0x8000, 0xBB);
+    try testing.expectEqual(@as(usize, 2), m.test_stub.write_count);
+    try testing.expectEqual(@as(u8, 0xAA), m.test_stub.writes[0].value);
+    try testing.expectEqual(@as(u8, 0xBB), m.test_stub.writes[1].value);
+}
+
 test "Nrom.prgRead mirrors a 16KB bank across the full $8000-$FFFF window" {
     var prg = [_]u8{0xAA} ** 0x4000;
     prg[0] = 0x11;
@@ -111,7 +195,8 @@ test "Nrom never raises an IRQ" {
 }
 
 /// Closed set of NES mappers (see the map's "Out of scope": coverage is
-/// capped at NROM/MMC1/UxROM/CNROM/MMC3). A tagged union dispatched via
+/// capped at NROM/MMC1/UxROM/CNROM/MMC3), plus one test double (`TestStub`).
+/// A tagged union dispatched via
 /// `switch (self.*) { inline else => |*m| ... }` rather than a vtable: the
 /// switch operates on `self.*`, a place expression, and captures by pointer
 /// (`|*m|`), so this does NOT copy the union's payload on every call — it
@@ -126,6 +211,9 @@ test "Nrom never raises an IRQ" {
 /// or returning an error — the mapper interface trusts its caller.
 pub const Mapper = union(enum) {
     nrom: Nrom,
+    /// Not a cartridge — a test double for the parts of this interface NROM
+    /// cannot reach. See `TestStub`.
+    test_stub: TestStub,
 
     pub fn prgRead(self: *const Mapper, addr: u16) u8 {
         switch (self.*) {
