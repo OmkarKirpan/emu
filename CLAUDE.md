@@ -8,7 +8,7 @@ Linear (workspace: OmkarKirpan, team: Engineering, project: [NES Emulator (WebAs
 
 ### Triage labels
 
-Not applicable — the `triage` skill isn't installed for this repo.
+Default vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-human, wontfix). See [docs/agents/triage-labels.md](docs/agents/triage-labels.md).
 
 ### Domain docs
 
