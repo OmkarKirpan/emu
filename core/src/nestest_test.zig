@@ -39,9 +39,16 @@
 //!     genuine (if weak) tripwire — it fires if a future change lets the ROM
 //!     reach its store path — and nothing more. Protocol (1) is the gate.
 //!
-//! The log's `PPU:` column is deliberately not compared: with no PPU yet
-//! (M2), those numbers are a pure function of the CPU cycle count
-//! (`dot = cycles * 3`), so checking them would only restate the `CYC:` check.
+//! The log's `PPU:` column *is* compared, as of M2. Nintendulator records the
+//! PPU's own (scanline, dot) at each instruction boundary, so this pins the
+//! CPU/PPU wiring against an external reference: the fixed 3-dots-per-CPU-cycle
+//! ratio, and the 341-dot / 262-scanline counter rollover. nestest never
+//! enables rendering, so no odd-frame dot skip ever fires during this run and
+//! the mapping stays `dot = (cycles * 3) mod 341` -- which makes the check
+//! largely implied by `CYC:` *arithmetically*, but not *structurally*: a wrong
+//! dots-per-cycle ratio or an off-by-one line length (340 vs. 341) diverges
+//! here and nowhere else in this harness. It costs one comparison to hold that
+//! ground.
 
 const std = @import("std");
 const testing = std.testing;
@@ -71,6 +78,8 @@ const Expected = struct {
     p: u8,
     s: u8,
     cycles: u64,
+    ppu_scanline: u16,
+    ppu_dot: u16,
 };
 
 const ParseError = error{ BadHexDigit, ShortLine, MissingField };
@@ -132,18 +141,32 @@ fn parseLine(line: []const u8) !Expected {
 
     const cyc_at = std.mem.indexOf(u8, line, "CYC:") orelse return ParseError.MissingField;
     e.cycles = try std.fmt.parseInt(u64, line[cyc_at + 4 ..], 10);
+
+    // `PPU:{scanline:3},{dot:3}`, sitting between the SP and CYC fields. Both
+    // numbers are space-padded decimal, not hex like the register block.
+    const ppu_at = std.mem.indexOf(u8, line, "PPU:") orelse return ParseError.MissingField;
+    const comma = std.mem.indexOfScalarPos(u8, line, ppu_at, ',') orelse return ParseError.MissingField;
+    if (comma > cyc_at) return ParseError.MissingField;
+    e.ppu_scanline = try std.fmt.parseInt(u16, std.mem.trim(u8, line[ppu_at + 4 .. comma], " "), 10);
+    e.ppu_dot = try std.fmt.parseInt(u16, std.mem.trim(u8, line[comma + 1 .. cyc_at], " "), 10);
     return e;
 }
 
-fn reportMismatch(instruction: usize, expected: Expected, actual: cpu_mod.Cpu.Trace) void {
+fn reportMismatch(
+    instruction: usize,
+    expected: Expected,
+    actual: cpu_mod.Cpu.Trace,
+    actual_scanline: u16,
+    actual_dot: u16,
+) void {
     const entry = cpu_mod.opcodes[actual.opcode];
     std.debug.print(
         \\
         \\nestest divergence at instruction #{d} (nestest.log line {d})
         \\  instruction: {s} ({s}), opcode ${X:0>2}
-        \\                 PC    A  X  Y  P SP        CYC
-        \\  expected:    {X:0>4}   {X:0>2} {X:0>2} {X:0>2} {X:0>2} {X:0>2} {d:>10}
-        \\  actual:      {X:0>4}   {X:0>2} {X:0>2} {X:0>2} {X:0>2} {X:0>2} {d:>10}
+        \\                 PC    A  X  Y  P SP   PPU(sl,dot)        CYC
+        \\  expected:    {X:0>4}   {X:0>2} {X:0>2} {X:0>2} {X:0>2} {X:0>2}    {d:>3},{d:>3} {d:>10}
+        \\  actual:      {X:0>4}   {X:0>2} {X:0>2} {X:0>2} {X:0>2} {X:0>2}    {d:>3},{d:>3} {d:>10}
         \\
     , .{
         instruction,
@@ -157,6 +180,8 @@ fn reportMismatch(instruction: usize, expected: Expected, actual: cpu_mod.Cpu.Tr
         expected.y,
         expected.p,
         expected.s,
+        expected.ppu_scanline,
+        expected.ppu_dot,
         expected.cycles,
         actual.pc,
         actual.a,
@@ -164,6 +189,8 @@ fn reportMismatch(instruction: usize, expected: Expected, actual: cpu_mod.Cpu.Tr
         actual.y,
         actual.p,
         actual.s,
+        actual_scanline,
+        actual_dot,
         actual.cycles,
     });
 
@@ -191,6 +218,10 @@ fn reportMismatch(instruction: usize, expected: Expected, actual: cpu_mod.Cpu.Tr
     }
     if (expected.s != actual.s) {
         differing[n] = "SP";
+        n += 1;
+    }
+    if (expected.ppu_scanline != actual_scanline or expected.ppu_dot != actual_dot) {
+        differing[n] = "PPU";
         n += 1;
     }
     if (expected.cycles != actual.cycles) {
@@ -233,6 +264,10 @@ test "nestest automation run matches nestest.log instruction for instruction" {
 
         const expected = try parseLine(line);
         const actual = cpu.trace();
+        // Sampled before `cpu.step()`, i.e. at the same instruction boundary
+        // the log line describes.
+        const actual_scanline = bus.ppu.scanline;
+        const actual_dot = bus.ppu.dot;
 
         const state_ok = expected.pc == actual.pc and
             expected.a == actual.a and
@@ -240,7 +275,9 @@ test "nestest automation run matches nestest.log instruction for instruction" {
             expected.y == actual.y and
             expected.p == actual.p and
             expected.s == actual.s and
-            expected.cycles == actual.cycles;
+            expected.cycles == actual.cycles and
+            expected.ppu_scanline == actual_scanline and
+            expected.ppu_dot == actual_dot;
 
         var bytes_ok = expected.length == actual.length;
         if (bytes_ok) {
@@ -255,7 +292,7 @@ test "nestest automation run matches nestest.log instruction for instruction" {
         }
 
         if (!state_ok or !bytes_ok) {
-            reportMismatch(instruction, expected, actual);
+            reportMismatch(instruction, expected, actual, actual_scanline, actual_dot);
             if (!bytes_ok) {
                 std.debug.print(
                     "  opcode bytes: expected {d} byte(s), decoded {d}\n",
@@ -307,6 +344,19 @@ test "the log parser reads a known line correctly" {
     try testing.expectEqual(@as(u8, 0x26), e.p);
     try testing.expectEqual(@as(u8, 0xFD), e.s);
     try testing.expectEqual(@as(u64, 12), e.cycles);
+    try testing.expectEqual(@as(u16, 0), e.ppu_scanline);
+    try testing.expectEqual(@as(u16, 36), e.ppu_dot);
+}
+
+test "the log parser reads a PPU column past scanline 0, with wider fields" {
+    // Both numbers are space-padded to width 3 and can reach 261/340, so the
+    // parser must not assume the single-digit-scanline layout every early
+    // line happens to have.
+    const line = "C7F5  A9 00     LDA #$00                        A:00 X:00 Y:00 P:26 SP:FB PPU:261,340 CYC:29781";
+    const e = try parseLine(line);
+    try testing.expectEqual(@as(u16, 261), e.ppu_scanline);
+    try testing.expectEqual(@as(u16, 340), e.ppu_dot);
+    try testing.expectEqual(@as(u64, 29781), e.cycles);
 }
 
 test "the log parser handles one- and three-byte instructions" {
@@ -322,4 +372,5 @@ test "the log parser handles one- and three-byte instructions" {
     try testing.expectEqual(@as(u8, 0xF5), e3.bytes[1]);
     try testing.expectEqual(@as(u8, 0xC5), e3.bytes[2]);
     try testing.expectEqual(@as(u64, 7), e3.cycles);
+    try testing.expectEqual(@as(u16, 21), e3.ppu_dot); // dot = cycles * 3 at reset
 }
