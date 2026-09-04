@@ -238,10 +238,10 @@ pub const Cpu = struct {
 
     bus: *Bus,
 
-    /// NMI is edge-triggered: `raiseNmi` latches it, and it stays latched
-    /// until serviced. `nmi_line` tracks the raw level so the edge detector
-    /// (`setNmiLine`) can find the falling edge on hardware's active-low line
-    /// — modeled here as a rising edge of "asserted".
+    /// NMI is edge-triggered: `setNmiLine` latches `nmi_pending` on the rising
+    /// edge, and it stays latched until serviced. `nmi_line` tracks the raw
+    /// level so the edge detector can find the transition on hardware's
+    /// active-low line — modeled here as a rising edge of "asserted".
     nmi_line: bool = false,
     nmi_pending: bool = false,
 
@@ -267,33 +267,102 @@ pub const Cpu = struct {
     irq_ready: bool = false,
     poll_i_override: ?bool = null,
 
+    /// The NMI analogue of `irq_ready`/`poll_i_override`, but general rather
+    /// than opcode-specific: `nmi_pending` (the raw, continuously-updated
+    /// edge latch) can be set by *any* cycle's bus access, not just three
+    /// named opcodes, since it's driven by writes to $2000 as easily as by
+    /// the PPU's own timing. Re-derived every single cycle (see `read`/
+    /// `write`) as a snapshot of `nmi_pending` taken *before* that cycle's
+    /// own tick+access, `nmi_ready` is what `step` actually dispatches on.
+    ///
+    /// This reproduces Blargg's `ppu_vbl_nmi/04-nmi_control` test 11
+    /// ("immediate occurrence should be after [the] NEXT instruction"): an
+    /// edge that lands on an instruction's own *last* cycle (e.g. the write
+    /// half of `STA $2000` enabling NMI while VBL is already set) updates
+    /// `nmi_pending` only *after* `nmi_ready` was already snapshotted for
+    /// that cycle, so it isn't visible to `step`'s dispatch check until the
+    /// *following* instruction has run its own first cycle and re-snapshotted.
+    /// An edge landing on any *earlier* cycle of a multi-cycle instruction,
+    /// by contrast, gets caught by that same instruction's next snapshot and
+    /// dispatches with no extra delay — exactly the cycle-precise variation
+    /// `05-nmi_timing` exercises.
+    nmi_ready: bool = false,
+
     pub fn init(bus: *Bus) Cpu {
         return .{ .bus = bus };
     }
 
     // ---------------------------------------------------------------- bus
 
-    /// Advance the emulated clock by one CPU cycle.
+    /// Advance the emulated clock by one CPU cycle, stepping the PPU 3 dots
+    /// (the fixed NTSC ratio) to match.
     ///
     /// **This is the only place `cycles` is incremented, deliberately.** Every
     /// cycle the core spends — bus accesses and the idle cycle a jammed CPU
-    /// burns alike — funnels through here, so M2's cycle-stepped refactor has
-    /// exactly one site to turn into a "tick the PPU/APU three dots and yield"
-    /// point. A cycle that bypassed `tick` would be a cycle during which video
-    /// stops advancing: a jammed CPU would freeze the picture instead of
-    /// hanging the game, which is not what hardware does.
+    /// burns alike — funnels through here, so a jammed CPU still advances
+    /// video instead of freezing the picture, which is not what hardware
+    /// does.
+    ///
+    /// **Why there's a poll wedged between the first and second PPU dot.**
+    /// `read`/`write` poll NMI once more, *after* this returns and after the
+    /// bus access completes — so within one CPU cycle there are two poll
+    /// points straddling three PPU dots. Blargg's `ppu_vbl_nmi/06-suppression`
+    /// (VBL flag set at scanline 241 dot 1) needs exactly this split to match
+    /// its documented window: a read landing so that the flag-setting dot is
+    /// the *first* of this cycle's three must see the edge fire normally
+    /// (the flag was already true for two whole PPU dots before this read's
+    /// own clear could suppress anything), while a read landing so that the
+    /// flag-setting dot is the *second or third* must suppress it (the read
+    /// clears the flag before either poll ever observes it high). Polling
+    /// only after all 3 dots — the first thing tried here — suppressed all
+    /// three alignments instead of two out of three, which is exactly the
+    /// off-by-one-dot failure `06-suppression` (and `05`/`07`/`08-nmi_*_timing`,
+    /// which share the same underlying edge-timing logic) caught.
     fn tick(self: *Cpu) void {
         self.cycles += 1;
+        self.bus.ppu.tick(&self.bus.mapper);
+        self.pollNmi();
+        self.bus.ppu.tick(&self.bus.mapper);
+        self.bus.ppu.tick(&self.bus.mapper);
+    }
+
+    /// Re-latch the CPU's edge-triggered NMI input from the PPU's current
+    /// (vblank_flag AND nmi_enable) output level. Called mid-`tick` (after
+    /// the first of this cycle's 3 PPU dots), after every bus access, and
+    /// after the idle cycle a jammed CPU burns — see `tick`'s doc comment
+    /// for why the split timing matters.
+    fn pollNmi(self: *Cpu) void {
+        self.setNmiLine(self.bus.ppu.nmiSignal());
+    }
+
+    /// Snapshot `nmi_ready` from `nmi_pending` as it stands *after* this
+    /// cycle's 3 PPU dots (`tick`, mid-`tick` poll included) but *before*
+    /// this cycle's own bus access. Called by every `read`/`write` (and the
+    /// jammed-CPU idle cycle) right after `tick` returns — see `nmi_ready`'s
+    /// doc comment for why this ordering is what gives `step` the right
+    /// dispatch timing: an edge already visible by the time this cycle's 3
+    /// dots have ticked (whether latched earlier or by `tick`'s own
+    /// mid-point poll) is ready to dispatch as soon as *this* instruction
+    /// finishes, while an edge this cycle's own *access* produces (e.g. a
+    /// write enabling NMI) is deliberately one snapshot too late to affect
+    /// this instruction's dispatch decision, only the next one's.
+    fn snapshotNmiReady(self: *Cpu) void {
+        self.nmi_ready = self.nmi_pending;
     }
 
     fn read(self: *Cpu, addr: u16) u8 {
         self.tick();
-        return self.bus.read(addr);
+        self.snapshotNmiReady();
+        const value = self.bus.read(addr);
+        self.pollNmi();
+        return value;
     }
 
     fn write(self: *Cpu, addr: u16, value: u8) void {
         self.tick();
+        self.snapshotNmiReady();
         self.bus.write(addr, value);
+        self.pollNmi();
     }
 
     fn fetch(self: *Cpu) u8 {
@@ -390,6 +459,12 @@ pub const Cpu = struct {
     /// but S is still decremented three times — which is why a freshly reset
     /// NES has S = $FD rather than $00. Every register except PC survives.
     pub fn reset(self: *Cpu) void {
+        // The PPU's own reset-cleared registers (PPUCTRL/PPUMASK/the $2005-
+        // $2006 write toggle/the PPUDATA read buffer) take effect as soon as
+        // /RESET is asserted on real hardware, before the CPU's own 7-cycle
+        // sequence even begins -- see `Ppu.reset`'s doc comment for exactly
+        // what does and does not survive.
+        self.bus.ppu.reset();
         _ = self.read(self.pc); // 1
         _ = self.read(self.pc); // 2
         _ = self.read(0x0100 | @as(u16, self.s)); // 3
@@ -404,6 +479,7 @@ pub const Cpu = struct {
         self.p.i = true;
         self.jammed = false;
         self.nmi_pending = false;
+        self.nmi_ready = false;
         self.irq_ready = false;
         self.poll_i_override = null;
     }
@@ -412,23 +488,32 @@ pub const Cpu = struct {
 
     /// Run one instruction, or one interrupt sequence if one is due.
     ///
-    /// Interrupts are dispatched at instruction boundaries using the poll
-    /// latched at the end of the previous instruction (see `irq_ready`), which
-    /// reproduces the one-instruction delay of `CLI`/`SEI`/`PLP` without
-    /// needing a full per-cycle state machine. The finer-grained cases the
-    /// hardware exhibits — an interrupt arriving mid-instruction and being
-    /// taken by the *current* instruction's final cycle — are not modeled;
-    /// they require a cycle-stepped core and are not exercised until the PPU
-    /// exists (M2).
+    /// IRQ is dispatched using the poll latched at the end of the previous
+    /// instruction (see `irq_ready`), reproducing the one-instruction delay
+    /// of `CLI`/`SEI`/`PLP`. NMI is dispatched from `nmi_ready`, which is
+    /// re-derived every single *cycle* rather than once per instruction (see
+    /// its doc comment) — since M2 the PPU can raise NMI from a write to
+    /// $2000 on literally any cycle of any instruction, not just three named
+    /// opcodes' final cycle, so a per-instruction-only latch can't cover it.
+    /// What is still not modeled: an interrupt being *taken* mid-instruction
+    /// (both kinds are only ever dispatched between whole instructions);
+    /// that requires a fully cycle-stepped instruction interior, which
+    /// nothing exercised by this milestone's test ROMs needs.
     pub fn step(self: *Cpu) void {
         if (self.jammed) {
             // A jammed core still consumes bus cycles, so this must go through
-            // `tick` like every other cycle -- see the note there.
+            // `tick` like every other cycle -- see the note there. No bus
+            // access happens this cycle, but NMI state is still re-derived
+            // for consistency with every other path (a jammed CPU can never
+            // service it anyway -- only RESET recovers from JAM).
             self.tick();
+            self.snapshotNmiReady();
+            self.pollNmi();
             return;
         }
 
-        if (self.nmi_pending) {
+        if (self.nmi_ready) {
+            self.nmi_ready = false;
             self.nmi_pending = false;
             self.serviceInterrupt(.nmi);
             self.latchInterruptPoll();
@@ -1358,7 +1443,7 @@ const TestHarness = struct {
         self.bus = Bus.init(switch (which) {
             .nrom => Mapper{ .nrom = Nrom.init(&self.prg, &.{}) },
             .test_stub => Mapper{ .test_stub = TestStub.init(&self.prg) },
-        });
+        }, .horizontal);
         self.cpu = Cpu.init(&self.bus);
         self.cpu.reset();
         self.cpu.cycles = 0;
@@ -1596,16 +1681,26 @@ test "BRK pushes PC+2, sets B and I, and vectors through $FFFE" {
     try testing.expectEqual(@as(u8, 0x30), h.bus.wram[0x01FB] & 0x30); // B set
 }
 
-test "NMI is edge-triggered and ignores the I flag" {
+test "NMI is edge-triggered, ignores the I flag, and dispatches after the instruction that observes it" {
     var h: TestHarness = undefined;
     h.init(&[_]u8{ 0xEA, 0xEA });
     h.prg[0x7FFA] = 0x00;
     h.prg[0x7FFB] = 0xE0; // NMI vector -> $E000
     h.cpu.p.i = true;
-    h.cpu.setNmiLine(true);
-    h.cpu.step();
+    h.cpu.setNmiLine(true); // latches nmi_pending directly, bypassing nmi_ready's snapshot
+
+    // `nmi_ready` -- what `step` actually dispatches on -- is only
+    // re-snapshotted from `nmi_pending` at the start of each cycle (see its
+    // doc comment), so a line asserted *between* steps is not visible to
+    // dispatch until the NOP that's already in flight runs its own cycle
+    // and re-snapshots. This is the same timing `ppu_vbl_nmi/04-nmi_control`
+    // test 11 checks for the $2000-driven case.
+    h.cpu.step(); // NOP runs normally; its own cycle snapshots nmi_ready=true
+    try testing.expectEqual(@as(u16, 0xC001), h.cpu.pc);
+
+    h.cpu.step(); // dispatches NMI instead of the second NOP
     try testing.expectEqual(@as(u16, 0xE000), h.cpu.pc);
-    try testing.expectEqual(@as(u64, 7), h.cpu.cycles);
+    try testing.expectEqual(@as(u64, 2 + 7), h.cpu.cycles);
 
     // Holding the line asserted must not retrigger.
     h.cpu.pc = 0xC000;
