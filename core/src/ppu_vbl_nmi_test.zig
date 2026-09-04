@@ -67,45 +67,67 @@ fn statusText(bus: *const bus_mod.Bus, buf: []u8) []const u8 {
     return buf[0..i];
 }
 
-/// Run one Blargg-protocol ROM to completion, asserting its result code is
-/// `$00` (pass). Polls `$6000` via `bus.peek` (side-effect-free -- the ROM
-/// itself owns that address's read/write via normal `Bus.read`/`Bus.write`
-/// as part of `cpu.step`; polling separately with `peek` must not perturb
-/// anything). Handles the `$81` "needs a reset" code by running for at least
-/// 100ms of emulated NES time and then calling `cpu.reset()`, exactly per
-/// the documented protocol.
-fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
-    const rom = try rom_mod.Rom.load(rom_bytes);
-    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu = cpu_mod.Cpu.init(&bus);
-    cpu.reset();
+/// One booted machine, kept as a struct so `cpu`'s pointer to `bus` stays
+/// valid: `Cpu` borrows `*Bus`, so the pair has to reach its final address
+/// before being wired together. Two-phase init (`var m: Machine = undefined;
+/// try m.init(rom)`) is the same shape `cpu.zig`'s own `TestHarness` uses.
+const Machine = struct {
+    bus: bus_mod.Bus,
+    cpu: cpu_mod.Cpu,
 
-    var resets: u32 = 0;
-    const status: u8 = while (true) {
-        if (cpu.cycles > max_cycles) return HarnessError.Timeout;
-        cpu.step();
-        if (bus.peek(0x6001) != 0xDE or bus.peek(0x6002) != 0xB0 or bus.peek(0x6003) != 0x61) continue;
-        const s = bus.peek(0x6000);
-        if (s == 0x80) continue;
-        if (s == 0x81) {
-            resets += 1;
-            if (resets > max_resets) return HarnessError.TooManyResets;
-            const target = cpu.cycles + min_reset_delay_cycles;
-            while (cpu.cycles < target) {
-                if (cpu.cycles > max_cycles) return HarnessError.Timeout;
-                cpu.step();
+    fn init(self: *Machine, rom_bytes: []const u8) !void {
+        const rom = try rom_mod.Rom.load(rom_bytes);
+        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
+        self.cpu = cpu_mod.Cpu.init(&self.bus);
+        self.cpu.reset();
+    }
+
+    /// Run until `$6000` reports a terminal result code, and return it.
+    ///
+    /// Polls `$6000` via `bus.peek` (side-effect-free -- the ROM itself owns
+    /// that address's real read/write through `Bus.read`/`Bus.write` as part
+    /// of `cpu.step`; polling separately must not perturb anything). Handles
+    /// the `$81` "needs a reset, delayed >=100ms" code by running out that
+    /// delay in emulated NES time and then calling `cpu.reset()`, exactly per
+    /// the documented protocol. Bounded by `max_cycles` so a ROM that spins
+    /// forever fails the test instead of hanging CI.
+    fn runToTerminalStatus(self: *Machine) !u8 {
+        var resets: u32 = 0;
+        while (true) {
+            if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
+            self.cpu.step();
+            if (self.bus.peek(0x6001) != 0xDE or
+                self.bus.peek(0x6002) != 0xB0 or
+                self.bus.peek(0x6003) != 0x61) continue;
+            const s = self.bus.peek(0x6000);
+            if (s == 0x80) continue;
+            if (s == 0x81) {
+                resets += 1;
+                if (resets > max_resets) return HarnessError.TooManyResets;
+                const target = self.cpu.cycles + min_reset_delay_cycles;
+                while (self.cpu.cycles < target) {
+                    if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
+                    self.cpu.step();
+                }
+                self.cpu.reset();
+                continue;
             }
-            cpu.reset();
-            continue;
+            return s;
         }
-        break s;
-    };
+    }
+};
+
+/// Run one Blargg-protocol ROM, asserting its result code is `$00` (pass).
+fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
+    var m: Machine = undefined;
+    try m.init(rom_bytes);
+    const status = try m.runToTerminalStatus();
 
     if (status != 0) {
         var buf: [256]u8 = undefined;
         std.debug.print(
             "\nppu_vbl_nmi/{s}: result code ${X:0>2}\n  detail: {s}\n",
-            .{ name, status, statusText(&bus, &buf) },
+            .{ name, status, statusText(&m.bus, &buf) },
         );
     }
     try testing.expectEqual(@as(u8, 0), status);
@@ -116,36 +138,14 @@ fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
 /// known failure code, so a regression to something *else* still fails the
 /// suite, then skips instead of claiming a pass that isn't real.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8, known_code: u8) !void {
-    const rom = try rom_mod.Rom.load(rom_bytes);
-    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu = cpu_mod.Cpu.init(&bus);
-    cpu.reset();
-
-    var resets: u32 = 0;
-    const status: u8 = while (true) {
-        if (cpu.cycles > max_cycles) return HarnessError.Timeout;
-        cpu.step();
-        if (bus.peek(0x6001) != 0xDE or bus.peek(0x6002) != 0xB0 or bus.peek(0x6003) != 0x61) continue;
-        const s = bus.peek(0x6000);
-        if (s == 0x80) continue;
-        if (s == 0x81) {
-            resets += 1;
-            if (resets > max_resets) return HarnessError.TooManyResets;
-            const target = cpu.cycles + min_reset_delay_cycles;
-            while (cpu.cycles < target) {
-                if (cpu.cycles > max_cycles) return HarnessError.Timeout;
-                cpu.step();
-            }
-            cpu.reset();
-            continue;
-        }
-        break s;
-    };
+    var m: Machine = undefined;
+    try m.init(rom_bytes);
+    const status = try m.runToTerminalStatus();
 
     var buf: [256]u8 = undefined;
     std.debug.print(
         "\nppu_vbl_nmi/{s}: documented gap, result code ${X:0>2} -- {s}\n",
-        .{ name, status, statusText(&bus, &buf) },
+        .{ name, status, statusText(&m.bus, &buf) },
     );
     // If the failure ever changes shape, this test should start failing for
     // real instead of silently continuing to skip.
