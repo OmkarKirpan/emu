@@ -11,6 +11,13 @@
 //! of a full rendered frame against a hand-derived expected value. Every
 //! byte written below has its derivation spelled out in a comment; nothing
 //! here is a hash with no traceable origin.
+//!
+//! Four fixtures, each isolating one decode axis: the full-frame single-tile
+//! check (pattern bitplanes, one attribute quadrant, palette lookup); the
+//! PPUMASK left-column mask; all four attribute quadrants of one cell, which
+//! is what pins `fetchAttributeByte`'s two quadrant shifts to the right axes;
+//! and fine-X scroll, the only test in the tree that reaches `outputPixel`'s
+//! `0x8000 >> fine_x` mux with a non-zero shift.
 
 const std = @import("std");
 const testing = std.testing;
@@ -160,5 +167,105 @@ test "background pipeline hides the leftmost 8 columns when PPUMASK's show_bg_le
     // so this only proves the *masking*, not an absence of the tile.
     for (0..8) |col| {
         try testing.expectEqual(@as(u8, 0x0F), ppu.framebuffer[0 * 256 + col]);
+    }
+}
+
+test "attribute-table quadrant selection: all four 2x2-tile quadrants of one cell" {
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
+    var ppu = Ppu.init(.horizontal);
+
+    // Tile #1, solid pixel value 1: low plane all 1s, high plane all 0s, so
+    // every pixel is (0 << 1) | 1 = 1 -- palette entry 1 of whichever group
+    // the attribute table selects. That makes the rendered color a direct
+    // readout of "which group did this quadrant resolve to".
+    writeSequential(&ppu, &mapper, 0x0010, &([_]u8{0xFF} ** 8)); // low plane
+    writeSequential(&ppu, &mapper, 0x0018, &([_]u8{0x00} ** 8)); // high plane
+
+    // One tile per quadrant of attribute cell (0,0), which covers nametable
+    // tiles (0..3, 0..3): top-left, top-right, bottom-left, bottom-right.
+    const spots = [_][2]u16{ .{ 0, 0 }, .{ 2, 0 }, .{ 0, 2 }, .{ 2, 2 } };
+    for (spots) |spot| {
+        setAddr(&ppu, &mapper, 0x2000 + spot[1] * 32 + spot[0]);
+        ppu.writeRegister(0x2007, 1, &mapper);
+    }
+
+    // $23C0 is cell (0,0). Bits 1:0 top-left, 3:2 top-right, 5:4 bottom-left,
+    // 7:6 bottom-right -- give each quadrant a *different* group (0,1,2,3),
+    // so swapping the two shifts in `fetchAttributeByte` (coarse_y's >>4 with
+    // coarse_x's >>2) shows up as top-right and bottom-left trading colors.
+    // 0b11_10_01_00 = 0xE4.
+    setAddr(&ppu, &mapper, 0x23C0);
+    ppu.writeRegister(0x2007, 0xE4, &mapper);
+
+    // Palette entry 1 of group g lives at $3F00 + g*4 + 1.
+    const group_colors = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    for (group_colors, 0..) |color, g| {
+        setAddr(&ppu, &mapper, @intCast(0x3F01 + g * 4));
+        ppu.writeRegister(0x2007, color, &mapper);
+    }
+
+    setAddr(&ppu, &mapper, 0x2000);
+    // Two $2005 writes of 0 -- see the first test in this file for why $2006
+    // alone leaves fine Y at 2 rather than 0.
+    ppu.writeRegister(0x2005, 0, &mapper);
+    ppu.writeRegister(0x2005, 0, &mapper);
+    ppu.writeRegister(0x2001, 0b0000_1010, &mapper); // show_bg | show_bg_left
+    while (ppu.frame < 2) ppu.tick(&mapper);
+
+    // Each placed tile's top-left pixel: nametable tile (col,row) starts at
+    // screen pixel (col*8, row*8).
+    for (spots, group_colors) |spot, expected| {
+        const px = @as(usize, spot[1]) * 8 * 256 + @as(usize, spot[0]) * 8;
+        const actual = ppu.framebuffer[px];
+        if (actual != expected) {
+            std.debug.print(
+                "quadrant at tile ({d},{d}): expected palette group color ${X:0>2}, got ${X:0>2}\n",
+                .{ spot[0], spot[1], expected, actual },
+            );
+        }
+        try testing.expectEqual(expected, actual);
+    }
+}
+
+test "fine-X scroll shifts the rendered background left by fine_x pixels" {
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
+    var ppu = Ppu.init(.horizontal);
+
+    // Solid pixel-value-1 tile at nametable tile (1,0) -- screen columns 8-15
+    // with no scroll at all.
+    writeSequential(&ppu, &mapper, 0x0010, &([_]u8{0xFF} ** 8));
+    writeSequential(&ppu, &mapper, 0x0018, &([_]u8{0x00} ** 8));
+    setAddr(&ppu, &mapper, 0x2000 + 1);
+    ppu.writeRegister(0x2007, 1, &mapper);
+    setAddr(&ppu, &mapper, 0x3F00);
+    ppu.writeRegister(0x2007, 0x0F, &mapper); // backdrop
+    setAddr(&ppu, &mapper, 0x3F01);
+    ppu.writeRegister(0x2007, 0x21, &mapper); // group 0, pixel value 1
+
+    setAddr(&ppu, &mapper, 0x2000);
+    // PPUSCROLL's first write splits into fine X (value & 7) and coarse X
+    // (value >> 3): 3 means three pixels of fine-X scroll, no coarse scroll.
+    ppu.writeRegister(0x2005, 3, &mapper);
+    ppu.writeRegister(0x2005, 0, &mapper); // fine Y = 0, coarse Y = 0
+    try testing.expectEqual(@as(u3, 3), ppu.fine_x);
+
+    ppu.writeRegister(0x2001, 0b0000_1010, &mapper);
+    while (ppu.frame < 2) ppu.tick(&mapper);
+
+    // Scrolling the camera right by 3 pixels moves the image left by 3, so
+    // the tile that would cover columns 8-15 now covers 5-12. This is the
+    // only test that reaches `outputPixel`'s `0x8000 >> fine_x` mux with a
+    // non-zero shift; without it, fine X is exercised as a stored register
+    // value and nothing more.
+    for (0..256) |col| {
+        const expected: u8 = if (col >= 5 and col < 13) 0x21 else 0x0F;
+        const actual = ppu.framebuffer[col];
+        if (actual != expected) {
+            std.debug.print(
+                "fine-X mismatch at row 0 col {d}: expected ${X:0>2}, got ${X:0>2}\n",
+                .{ col, expected, actual },
+            );
+        }
+        try testing.expectEqual(expected, actual);
     }
 }
