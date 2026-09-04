@@ -196,13 +196,18 @@ pub const Ppu = struct {
     /// What survives a CPU /RESET vs. what a fresh `Ppu.init` gives you.
     /// Per https://www.nesdev.org/wiki/PPU_power_up_state: PPUCTRL, PPUMASK,
     /// the $2005/$2006 write toggle, and the PPUDATA read buffer are
-    /// cleared; PPUSTATUS (the VBL flag included), OAMADDR, OAM, VRAM,
-    /// palette RAM, and the v/t/x scroll registers all survive untouched.
+    /// cleared; PPUSTATUS (the VBL flag included), OAMADDR, OAM, VRAM, and
+    /// palette RAM survive untouched. The same page is explicit that `t`
+    /// (the "VRAM address latch") and fine X *also* clear -- only `v` (the
+    /// actual current VRAM address) survives -- so PPUSCROLL/PPUADDR's
+    /// pending-write state resets right along with the toggle that gates it.
     pub fn reset(self: *Ppu) void {
         self.ctrl = .{};
         self.mask = .{};
         self.w = false;
         self.read_buffer = 0;
+        self.t = 0;
+        self.fine_x = 0;
     }
 
     pub fn nmiSignal(self: *const Ppu) bool {
@@ -439,9 +444,13 @@ pub const Ppu = struct {
     /// byte, pattern low, pattern high -- 2 dots each on real hardware; we
     /// perform each fetch's actual bus read on its *second* dot and treat
     /// the first as address setup, which is invisible to anything that
-    /// doesn't snoop the PPU bus mid-fetch), so 256 dots fetch exactly the
+    /// doesn't snoop the PPU bus mid-fetch), so dots 1-256 fetch exactly the
     /// 32 tiles a scanline needs, and dots 321-336 prefetch the first two
-    /// tiles of the *next* scanline into the pipeline ahead of time.
+    /// tiles of the *next* scanline into the pipeline ahead of time. Dot 257
+    /// also falls in `fetching`'s range below (it re-runs case 0's NT fetch
+    /// using the pre-`transferAddressX` `v`), but that value is dead: dot
+    /// 321's real fetch overwrites it before anything reads it, so this is
+    /// inert, not a 33rd tile.
     fn renderCycle(self: *Ppu, mapper: *Mapper) void {
         const d = self.dot;
         const fetching = (d >= 1 and d <= 257) or (d >= 321 and d <= 337);
@@ -482,6 +491,16 @@ pub const Ppu = struct {
         }
     }
 
+    /// **Known gap**: real hardware, while rendering is disabled, shows
+    /// whichever palette entry `v` currently points to (if `v` happens to
+    /// address `$3F00-$3FFF`) instead of always the universal backdrop
+    /// (`palette[0]`) -- see https://www.nesdev.org/wiki/PPU_palettes. That
+    /// lets a program flash the whole screen a chosen color by parking `v`
+    /// there via `$2006`. Not modeled: `color_index` below is unconditionally
+    /// `palette[0]` regardless of `v`. Harmless for this milestone's own
+    /// tests (none park `v` in palette space while rendering is off), flagged
+    /// so it reads as known rather than as an oversight for whoever next
+    /// touches this function.
     fn outputPixel(self: *Ppu) void {
         const col = self.dot - 1;
         const row = self.scanline;
@@ -742,7 +761,7 @@ test "palette writes mirror $3F10/$14/$18/$1C onto $3F00/$04/$08/$0C" {
     try testing.expectEqual(@as(u8, 0x2A), ppu.palette[0x10 & 0x1F & ~@as(u16, 0x10)]); // = palette[0]
 }
 
-test "Ppu.reset clears PPUCTRL/PPUMASK/the write toggle/the read buffer, nothing else" {
+test "Ppu.reset clears PPUCTRL/PPUMASK/the write toggle/the read buffer/t/fine_x, but not v or PPUSTATUS/OAM" {
     var ppu = testPpu(.horizontal);
     ppu.ctrl.nmi_enable = true;
     ppu.mask.show_bg = true;
@@ -751,11 +770,18 @@ test "Ppu.reset clears PPUCTRL/PPUMASK/the write toggle/the read buffer, nothing
     ppu.status.vblank = true;
     ppu.oam_addr = 0x10;
     ppu.v = 0x2000;
+    ppu.t = 0x2000;
+    ppu.fine_x = 0x5;
     ppu.reset();
     try testing.expect(!ppu.ctrl.nmi_enable);
     try testing.expect(!ppu.mask.show_bg);
     try testing.expect(!ppu.w);
     try testing.expectEqual(@as(u8, 0), ppu.read_buffer);
+    // Per https://www.nesdev.org/wiki/PPU_power_up_state: reset clears `t`
+    // (the "VRAM address latch") and fine X along with the toggle that
+    // gates them -- only `v`, the actual current VRAM address, survives.
+    try testing.expectEqual(@as(u15, 0), ppu.t);
+    try testing.expectEqual(@as(u3, 0), ppu.fine_x);
     try testing.expect(ppu.status.vblank); // survives reset
     try testing.expectEqual(@as(u8, 0x10), ppu.oam_addr); // survives reset
     try testing.expectEqual(@as(u15, 0x2000), ppu.v); // survives reset

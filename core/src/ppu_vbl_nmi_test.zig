@@ -177,16 +177,18 @@ test "ppu_vbl_nmi 06-suppression" {
 // which is what pins the gap down to this specific direction rather than to
 // NMI edge-timing in general.
 //
-// Both `Cpu.read` and `Cpu.write` fold this milestone's fixed 3-PPU-dots-
-// per-CPU-cycle ratio into "tick 3 dots, *then* touch the bus" (reads) or
-// "touch the bus, *then* tick 3 dots" (writes) -- see the doc comments on
-// `Cpu.tick`, `Cpu.write`, and `Cpu.nmi_ready`. That, plus a single NMI poll
-// wedged after the first of the 3 dots, is exactly what makes
-// `06-suppression`, `08-nmi_off_timing`, and the dispatch-delay behavior
-// `04-nmi_control`/`05-nmi_timing` check all resolve correctly to real
-// single-PPU-dot precision -- verified by writing out the R-vs-D (read-dot
-// vs. set-dot) case analysis for all three within-a-cycle alignments and
-// confirming each matches the NESdev-documented suppression window exactly.
+// `Cpu.read` and `Cpu.write` are structurally identical in their access
+// ordering -- both call `tick()` (3 PPU dots per cycle, with a single NMI
+// poll wedged after the first of the 3) *before* touching the bus, then poll
+// once more *after* the access -- see the doc comments on `Cpu.tick`,
+// `Cpu.read`/`Cpu.write`, and `Cpu.nmi_ready`. That single mid-tick poll
+// point is what gives `06-suppression`, `08-nmi_off_timing`, and the
+// dispatch-delay behavior `04-nmi_control`/`05-nmi_timing` check real
+// single-PPU-dot precision for the *level* they each sample there (the VBL
+// flag, gated by PPUCTRL's NMI-enable bit) -- verified by writing out the
+// R-vs-D (read-dot vs. set-dot) case analysis for all three within-a-cycle
+// alignments and confirming each matches the NESdev-documented suppression
+// window exactly.
 //
 // `07-nmi_on_timing` needs the *opposite* comparison: whether a WRITE
 // (enabling NMI) landed before or after the VBL flag's *clear* at
