@@ -31,6 +31,28 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/roms/nestest/nestest.log"),
     });
 
+    // The 10 individual `ppu_vbl_nmi` sub-tests (each independently confirmed
+    // mapper 0/NROM -- the combined multi-test ROM is mapper 1/MMC1, which
+    // this codebase cannot run). Same native-test-only treatment as nestest's
+    // fixtures above.
+    const ppu_vbl_nmi_names = [_][]const u8{
+        "01-vbl_basics",
+        "02-vbl_set_time",
+        "03-vbl_clear_time",
+        "04-nmi_control",
+        "05-nmi_timing",
+        "06-suppression",
+        "07-nmi_on_timing",
+        "08-nmi_off_timing",
+        "09-even_odd_frames",
+        "10-even_odd_timing",
+    };
+    for (ppu_vbl_nmi_names) |name| {
+        test_mod.addAnonymousImport(name, .{
+            .root_source_file = b.path(b.fmt("tests/roms/ppu_vbl_nmi/rom_singles/{s}.nes", .{name})),
+        });
+    }
+
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");

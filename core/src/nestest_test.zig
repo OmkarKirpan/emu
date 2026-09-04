@@ -208,7 +208,7 @@ fn reportMismatch(instruction: usize, expected: Expected, actual: cpu_mod.Cpu.Tr
 
 test "nestest automation run matches nestest.log instruction for instruction" {
     const rom = try rom_mod.Rom.load(nestest_rom);
-    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom));
+    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
     var cpu = cpu_mod.Cpu.init(&bus);
 
     // A real RESET first (7 cycles, S = $FD, I set), then jump to the
