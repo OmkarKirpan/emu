@@ -37,6 +37,27 @@ pub const rgb: [64][3]u8 = .{
     .{ 0xB5, 0xEB, 0xF2 }, .{ 0xB8, 0xB8, 0xB8 }, .{ 0x00, 0x00, 0x00 }, .{ 0x00, 0x00, 0x00 },
 };
 
+/// `rgb`, pre-packed into the exact little-endian byte order an RGBA8
+/// framebuffer wants (R at the lowest address, then G, B, and an opaque
+/// alpha) -- so resolving a pixel is one `u32` load and one `u32` store
+/// rather than three byte loads, three byte stores, and a constant alpha
+/// store (see `wasm.zig`'s `resolveFramebuffer`, which runs this 61,440
+/// times per frame at 60fps). Derived from `rgb` at comptime rather than
+/// written out a second time: `rgb` above stays the single, readable,
+/// greppable source of truth, and the two can never drift.
+///
+/// wasm is little-endian, so byte 0 of each `u32` is its low byte.
+pub const rgba: [64]u32 = blk: {
+    var packed_table: [64]u32 = undefined;
+    for (rgb, &packed_table) |color, *entry| {
+        entry.* = @as(u32, color[0]) |
+            (@as(u32, color[1]) << 8) |
+            (@as(u32, color[2]) << 16) |
+            0xFF00_0000;
+    }
+    break :blk packed_table;
+};
+
 test "rgb has exactly 64 entries, one per 6-bit palette index" {
     try testing.expectEqual(@as(usize, 64), rgb.len);
 }
@@ -47,4 +68,14 @@ test "index $0F -- the universal backdrop most ROMs park in palette[0] -- is bla
 
 test "index $30 is the palette's brightest whitish entry" {
     try testing.expectEqual([3]u8{ 0xFF, 0xFE, 0xFF }, rgb[0x30]);
+}
+
+test "rgba packs every rgb entry into little-endian R,G,B,255 byte order" {
+    for (rgb, rgba) |color, entry| {
+        const bytes: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, entry));
+        try testing.expectEqual(color[0], bytes[0]);
+        try testing.expectEqual(color[1], bytes[1]);
+        try testing.expectEqual(color[2], bytes[2]);
+        try testing.expectEqual(@as(u8, 0xFF), bytes[3]);
+    }
 }

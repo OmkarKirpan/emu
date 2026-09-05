@@ -53,17 +53,18 @@ export class KeyboardController {
     window.removeEventListener('keyup', this.handleKeyUp)
   }
 
-  private handleKeyDown = (event: KeyboardEvent): void => {
+  // Arrow properties, not methods: `removeEventListener` needs the same
+  // function identity `addEventListener` was given.
+  private handleKeyDown = (event: KeyboardEvent): void => this.apply(event, true)
+  private handleKeyUp = (event: KeyboardEvent): void => this.apply(event, false)
+
+  /** Both directions differ only in which way the bit moves, so the mapped-key
+   * policy (what counts as mapped, and that mapped keys are swallowed) lives
+   * in one place rather than being kept in sync across two handlers. */
+  private apply(event: KeyboardEvent, pressed: boolean): void {
     const bit = KEY_MAP[event.code]
     if (bit === undefined) return
     event.preventDefault() // mapped keys (esp. arrows) shouldn't scroll the page
-    this.buttons |= bit
-  }
-
-  private handleKeyUp = (event: KeyboardEvent): void => {
-    const bit = KEY_MAP[event.code]
-    if (bit === undefined) return
-    event.preventDefault()
-    this.buttons &= ~bit
+    this.buttons = pressed ? this.buttons | bit : this.buttons & ~bit
   }
 }

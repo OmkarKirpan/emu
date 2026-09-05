@@ -52,8 +52,13 @@ export class RomLoadError extends Error {
         return `ROM file is truncated (only ${context} bytes were readable).`
       case RomStatus.RomTooLarge:
         return `ROM file is too large (the core's cap is ${context} bytes).`
-      case RomStatus.Ok:
-        return 'not an error'
+      default:
+        // Unreachable for the codes above, and `loadRom` never constructs
+        // this for `Ok` -- but a `default` (rather than an `Ok` arm that
+        // returns a lie) means a status code added on the Zig side reads as
+        // an honest unknown here instead of falling out of the switch as
+        // `undefined`.
+        return `ROM load failed (status ${status}).`
     }
   }
 }
@@ -76,23 +81,22 @@ interface CoreExports {
  * One instantiated core module, wrapping ENG-60's raw ABI. Two things this
  * class exists to get right that the raw exports alone don't:
  *
- * 1. **The framebuffer view can be invalidated.** A `memory.grow` (e.g.
- *    inside `alloc`, which can happen on every `loadRom`) detaches every
- *    existing typed-array view over that memory (ENG-60 flags this
- *    explicitly) — so this re-views lazily whenever the underlying
- *    `ArrayBuffer` identity has changed, rather than handing out one view
- *    that can go stale underneath the caller.
+ * 1. **A framebuffer view can go stale.** A `memory.grow` (which `alloc`
+ *    can trigger, so every `loadRom` can) detaches every existing
+ *    typed-array view over that memory — ENG-60 flags this explicitly, and
+ *    a detached view silently reads as empty rather than throwing. So
+ *    `stepFrame` hands back a freshly-built view every time instead of
+ *    caching one: unconditionally correct, and a view object per frame is
+ *    nothing next to the 16.67ms it is handed out for.
  * 2. **Every fallible call maps its `i32` status to a real exception**,
  *    with `get_last_error_context()` folded in, so callers never have to
  *    remember to check a magic number themselves.
  */
 export class NesCore {
   private readonly exports: CoreExports
-  private framebufferView: Uint8ClampedArray<ArrayBuffer>
 
   private constructor(exports: CoreExports) {
     this.exports = exports
-    this.framebufferView = this.viewFramebuffer()
   }
 
   static async create(): Promise<NesCore> {
@@ -124,14 +128,12 @@ export class NesCore {
 
   /** Advances exactly one NTSC video frame and returns a live view onto the
    * resolved RGBA8 framebuffer (ENG-60) — safe to hand straight to
-   * `ImageData`. The view is reused across calls when the backing memory
-   * hasn't moved, so this allocates nothing on the steady-state path. */
+   * `ImageData`, and deliberately raw rather than pre-wrapped, so the
+   * WebGPU texture-upload path this same buffer is designed to feed later
+   * isn't forced through a Canvas-2D-shaped type. */
   stepFrame(): Uint8ClampedArray<ArrayBuffer> {
     this.exports.step_frame()
-    if (this.framebufferView.buffer !== this.exports.memory.buffer) {
-      this.framebufferView = this.viewFramebuffer()
-    }
-    return this.framebufferView
+    return this.viewFramebuffer()
   }
 
   /** One packed byte per controller, NES bit order — see

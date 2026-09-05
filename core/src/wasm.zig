@@ -63,11 +63,21 @@ var g_loaded: bool = false;
 
 var g_last_error_context: u32 = 0;
 
+const pixel_count = @typeInfo(@FieldType(core.Ppu, "framebuffer")).array.len;
+
 /// Fixed static RGBA8 buffer `get_framebuffer_ptr` points at -- one 32-bit
 /// color per `Ppu.framebuffer` palette-index entry, refreshed at the end of
 /// every `step_frame`. See `resolveFramebuffer`'s doc comment for why the
 /// resolve happens here rather than inside `Ppu.outputPixel` itself.
-var rgba_framebuffer: [256 * 240 * 4]u8 = [_]u8{0} ** (256 * 240 * 4);
+///
+/// Typed `u32` rather than `[N * 4]u8` so a pixel is one store, and sized
+/// off `Ppu.framebuffer`'s own length rather than restating 256x240: that
+/// makes `resolveFramebuffer`'s two-object `for` a compile-time length
+/// check, so a future change to the PPU's framebuffer dimensions fails the
+/// build here instead of silently writing past this buffer. The host still
+/// sees plain RGBA8 bytes -- `u32` is 4-byte aligned, which is exactly what
+/// a `Uint8ClampedArray` view (and `putImageData`) wants.
+var rgba_framebuffer: [pixel_count]u32 = [_]u32{0} ** pixel_count;
 
 /// Generic byte-buffer staging (ENG-60): the host allocates, copies a
 /// `Uint8Array` view in, then passes `(ptr, len)` to whichever export
@@ -92,27 +102,25 @@ export fn free(ptr: u32, size: u32) void {
 /// malformed ROM can never partially overwrite `rom_storage` and corrupt an
 /// already-running machine -- see `load_rom`.
 fn validate(data: []const u8) ?i32 {
-    const rom = core.Rom.load(data) catch |err| {
-        g_last_error_context = switch (err) {
-            error.TooShort, error.BadMagic => 0,
-            error.Truncated => @intCast(data.len),
-        };
-        return switch (err) {
-            error.TooShort, error.BadMagic => status_invalid_header,
-            error.Truncated => status_truncated_data,
-        };
+    const rom = core.Rom.load(data) catch |err| switch (err) {
+        error.TooShort, error.BadMagic => {
+            g_last_error_context = 0;
+            return status_invalid_header;
+        },
+        error.Truncated => {
+            g_last_error_context = @intCast(data.len);
+            return status_truncated_data;
+        },
     };
-    _ = core.createMapper(rom) catch |err| {
-        switch (err) {
-            error.UnsupportedMapper => {
-                g_last_error_context = rom.header.mapper;
-                return status_unsupported_mapper;
-            },
-            error.InvalidRomGeometry => {
-                g_last_error_context = 0;
-                return status_invalid_header;
-            },
-        }
+    _ = core.createMapper(rom) catch |err| switch (err) {
+        error.UnsupportedMapper => {
+            g_last_error_context = rom.header.mapper;
+            return status_unsupported_mapper;
+        },
+        error.InvalidRomGeometry => {
+            g_last_error_context = 0;
+            return status_invalid_header;
+        },
     };
     return null;
 }
@@ -196,15 +204,13 @@ export fn get_last_error_context() u32 {
 /// `palette.zig`'s color-table dependency -- `Ppu`'s own tests assert
 /// palette *indices*, which would otherwise all need rewriting to assert
 /// RGB triples instead.
+///
+/// The `& 0x3F` is not defensive: `outputPixel` already masks every value it
+/// writes, but restating it here keeps the index a provable `u6` into a
+/// 64-entry table, so the bounds check folds away instead of becoming a
+/// branch and a panic path in every non-ReleaseFast build.
 fn resolveFramebuffer() void {
-    const indices = &g_bus.ppu.framebuffer;
-    var i: usize = 0;
-    while (i < indices.len) : (i += 1) {
-        const color = palette.rgb[indices[i] & 0x3F];
-        const o = i * 4;
-        rgba_framebuffer[o + 0] = color[0];
-        rgba_framebuffer[o + 1] = color[1];
-        rgba_framebuffer[o + 2] = color[2];
-        rgba_framebuffer[o + 3] = 0xFF;
+    for (&g_bus.ppu.framebuffer, &rgba_framebuffer) |index, *out| {
+        out.* = palette.rgba[index & 0x3F];
     }
 }
