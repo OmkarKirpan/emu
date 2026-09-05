@@ -17,9 +17,8 @@
 const std = @import("std");
 const testing = std.testing;
 
-const rom_mod = @import("rom.zig");
 const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
+const Machine = @import("machine.zig").Machine;
 
 /// NTSC CPU clock, Hz. Used only to convert Blargg's "at least 100 msec"
 /// reset-delay requirement into a cycle count.
@@ -50,61 +49,49 @@ fn statusText(bus: *const bus_mod.Bus, buf: []u8) []const u8 {
     return buf[0..i];
 }
 
-/// One booted machine, kept as a struct so `cpu`'s pointer to `bus` stays
-/// valid: `Cpu` borrows `*Bus`, so the pair has to reach its final address
-/// before being wired together. Two-phase init (`var m: Machine = undefined;
-/// try m.init(rom)`) is the same shape `cpu.zig`'s own `TestHarness` uses.
-pub const Machine = struct {
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Cpu,
-
-    pub fn init(self: *Machine, rom_bytes: []const u8) !void {
-        const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-        self.cpu = cpu_mod.Cpu.init(&self.bus);
-        self.cpu.reset();
-    }
-
-    /// Run until `$6000` reports a terminal result code, and return it.
-    ///
-    /// Polls `$6000` via `bus.peek` (side-effect-free -- the ROM itself owns
-    /// that address's real read/write through `Bus.read`/`Bus.write` as part
-    /// of `cpu.step`; polling separately must not perturb anything). Handles
-    /// the `$81` "needs a reset, delayed >=100ms" code by running out that
-    /// delay in emulated NES time and then calling `cpu.reset()`, exactly per
-    /// the documented protocol. Bounded by `max_cycles` so a ROM that spins
-    /// forever fails the test instead of hanging CI.
-    pub fn runToTerminalStatus(self: *Machine) !u8 {
-        var resets: u32 = 0;
-        while (true) {
-            if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-            self.cpu.step();
-            if (self.bus.peek(0x6001) != 0xDE or
-                self.bus.peek(0x6002) != 0xB0 or
-                self.bus.peek(0x6003) != 0x61) continue;
-            const s = self.bus.peek(0x6000);
-            if (s == 0x80) continue;
-            if (s == 0x81) {
-                resets += 1;
-                if (resets > max_resets) return HarnessError.TooManyResets;
-                const target = self.cpu.cycles + min_reset_delay_cycles;
-                while (self.cpu.cycles < target) {
-                    if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-                    self.cpu.step();
-                }
-                self.cpu.reset();
-                continue;
+/// Run `m` until `$6000` reports a terminal result code, and return it.
+///
+/// Polls `$6000` via `bus.peek` (side-effect-free -- the ROM itself owns
+/// that address's real read/write through `Bus.read`/`Bus.write` as part
+/// of `cpu.step`; polling separately must not perturb anything). Handles
+/// the `$81` "needs a reset, delayed >=100ms" code by running out that
+/// delay in emulated NES time and then calling `cpu.reset()`, exactly per
+/// the documented protocol. Bounded by `max_cycles` so a ROM that spins
+/// forever fails the test instead of hanging CI.
+///
+/// A free function taking `*Machine` rather than a method: the booted
+/// console itself is shared (`machine.zig`), and this protocol is one
+/// particular thing to do with one, not part of what a machine is.
+pub fn runToTerminalStatus(m: *Machine) !u8 {
+    var resets: u32 = 0;
+    while (true) {
+        if (m.cpu.cycles > max_cycles) return HarnessError.Timeout;
+        m.cpu.step();
+        if (m.bus.peek(0x6001) != 0xDE or
+            m.bus.peek(0x6002) != 0xB0 or
+            m.bus.peek(0x6003) != 0x61) continue;
+        const s = m.bus.peek(0x6000);
+        if (s == 0x80) continue;
+        if (s == 0x81) {
+            resets += 1;
+            if (resets > max_resets) return HarnessError.TooManyResets;
+            const target = m.cpu.cycles + min_reset_delay_cycles;
+            while (m.cpu.cycles < target) {
+                if (m.cpu.cycles > max_cycles) return HarnessError.Timeout;
+                m.cpu.step();
             }
-            return s;
+            m.cpu.reset();
+            continue;
         }
+        return s;
     }
-};
+}
 
 /// Run one Blargg-protocol ROM, asserting its result code is `$00` (pass).
 pub fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
     var m: Machine = undefined;
     try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
+    const status = try runToTerminalStatus(&m);
 
     if (status != 0) {
         var buf: [256]u8 = undefined;

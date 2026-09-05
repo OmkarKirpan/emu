@@ -5,6 +5,7 @@ pub const cpu = @import("cpu.zig");
 pub const ppu = @import("ppu.zig");
 pub const controller = @import("controller.zig");
 pub const palette = @import("palette.zig");
+pub const machine = @import("machine.zig");
 
 pub const Rom = rom.Rom;
 pub const Header = rom.Header;
@@ -21,6 +22,7 @@ pub const Ctrl = ppu.Ctrl;
 pub const Mask = ppu.Mask;
 pub const Status = ppu.Status;
 pub const Controller = controller.Controller;
+pub const Machine = machine.Machine;
 
 // No force-analysis block here, deliberately. One used to live at this spot,
 // forcing codegen of the whole public surface because `root.zig` was itself

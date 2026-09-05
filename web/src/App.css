@@ -45,6 +45,25 @@
   color: #ffb3b3;
 }
 
+.reset {
+  font-family: var(--mono);
+  font-size: 14px;
+  padding: 6px 16px;
+  border-radius: 6px;
+  color: var(--text-h);
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    border-color: var(--text);
+  }
+  &:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+}
+
 .controls {
   font-family: var(--mono);
   font-size: 14px;

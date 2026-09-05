@@ -16,44 +16,18 @@
 const std = @import("std");
 const testing = std.testing;
 
-const rom_mod = @import("rom.zig");
-const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
 const controller_mod = @import("controller.zig");
+const Machine = @import("machine.zig").Machine;
 
-const Machine = struct {
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Cpu,
-
-    fn init(self: *Machine, rom_bytes: []const u8) !void {
-        const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-        self.cpu = cpu_mod.Cpu.init(&self.bus);
-        self.cpu.reset();
-    }
-
-    /// Run until `Ppu.frame` has advanced by exactly `n` -- keyed off the
-    /// PPU's own frame counter rather than a guessed CPU-cycle budget, so
-    /// this is exact regardless of the odd-frame dot skip or of exactly
-    /// where in a frame the ROM's own per-frame (NMI-driven) work happens.
-    /// `frame` incrementing at all also guarantees at least one full VBLANK
-    /// -- and therefore at least one opportunity for this ROM's NMI handler
-    /// to fire -- has occurred.
-    fn runFrames(self: *Machine, n: u32) void {
-        const target = self.bus.ppu.frame + n;
-        while (self.bus.ppu.frame < target) self.cpu.step();
-    }
-
-    /// Screen column of the sprite's leftmost pixel, read back from live
-    /// OAM (not the CPU's own zero-page mirror) -- proof the value actually
-    /// made it through OAMDMA into the PPU, not just into WRAM.
-    fn spriteX(self: *const Machine) u8 {
-        return self.bus.ppu.oam[3];
-    }
-    fn spriteY(self: *const Machine) u8 {
-        return self.bus.ppu.oam[0];
-    }
-};
+/// Screen column of the sprite's leftmost pixel, read back from live OAM
+/// (not the CPU's own zero-page mirror) -- proof the value actually made it
+/// through OAMDMA into the PPU, not just into WRAM.
+fn spriteX(m: *const Machine) u8 {
+    return m.bus.ppu.oam[3];
+}
+fn spriteY(m: *const Machine) u8 {
+    return m.bus.ppu.oam[0];
+}
 
 // Every test below waits out this many frames before its first check. Boot
 // (2 vblank-polled waits) plus the NMI-driven main loop's own first OAMDMA
@@ -71,8 +45,8 @@ test "sprite_input_demo: boots, DMAs OAM, and renders the sprite at its initial 
     try m.init(@embedFile("sprite_input_demo"));
     m.runFrames(settle_frames);
 
-    try testing.expectEqual(@as(u8, 0x70), m.spriteY());
-    try testing.expectEqual(@as(u8, 0x80), m.spriteX());
+    try testing.expectEqual(@as(u8, 0x70), spriteY(&m));
+    try testing.expectEqual(@as(u8, 0x80), spriteX(&m));
 
     // Tile 1 is a solid 8x8 block of pixel value 3, sprite palette group 0
     // -> palette RAM index $3F13 (sprite palettes start at $3F10, *not*
@@ -99,53 +73,53 @@ test "sprite_input_demo: holding no buttons leaves the sprite exactly where it s
     var m: Machine = undefined;
     try m.init(@embedFile("sprite_input_demo"));
     m.runFrames(settle_frames);
-    const x0 = m.spriteX();
-    const y0 = m.spriteY();
+    const x0 = spriteX(&m);
+    const y0 = spriteY(&m);
 
     m.runFrames(5);
-    try testing.expectEqual(x0, m.spriteX());
-    try testing.expectEqual(y0, m.spriteY());
+    try testing.expectEqual(x0, spriteX(&m));
+    try testing.expectEqual(y0, spriteY(&m));
 }
 
 test "sprite_input_demo: holding Right moves the sprite right, frame by frame, through real controller input" {
     var m: Machine = undefined;
     try m.init(@embedFile("sprite_input_demo"));
     m.runFrames(settle_frames);
-    const x0 = m.spriteX();
+    const x0 = spriteX(&m);
 
     m.bus.controllers[0].setButtons(controller_mod.button_right);
     m.runFrames(8);
 
-    try testing.expect(m.spriteX() > x0);
-    try testing.expect(@as(u16, m.spriteX()) <= @as(u16, x0) + 8);
+    try testing.expect(spriteX(&m) > x0);
+    try testing.expect(@as(u16, spriteX(&m)) <= @as(u16, x0) + 8);
 }
 
 test "sprite_input_demo: holding Left moves the sprite left" {
     var m: Machine = undefined;
     try m.init(@embedFile("sprite_input_demo"));
     m.runFrames(settle_frames);
-    const x0 = m.spriteX();
+    const x0 = spriteX(&m);
 
     m.bus.controllers[0].setButtons(controller_mod.button_left);
     m.runFrames(8);
 
-    try testing.expect(m.spriteX() < x0);
+    try testing.expect(spriteX(&m) < x0);
 }
 
 test "sprite_input_demo: holding Up then Down moves the sprite vertically both ways" {
     var m: Machine = undefined;
     try m.init(@embedFile("sprite_input_demo"));
     m.runFrames(settle_frames);
-    const y0 = m.spriteY();
+    const y0 = spriteY(&m);
 
     m.bus.controllers[0].setButtons(controller_mod.button_up);
     m.runFrames(8);
-    const y1 = m.spriteY();
+    const y1 = spriteY(&m);
     try testing.expect(y1 < y0); // up = smaller Y = higher on screen
 
     m.bus.controllers[0].setButtons(controller_mod.button_down);
     m.runFrames(8);
-    try testing.expect(m.spriteY() > y1);
+    try testing.expect(spriteY(&m) > y1);
 }
 
 test "sprite_input_demo: releasing all buttons stops further movement" {
@@ -164,8 +138,8 @@ test "sprite_input_demo: releasing all buttons stops further movement" {
     // this stays generous rather than pinned to a specific frame count.
     m.bus.controllers[0].setButtons(0);
     m.runFrames(3);
-    const settled = m.spriteX();
+    const settled = spriteX(&m);
 
     m.runFrames(5);
-    try testing.expectEqual(settled, m.spriteX());
+    try testing.expectEqual(settled, spriteX(&m));
 }

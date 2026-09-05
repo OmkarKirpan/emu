@@ -13,7 +13,7 @@
 //!     codebase's own background-rendering pipeline and observing the text
 //!     land byte-for-byte in `Ppu.vram` (tile ID = ASCII code). See
 //!     `core/tests/roms/sprite_hit_tests_2005.10.05/ATTRIBUTION.md` for the
-//!     full derivation. `NametableMachine`/`runToResult` below implement
+//!     full derivation. `nametableText`/`runToResult` below implement
 //!     that detection instead of polling `$6000`.
 //!
 //! All four suites pass in full. `oam_stress` and
@@ -27,10 +27,8 @@
 const std = @import("std");
 const testing = std.testing;
 
-const rom_mod = @import("rom.zig");
-const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
 const determinism = @import("determinism.zig");
+const Machine = @import("machine.zig").Machine;
 const harness = @import("blargg_harness.zig");
 
 // ------------------------------------------------- $6000-protocol suites
@@ -59,22 +57,10 @@ test "oam_stress" {
 /// maps logical nametable 0 to physical bank 0 either way), so reading the
 /// first 960 bytes (32x30 tiles, before the 64-byte attribute table at
 /// $3C0-$3FF) directly is valid for any of these ROMs' mirroring header.
-const NametableMachine = struct {
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Cpu,
-
-    fn init(self: *NametableMachine, rom_bytes: []const u8) !void {
-        const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-        self.cpu = cpu_mod.Cpu.init(&self.bus);
-        self.cpu.reset();
-    }
-
-    fn nametableText(self: *const NametableMachine, buf: *[960]u8) []const u8 {
-        @memcpy(buf, self.bus.ppu.vram[0..960]);
-        return buf[0..960];
-    }
-};
+fn nametableText(m: *const Machine, buf: *[960]u8) []const u8 {
+    @memcpy(buf, m.bus.ppu.vram[0..960]);
+    return buf[0..960];
+}
 
 /// Generous ceiling on total emulated CPU cycles (roughly 45 seconds of NES
 /// time). Every ROM in these two suites reports a result in well under a
@@ -99,12 +85,12 @@ fn failureCode(text: []const u8, failed_at: usize) ?u32 {
     return code;
 }
 
-fn runToResult(m: *NametableMachine) !NametableResult {
+fn runToResult(m: *Machine) !NametableResult {
     var buf: [960]u8 = undefined;
     while (m.cpu.cycles < max_cycles) {
         const target = m.cpu.cycles + poll_interval_cycles;
         while (m.cpu.cycles < target) m.cpu.step();
-        const text = m.nametableText(&buf);
+        const text = nametableText(m, &buf);
         if (std.mem.indexOf(u8, text, "PASSED")) |_| return .passed;
         if (std.mem.indexOf(u8, text, "FAILED")) |idx| {
             if (failureCode(text, idx)) |code| return .{ .failed = code };
@@ -114,7 +100,7 @@ fn runToResult(m: *NametableMachine) !NametableResult {
 }
 
 fn expectPassText(name: []const u8, rom_bytes: []const u8) !void {
-    var m: NametableMachine = undefined;
+    var m: Machine = undefined;
     try m.init(rom_bytes);
     switch (try runToResult(&m)) {
         .passed => {},

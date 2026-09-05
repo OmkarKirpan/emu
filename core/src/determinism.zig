@@ -33,12 +33,12 @@
 const std = @import("std");
 const testing = std.testing;
 
-const rom_mod = @import("rom.zig");
 const bus_mod = @import("bus.zig");
 const cpu_mod = @import("cpu.zig");
 const ppu_mod = @import("ppu.zig");
 const mapper_mod = @import("mapper.zig");
 const controller_mod = @import("controller.zig");
+const Machine = @import("machine.zig").Machine;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Digest = [Sha256.digest_length]u8;
@@ -53,12 +53,10 @@ pub fn assertDeterministic(rom_bytes: []const u8, cycles: u64) !void {
 }
 
 fn runAndHash(rom_bytes: []const u8, cycles: u64) !Digest {
-    const rom = try rom_mod.Rom.load(rom_bytes);
-    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu = cpu_mod.Cpu.init(&bus);
-    cpu.reset();
-    while (cpu.cycles < cycles) cpu.step();
-    return hashState(&cpu, &bus);
+    var m: Machine = undefined;
+    try m.init(rom_bytes);
+    while (m.cpu.cycles < cycles) m.cpu.step();
+    return hashState(&m.cpu, &m.bus);
 }
 
 /// Factored out of `runAndHash` so tests can hash two independently-built
@@ -225,37 +223,29 @@ fn minimalNromBuf() [16 + 0x4000]u8 {
 
 test "the hash changes if bus.prg_ram (the vendored ROMs' \\$6000 result-code RAM) differs" {
     const buf = minimalNromBuf();
-    const rom = try rom_mod.Rom.load(&buf);
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
 
-    var bus_a = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu_a = cpu_mod.Cpu.init(&bus_a);
-    cpu_a.reset();
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.prg_ram[0] = 0xFF; // the only difference from a_machine
 
-    var bus_b = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    bus_b.prg_ram[0] = 0xFF; // the only difference from bus_a/cpu_a
-    var cpu_b = cpu_mod.Cpu.init(&bus_b);
-    cpu_b.reset();
-
-    const a = hashState(&cpu_a, &bus_a);
-    const b = hashState(&cpu_b, &bus_b);
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
 test "the hash changes if a CHR-RAM cartridge's CHR contents differ" {
     const buf = minimalNromBuf(); // CHR size 0 -> CHR-RAM, per rom.zig
-    const rom = try rom_mod.Rom.load(&buf);
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
 
-    var bus_a = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu_a = cpu_mod.Cpu.init(&bus_a);
-    cpu_a.reset();
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.mapper.nrom.chr[0] = 0xFF; // the only difference from a_machine
 
-    var bus_b = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    bus_b.mapper.nrom.chr[0] = 0xFF; // the only difference from bus_a/cpu_a
-    var cpu_b = cpu_mod.Cpu.init(&bus_b);
-    cpu_b.reset();
-
-    const a = hashState(&cpu_a, &bus_a);
-    const b = hashState(&cpu_b, &bus_b);
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -264,36 +254,28 @@ test "the hash does NOT change if a CHR-ROM cartridge's CHR contents differ (ENG
     buf[5] = 1; // 8KB CHR-ROM instead of CHR-RAM
     var full: [16 + 0x4000 + 0x2000]u8 = [_]u8{0} ** (16 + 0x4000 + 0x2000);
     @memcpy(full[0 .. 16 + 0x4000], &buf);
-    const rom = try rom_mod.Rom.load(&full);
+    var a_machine: Machine = undefined;
+    try a_machine.init(&full);
 
-    var bus_a = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu_a = cpu_mod.Cpu.init(&bus_a);
-    cpu_a.reset();
+    var b_machine: Machine = undefined;
+    try b_machine.init(&full);
+    b_machine.bus.mapper.nrom.chr[0] = 0xFF; // CHR-ROM: mutating the copy must not move the hash
 
-    var bus_b = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    bus_b.mapper.nrom.chr[0] = 0xFF; // CHR-ROM: mutating the copy must not move the hash
-    var cpu_b = cpu_mod.Cpu.init(&bus_b);
-    cpu_b.reset();
-
-    const a = hashState(&cpu_a, &bus_a);
-    const b = hashState(&cpu_b, &bus_b);
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
     try testing.expect(std.mem.eql(u8, &a, &b));
 }
 
 test "the hash changes if controller state (ENG-68) differs" {
     const buf = minimalNromBuf();
-    const rom = try rom_mod.Rom.load(&buf);
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
 
-    var bus_a = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu_a = cpu_mod.Cpu.init(&bus_a);
-    cpu_a.reset();
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.controllers[0].setButtons(0x01); // the only difference from a_machine
 
-    var bus_b = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    bus_b.controllers[0].setButtons(0x01); // the only difference from bus_a/cpu_a
-    var cpu_b = cpu_mod.Cpu.init(&bus_b);
-    cpu_b.reset();
-
-    const a = hashState(&cpu_a, &bus_a);
-    const b = hashState(&cpu_b, &bus_b);
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }

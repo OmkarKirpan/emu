@@ -32,10 +32,13 @@ mkdirSync(wasmDestDir, { recursive: true })
 copyFileSync(join(coreRoot, 'zig-out', 'bin', 'nes_core.wasm'), join(wasmDestDir, 'nes_core.wasm'))
 console.log('[sync-core] copied nes_core.wasm -> web/src/wasm/')
 
-const romsDestDir = join(webRoot, 'public', 'roms')
+// Into `src/`, not `public/`: the app imports this through Vite's asset
+// graph (`?url`), so a missing ROM is a build error rather than a runtime
+// 404, and the served file is content-hashed like any other asset.
+const romsDestDir = join(webRoot, 'src', 'roms')
 mkdirSync(romsDestDir, { recursive: true })
 copyFileSync(
   join(coreRoot, 'tests', 'roms', 'nrom_demo', 'sprite_input_demo.nes'),
   join(romsDestDir, 'sprite_input_demo.nes'),
 )
-console.log('[sync-core] copied sprite_input_demo.nes -> web/public/roms/')
+console.log('[sync-core] copied sprite_input_demo.nes -> web/src/roms/')

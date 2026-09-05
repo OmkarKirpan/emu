@@ -1,6 +1,6 @@
 //! The wasm32-freestanding export surface (ENG-69, M4) -- the actual root
 //! module `zig build wasm` compiles. Implements the ABI ENG-60 designed: an
-//! implicit global-singleton emulator (`g_bus`/`g_cpu` below), free
+//! implicit global-singleton emulator (`g_machine` below), free
 //! functions operating on it directly, and `i32` status codes in place of
 //! exceptions (Zig has none to hand across a wasm boundary).
 //!
@@ -47,18 +47,19 @@ const max_rom_bytes = 512 * 1024;
 /// Backs the currently-loaded ROM. `Mapper.Nrom.prg_rom` borrows a slice of
 /// whatever buffer it was built from (see that type's own doc comment) --
 /// this is that buffer's permanent home, so it stays valid for the lifetime
-/// of `g_bus.mapper`, unlike the transient `alloc`'d buffer the host used to
+/// of `g_machine.bus.mapper`, unlike the transient `alloc`'d buffer used to
 /// carry the bytes across the boundary in the first place (see `load_rom`).
 var rom_storage: [max_rom_bytes]u8 = undefined;
 
-/// ENG-60's "implicit global singleton", as two package-level globals rather
-/// than a wrapping `Machine` struct: unlike a local/stack variable, a
-/// package-level global already sits at one fixed address for the whole
-/// program's lifetime, which is all `blargg_harness.Machine` and
-/// `nrom_sprite_input_test.Machine` use their own wrapping struct to
-/// guarantee for `Cpu`'s `*Bus` pointer -- so here it's unnecessary.
-var g_bus: core.Bus = undefined;
-var g_cpu: core.Cpu = undefined;
+/// ENG-60's "implicit global singleton": the one console this module ever
+/// runs, booted by `machine.zig`'s shared five-step sequence like every
+/// native harness. A package-level global never moves, which is exactly what
+/// `Machine`'s "must not be copied after `init`" rule needs (`cpu` borrows
+/// `&self.bus`).
+var g_machine: core.Machine = undefined;
+
+/// Whether `g_machine` has been booted. Everything that would touch it is a
+/// no-op until then -- see `step_frame`.
 var g_loaded: bool = false;
 
 var g_last_error_context: u32 = 0;
@@ -129,7 +130,7 @@ fn validate(data: []const u8) ?i32 {
 /// -- typically the host's `alloc`'d staging buffer, freed right after this
 /// returns (per the ABI's `alloc`/`free` contract). `validate` never keeps a
 /// reference to it, and the persistent copy this makes into `rom_storage`
-/// is what `g_bus.mapper` actually ends up pointing into afterward.
+/// is what `g_machine.bus.mapper` actually ends up pointing into afterward.
 export fn load_rom(ptr: u32, len: u32) i32 {
     if (len > max_rom_bytes) {
         g_last_error_context = max_rom_bytes;
@@ -140,33 +141,26 @@ export fn load_rom(ptr: u32, len: u32) i32 {
     if (validate(src)) |err_status| return err_status;
 
     @memcpy(rom_storage[0..len], src);
-    const persistent = rom_storage[0..len];
     // Byte-identical to what `validate` just proved parses cleanly.
-    const rom = core.Rom.load(persistent) catch unreachable;
-    const mapper = core.createMapper(rom) catch unreachable;
-
-    g_bus = core.Bus.init(mapper, rom.header.mirroring);
-    g_cpu = core.Cpu.init(&g_bus);
-    g_cpu.reset();
+    g_machine.init(rom_storage[0..len]) catch unreachable;
     g_loaded = true;
     return status_ok;
 }
 
 export fn reset() void {
     if (!g_loaded) return;
-    g_cpu.reset();
+    g_machine.cpu.reset();
 }
 
 /// One full NTSC video frame's worth of cycle-accurate CPU/PPU interleaving
 /// -- the primary playback call. A no-op before the first successful
-/// `load_rom`, rather than undefined behavior on an unloaded `g_bus`/
-/// `g_cpu`, so a host that races `step_frame` against `load_rom` (e.g. an
+/// `load_rom`, rather than undefined behavior on an unloaded `g_machine`,
+/// so a host that races `step_frame` against `load_rom` (e.g. an
 /// `requestAnimationFrame` loop already ticking before the ROM fetch lands)
 /// degrades to "nothing happened yet" instead of crashing the module.
 export fn step_frame() void {
     if (!g_loaded) return;
-    const target = g_bus.ppu.frame + 1;
-    while (g_bus.ppu.frame < target) g_cpu.step();
+    g_machine.runFrames(1);
     resolveFramebuffer();
 }
 
@@ -185,7 +179,7 @@ export fn get_framebuffer_ptr() u32 {
 /// or for a port nothing uses is not a failure the host needs to handle.
 export fn set_input(controller: u8, buttons: u8) void {
     if (!g_loaded or controller > 1) return;
-    g_bus.controllers[controller].setButtons(buttons);
+    g_machine.bus.controllers[controller].setButtons(buttons);
 }
 
 /// Valid to call after any non-zero `load_rom` status; see the status-code
@@ -210,7 +204,7 @@ export fn get_last_error_context() u32 {
 /// 64-entry table, so the bounds check folds away instead of becoming a
 /// branch and a panic path in every non-ReleaseFast build.
 fn resolveFramebuffer() void {
-    for (&g_bus.ppu.framebuffer, &rgba_framebuffer) |index, *out| {
+    for (&g_machine.bus.ppu.framebuffer, &rgba_framebuffer) |index, *out| {
         out.* = palette.rgba[index & 0x3F];
     }
 }
