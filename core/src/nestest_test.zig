@@ -53,9 +53,8 @@
 const std = @import("std");
 const testing = std.testing;
 
-const rom_mod = @import("rom.zig");
-const bus_mod = @import("bus.zig");
 const cpu_mod = @import("cpu.zig");
+const Machine = @import("machine.zig").Machine;
 
 /// Vendored fixtures, wired in as anonymous imports by `build.zig` so they are
 /// only ever pulled into the native test binary.
@@ -238,23 +237,20 @@ fn reportMismatch(
 }
 
 test "nestest automation run matches nestest.log instruction for instruction" {
-    const rom = try rom_mod.Rom.load(nestest_rom);
-    var bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-    var cpu = cpu_mod.Cpu.init(&bus);
-
-    // A real RESET first (7 cycles, S = $FD, I set), then jump to the
-    // automation entry point. This is what produces the log's opening
-    // `A:00 X:00 Y:00 P:24 SP:FD CYC:7`.
-    cpu.reset();
-    cpu.pc = automation_entry;
+    // `Machine.init` performs the real RESET (7 cycles, S = $FD, I set);
+    // jumping to the automation entry point afterwards is what produces the
+    // log's opening `A:00 X:00 Y:00 P:24 SP:FD CYC:7`.
+    var m: Machine = undefined;
+    try m.init(nestest_rom);
+    m.cpu.pc = automation_entry;
 
     // Poison the two result-code bytes. See the file docstring: a correct run
     // never reaches nestest's store path, so these must still hold their
     // sentinels at the end. Any other value means control flow diverged.
     const sentinel_02: u8 = 0xA5;
     const sentinel_03: u8 = 0x5A;
-    bus.wram[0x02] = sentinel_02;
-    bus.wram[0x03] = sentinel_03;
+    m.bus.wram[0x02] = sentinel_02;
+    m.bus.wram[0x03] = sentinel_03;
 
     var lines = std.mem.splitScalar(u8, nestest_log, '\n');
     var instruction: usize = 0;
@@ -263,11 +259,11 @@ test "nestest automation run matches nestest.log instruction for instruction" {
         if (line.len == 0) continue;
 
         const expected = try parseLine(line);
-        const actual = cpu.trace();
-        // Sampled before `cpu.step()`, i.e. at the same instruction boundary
+        const actual = m.cpu.trace();
+        // Sampled before `m.cpu.step()`, i.e. at the same instruction boundary
         // the log line describes.
-        const actual_scanline = bus.ppu.scanline;
-        const actual_dot = bus.ppu.dot;
+        const actual_scanline = m.bus.ppu.scanline;
+        const actual_dot = m.bus.ppu.dot;
 
         const state_ok = expected.pc == actual.pc and
             expected.a == actual.a and
@@ -303,7 +299,7 @@ test "nestest automation run matches nestest.log instruction for instruction" {
             return error.NestestDivergence;
         }
 
-        cpu.step();
+        m.cpu.step();
         instruction += 1;
     }
 
@@ -315,7 +311,7 @@ test "nestest automation run matches nestest.log instruction for instruction" {
     // we require the sentinels to be *untouched*. `$00` here would be a
     // failure, not a pass — nestest writing anything at all means the run took
     // a path a correct CPU does not take.
-    if (bus.wram[0x02] != sentinel_02 or bus.wram[0x03] != sentinel_03) {
+    if (m.bus.wram[0x02] != sentinel_02 or m.bus.wram[0x03] != sentinel_03) {
         std.debug.print(
             \\
             \\nestest stored a zero-page result code during the logged run.
@@ -325,10 +321,10 @@ test "nestest automation run matches nestest.log instruction for instruction" {
             \\code means -- but the log diff above is the authoritative signal,
             \\and `$00` here is NOT a pass.
             \\
-        , .{ bus.wram[0x02], sentinel_02, bus.wram[0x03], sentinel_03 });
+        , .{ m.bus.wram[0x02], sentinel_02, m.bus.wram[0x03], sentinel_03 });
     }
-    try testing.expectEqual(sentinel_02, bus.wram[0x02]);
-    try testing.expectEqual(sentinel_03, bus.wram[0x03]);
+    try testing.expectEqual(sentinel_02, m.bus.wram[0x02]);
+    try testing.expectEqual(sentinel_03, m.bus.wram[0x03]);
 }
 
 test "the log parser reads a known line correctly" {

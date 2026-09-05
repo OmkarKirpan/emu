@@ -105,15 +105,30 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    // The wasm32-freestanding build: proves the module compiles for the
-    // delivery target. No shared_memory/atomics yet (that's ENG-56, M5) and
-    // no exported ABI functions yet (that's ENG-60, M4) — this step exists
-    // purely so a wasm regression is caught before those milestones need it.
+    // The wasm32-freestanding build: `src/wasm.zig` (not `root.zig` — see
+    // its own doc comment) is the actual delivery artifact as of ENG-69
+    // (M4), exporting the ABI ENG-60 designed. Still no shared_memory/
+    // atomics (that's ENG-56, M5).
+    //
+    // Its optimize mode is deliberately *its own* option rather than the
+    // shared `-Doptimize` above, and defaults to ReleaseFast: this is the
+    // build a browser runs at 60fps, where a Debug core pays for bounds and
+    // overflow checks on every one of ~89,000 `Ppu.tick`s and ~29,780 CPU
+    // cycles per frame. Sharing `-Doptimize` would have meant either
+    // shipping that Debug core (what happens when nobody passes the flag)
+    // or optimizing the native tests, which want those checks precisely
+    // because correctness is established there. `-Dwasm-optimize=Debug`
+    // when debugging the delivered module itself.
+    const wasm_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "wasm-optimize",
+        "Optimize mode for the wasm32 delivery build (default: ReleaseFast)",
+    ) orelse .ReleaseFast;
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/wasm.zig"),
         .target = wasm_target,
-        .optimize = optimize,
+        .optimize = wasm_optimize,
     });
     const wasm_exe = b.addExecutable(.{ .name = "nes_core", .root_module = wasm_mod });
     wasm_exe.entry = .disabled;
