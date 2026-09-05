@@ -27,214 +27,68 @@
 //! it is exactly the mechanism that lets `06-suppression` and its neighbors
 //! probe "one PPU clock later" timings at all (see `ppu.zig`'s
 //! `advanceDot` and its test coverage) -- none of the 10 sub-tests here
-//! depend on sprite rendering, which this milestone deliberately does not
-//! implement.
+//! depend on sprite rendering (ENG-68, M3), which was not implemented yet
+//! when this suite was first wired up.
+//!
+//! **All 10 sub-tests pass.** `07-nmi_on_timing` and `10-even_odd_timing`
+//! were documented, asserted gaps through M2 and M3 -- both fixed by giving
+//! PPUCTRL/PPUMASK writes the one-dot latch delay real hardware has; see
+//! `Ppu.applyPendingLatches` and `Cpu.write`.
+//!
+//! The shared `$6000`-protocol polling/reset-handling logic (`Machine`,
+//! `expectPass`) lives in `blargg_harness.zig`,
+//! factored out here when `ppu_sprites_test.zig` (ENG-68) needed the exact
+//! same logic for `oam_read`/`oam_stress`.
 
-const std = @import("std");
-const testing = std.testing;
-
-const rom_mod = @import("rom.zig");
-const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
 const determinism = @import("determinism.zig");
-
-/// NTSC CPU clock, Hz. Used only to convert Blargg's "at least 100 msec"
-/// reset-delay requirement into a cycle count.
-const cpu_hz: u64 = 1_789_773;
-
-/// Generous ceiling on total emulated CPU cycles per sub-test (roughly 60
-/// seconds of NES time). Every one of these tests completes in a small
-/// fraction of a second of NES time; this exists purely so a genuine hang
-/// (a bug that makes the ROM spin forever) fails the test instead of
-/// hanging CI.
-const max_cycles: u64 = 60 * cpu_hz;
-
-/// >=100ms of emulated NES time, rounded up, per the `$81` protocol.
-const min_reset_delay_cycles: u64 = (100 * cpu_hz) / 1000 + 1;
-
-const max_resets: u32 = 10;
-
-const HarnessError = error{ Timeout, TooManyResets };
-
-/// Grab the null-terminated ASCII detail text at $6004, for failure output.
-fn statusText(bus: *const bus_mod.Bus, buf: []u8) []const u8 {
-    var i: usize = 0;
-    while (i < buf.len) : (i += 1) {
-        const c = bus.peek(@intCast(0x6004 + i));
-        if (c == 0) break;
-        buf[i] = c;
-    }
-    return buf[0..i];
-}
-
-/// One booted machine, kept as a struct so `cpu`'s pointer to `bus` stays
-/// valid: `Cpu` borrows `*Bus`, so the pair has to reach its final address
-/// before being wired together. Two-phase init (`var m: Machine = undefined;
-/// try m.init(rom)`) is the same shape `cpu.zig`'s own `TestHarness` uses.
-const Machine = struct {
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Cpu,
-
-    fn init(self: *Machine, rom_bytes: []const u8) !void {
-        const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-        self.cpu = cpu_mod.Cpu.init(&self.bus);
-        self.cpu.reset();
-    }
-
-    /// Run until `$6000` reports a terminal result code, and return it.
-    ///
-    /// Polls `$6000` via `bus.peek` (side-effect-free -- the ROM itself owns
-    /// that address's real read/write through `Bus.read`/`Bus.write` as part
-    /// of `cpu.step`; polling separately must not perturb anything). Handles
-    /// the `$81` "needs a reset, delayed >=100ms" code by running out that
-    /// delay in emulated NES time and then calling `cpu.reset()`, exactly per
-    /// the documented protocol. Bounded by `max_cycles` so a ROM that spins
-    /// forever fails the test instead of hanging CI.
-    fn runToTerminalStatus(self: *Machine) !u8 {
-        var resets: u32 = 0;
-        while (true) {
-            if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-            self.cpu.step();
-            if (self.bus.peek(0x6001) != 0xDE or
-                self.bus.peek(0x6002) != 0xB0 or
-                self.bus.peek(0x6003) != 0x61) continue;
-            const s = self.bus.peek(0x6000);
-            if (s == 0x80) continue;
-            if (s == 0x81) {
-                resets += 1;
-                if (resets > max_resets) return HarnessError.TooManyResets;
-                const target = self.cpu.cycles + min_reset_delay_cycles;
-                while (self.cpu.cycles < target) {
-                    if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-                    self.cpu.step();
-                }
-                self.cpu.reset();
-                continue;
-            }
-            return s;
-        }
-    }
-};
-
-/// Run one Blargg-protocol ROM, asserting its result code is `$00` (pass).
-fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
-    var m: Machine = undefined;
-    try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
-
-    if (status != 0) {
-        var buf: [256]u8 = undefined;
-        std.debug.print(
-            "\nppu_vbl_nmi/{s}: result code ${X:0>2}\n  detail: {s}\n",
-            .{ name, status, statusText(&m.bus, &buf) },
-        );
-    }
-    try testing.expectEqual(@as(u8, 0), status);
-}
-
-/// Runs a sub-test that is a *documented, understood* gap (see the two
-/// call sites below) rather than a pass: asserts the result is exactly the
-/// known failure code, so a regression to something *else* still fails the
-/// suite, then skips instead of claiming a pass that isn't real.
-fn expectKnownGap(name: []const u8, rom_bytes: []const u8, known_code: u8) !void {
-    var m: Machine = undefined;
-    try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
-
-    var buf: [256]u8 = undefined;
-    std.debug.print(
-        "\nppu_vbl_nmi/{s}: documented gap, result code ${X:0>2} -- {s}\n",
-        .{ name, status, statusText(&m.bus, &buf) },
-    );
-    // If the failure ever changes shape, this test should start failing for
-    // real instead of silently continuing to skip.
-    try testing.expectEqual(known_code, status);
-    return error.SkipZigTest;
-}
+const harness = @import("blargg_harness.zig");
+const expectPass = harness.expectPass;
 
 test "ppu_vbl_nmi 01-vbl_basics" {
-    try expectPass("01-vbl_basics", @embedFile("01-vbl_basics"));
+    try expectPass("ppu_vbl_nmi/01-vbl_basics", @embedFile("01-vbl_basics"));
 }
 test "ppu_vbl_nmi 02-vbl_set_time" {
-    try expectPass("02-vbl_set_time", @embedFile("02-vbl_set_time"));
+    try expectPass("ppu_vbl_nmi/02-vbl_set_time", @embedFile("02-vbl_set_time"));
 }
 test "ppu_vbl_nmi 03-vbl_clear_time" {
-    try expectPass("03-vbl_clear_time", @embedFile("03-vbl_clear_time"));
+    try expectPass("ppu_vbl_nmi/03-vbl_clear_time", @embedFile("03-vbl_clear_time"));
 }
 test "ppu_vbl_nmi 04-nmi_control" {
-    try expectPass("04-nmi_control", @embedFile("04-nmi_control"));
+    try expectPass("ppu_vbl_nmi/04-nmi_control", @embedFile("04-nmi_control"));
 }
 test "ppu_vbl_nmi 05-nmi_timing" {
-    try expectPass("05-nmi_timing", @embedFile("05-nmi_timing"));
+    try expectPass("ppu_vbl_nmi/05-nmi_timing", @embedFile("05-nmi_timing"));
 }
 test "ppu_vbl_nmi 06-suppression" {
-    try expectPass("06-suppression", @embedFile("06-suppression"));
+    try expectPass("ppu_vbl_nmi/06-suppression", @embedFile("06-suppression"));
 }
-// 07-nmi_on_timing: a documented, understood gap -- see the doc comment
-// below. 08-nmi_off_timing, its mirror-image test (disabling NMI near the
-// VBL *set* rather than enabling it near the VBL *clear*), passes outright,
-// which is what pins the gap down to this specific direction rather than to
-// NMI edge-timing in general.
-//
-// `Cpu.read` and `Cpu.write` are structurally identical in their access
-// ordering -- both call `tick()` (3 PPU dots per cycle, with a single NMI
-// poll wedged after the first of the 3) *before* touching the bus, then poll
-// once more *after* the access -- see the doc comments on `Cpu.tick`,
-// `Cpu.read`/`Cpu.write`, and `Cpu.nmi_ready`. That single mid-tick poll
-// point is what gives `06-suppression`, `08-nmi_off_timing`, and the
-// dispatch-delay behavior `04-nmi_control`/`05-nmi_timing` check real
-// single-PPU-dot precision for the *level* they each sample there (the VBL
-// flag, gated by PPUCTRL's NMI-enable bit) -- verified by writing out the
-// R-vs-D (read-dot vs. set-dot) case analysis for all three within-a-cycle
-// alignments and confirming each matches the NESdev-documented suppression
-// window exactly.
-//
-// `07-nmi_on_timing` needs the *opposite* comparison: whether a WRITE
-// (enabling NMI) landed before or after the VBL flag's *clear* at
-// (scanline 261, dot 1). Because a write's own bus effect in this milestone
-// always applies only after that cycle's 3 PPU dots have already run, a
-// clear landing on *any* of those 3 dots is indistinguishable from the
-// write's point of view -- all three collapse to "the clear already
-// happened", one PPU-dot-alignment more than Blargg's ROM expects (it wants
-// exactly one of those three to still read as "before the clear"). This was
-// confirmed empirically, not assumed: forcing the write to apply *before*
-// its cycle's own dots (so it can plainly see whichever PPU state came
-// immediately before) makes every row fire instead of the expected 5-of-9,
-// and forcing it to apply after only the first dot shifts the boundary the
-// wrong way and regresses 08. Resolving this for real needs a write's bus
-// effect to be positionable at a specific *sub-cycle* (single-PPU-dot)
-// point relative to the PPU's own event -- i.e. genuinely interleaved
-// per-dot CPU/PPU co-simulation, not "3 ticks, then one bus access" -- which
-// is a real architectural step up, not a local bug fix, and is deliberately
-// out of scope for M2's "drive the PPU off the CPU's existing tick
-// chokepoint" integration. Measured: rows 0-4 read "N" (fires) as expected;
-// row 5 also reads "N" where Blargg's ROM expects "-" (does not fire) --
-// exactly the one-row/one-PPU-dot shift this analysis predicts, and no
-// wider than that.
-test "ppu_vbl_nmi 07-nmi_on_timing (documented gap: write-vs-VBL-clear needs sub-CPU-cycle precision this milestone's CPU/PPU integration does not have)" {
-    try expectKnownGap("07-nmi_on_timing", @embedFile("07-nmi_on_timing"), 0x01);
+// 07 and 08 are mirror images: 08 disables NMI near the VBL flag's *set*,
+// 07 enables it near the VBL flag's *clear*. Both now pass, but only
+// together, and only because of the one-dot PPUCTRL/PPUMASK latch delay
+// modeled in `Ppu.applyPendingLatches` plus its `Cpu.write` counterpart
+// (no NMI poll at the end of a write cycle) -- see both doc comments. 07
+// was a documented, asserted gap through M2 and M3: with the write landing
+// a dot too early, its row 5 fired where hardware does not.
+test "ppu_vbl_nmi 07-nmi_on_timing" {
+    try expectPass("ppu_vbl_nmi/07-nmi_on_timing", @embedFile("07-nmi_on_timing"));
 }
 test "ppu_vbl_nmi 08-nmi_off_timing" {
-    try expectPass("08-nmi_off_timing", @embedFile("08-nmi_off_timing"));
+    try expectPass("ppu_vbl_nmi/08-nmi_off_timing", @embedFile("08-nmi_off_timing"));
 }
 test "ppu_vbl_nmi 09-even_odd_frames" {
-    try expectPass("09-even_odd_frames", @embedFile("09-even_odd_frames"));
+    try expectPass("ppu_vbl_nmi/09-even_odd_frames", @embedFile("09-even_odd_frames"));
 }
 
-// 10-even_odd_timing: the same underlying gap as 07, applied to PPUMASK
-// instead of PPUCTRL -- it probes exactly when a write enabling/disabling
-// background rendering becomes visible to the odd-frame dot-skip decision
-// (`Ppu.advanceDot`, scanline 261 dot 339), which is a plain level check,
-// not edge-triggered, so the NMI-specific mid-cycle poll that fixes
-// `06`/`08` has no analogue here. Same root cause, same fix needed
-// (sub-CPU-cycle write timing); see 07's doc comment for the full
-// derivation. Measured: the ROM's own first two sub-checks (dot-skip count
-// for a sequence of enable/disable transitions) pass; it fails specifically
-// at "Clock is skipped too late, relative to enabling BG" -- the identical
-// one-PPU-dot-late shape as 07, not a different or wider divergence.
-test "ppu_vbl_nmi 10-even_odd_timing (documented gap: same root cause as 07, for PPUMASK/odd-frame-skip)" {
-    try expectKnownGap("10-even_odd_timing", @embedFile("10-even_odd_timing"), 0x03);
+// 10-even_odd_timing probes the same one-dot write-visibility question as
+// 07, but through PPUMASK rather than PPUCTRL: exactly when a write
+// enabling/disabling background rendering becomes visible to the odd-frame
+// dot-skip decision (`Ppu.advanceDot`, scanline 261 dot 339). That is a
+// plain level check, with no NMI edge involved at all, which is what makes
+// it the cleaner of the two demonstrations that the fix is really about
+// *when the PPU latches the written byte* and not about NMI polling: it
+// passes on the latch delay alone.
+test "ppu_vbl_nmi 10-even_odd_timing" {
+    try expectPass("ppu_vbl_nmi/10-even_odd_timing", @embedFile("10-even_odd_timing"));
 }
 
 // `assert_deterministic` (ENG-65), wired into this stage per ENG-66's

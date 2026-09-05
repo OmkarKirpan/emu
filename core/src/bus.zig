@@ -4,10 +4,12 @@ const testing = std.testing;
 const mapper_mod = @import("mapper.zig");
 const rom_mod = @import("rom.zig");
 const ppu_mod = @import("ppu.zig");
+const controller_mod = @import("controller.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mirroring = rom_mod.Mirroring;
 const Ppu = ppu_mod.Ppu;
+const Controller = controller_mod.Controller;
 
 /// The 2A03's CPU-visible address space.
 ///
@@ -20,12 +22,34 @@ const Ppu = ppu_mod.Ppu;
 ///     $0800-$1FFF  mirrors of WRAM (A11/A12 are not decoded)
 ///     $2000-$2007  PPU registers, decoded through `Ppu.readRegister`/`writeRegister`
 ///     $2008-$3FFF  mirrors of $2000-$2007 every 8 bytes
-///     $4000-$4017  APU + controller ports    -- not implemented (M6)
-///     $4018-$401F  CPU test registers (disabled on retail hardware)
+///     $4000-$4013  APU registers             -- not implemented (M6): open bus
+///     $4014        OAMDMA                    -- handled by `Cpu.write`, not here (see below)
+///     $4016        controller strobe (write) / port 0 data (read)
+///     $4017        APU frame counter (write, M6: open bus) / port 1 data (read)
+///     $4015,$4018-$401F  remaining APU/CPU-test registers -- not implemented: open bus
 ///     $4020-$5FFF  cartridge expansion       -- unmapped on NROM
 ///     $6000-$7FFF  cartridge PRG-RAM         -- `Bus.prg_ram`, unconditional
 ///     $8000-$FFFF  cartridge PRG-ROM         -- `Mapper.prgRead`/`prgWrite`
 ///
+/// **$4014 (OAMDMA) is not decoded by `Bus` at all.** Copying 256 bytes into
+/// OAM costs 513-514 *CPU* cycles (see https://www.nesdev.org/wiki/DMA) --
+/// time that has to flow through `Cpu.tick`'s chokepoint so the PPU keeps
+/// advancing and NMI keeps getting polled while it happens, exactly like
+/// every other cycle the CPU spends. `Bus` has no access to `Cpu` (`Cpu`
+/// borrows `*Bus`, not the other way around), so `Cpu.write` special-cases
+/// $4014 itself, immediately after the ordinary bus write above completes
+/// (which still updates `open_bus`, same as any other write to this
+/// unmapped-by-`Bus` address).
+///
+/// **Controller reads/writes.** $4016 write sets the strobe latch shared by
+/// *both* controller shift registers (see `Controller`'s doc comment); reads
+/// of $4016/$4017 pull that port's next serial bit into bit 0, with every
+/// other bit falling to `open_bus` -- the same "only the bits hardware
+/// actually drives are real, the rest reads back the bus's last value"
+/// convention as `Ppu.data_bus` and this type's own open-bus handling below.
+/// Writing $4017 is the APU frame-counter register, not a controller
+/// input -- unimplemented (M6), so it is plain open bus like the rest of
+/// the not-yet-built APU.
 /// **$6000-$7FFF is plain 8KB WRAM, unconditionally, not routed through
 /// `Mapper`.** Despite the mapper-0 name, "NROM" says nothing about whether a
 /// given cartridge board wires up PRG-RAM at $6000 -- that varies per board,
@@ -64,6 +88,9 @@ pub const Bus = struct {
     wram: [0x0800]u8 = [_]u8{0} ** 0x0800,
     mapper: Mapper,
     ppu: Ppu,
+    /// Port 0 ($4016) and port 1 ($4017). See `Controller`'s doc comment for
+    /// the shift-register model and the shared-strobe wiring.
+    controllers: [2]Controller = [_]Controller{.{}} ** 2,
     /// $6000-$7FFF. See the type doc comment for why this is unconditional
     /// rather than mapper-gated.
     prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
@@ -78,9 +105,10 @@ pub const Bus = struct {
         const value: u8 = switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF],
             0x2000...0x3FFF => self.ppu.readRegister(0x2000 | (addr & 0x0007), &self.mapper),
-            // APU/IO (M6) and cartridge expansion space (unused on NROM)
-            // still fall to open bus.
-            0x4000...0x5FFF => self.open_bus,
+            0x4000...0x4015 => self.open_bus, // APU (M6): not implemented
+            0x4016 => (self.open_bus & 0xFE) | self.controllers[0].read(),
+            0x4017 => (self.open_bus & 0xFE) | self.controllers[1].read(),
+            0x4018...0x5FFF => self.open_bus, // CPU test regs + cartridge expansion
             0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF],
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
@@ -93,7 +121,19 @@ pub const Bus = struct {
         switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF] = value,
             0x2000...0x3FFF => self.ppu.writeRegister(0x2000 | (addr & 0x0007), value, &self.mapper),
-            0x4000...0x5FFF => {},
+            // $4014 (OAMDMA) is handled by `Cpu.write`, not here -- see the
+            // type doc comment. It still falls through to this no-op case
+            // (the `open_bus` update above already happened), same as every
+            // other not-yet-implemented APU register.
+            0x4000...0x4015 => {},
+            0x4016 => {
+                const strobe = (value & 0x01) != 0;
+                self.controllers[0].setStrobe(strobe);
+                self.controllers[1].setStrobe(strobe);
+            },
+            // $4017 here is the APU frame counter (M6), not a controller
+            // port -- controller *writes* both go through $4016 only.
+            0x4017...0x5FFF => {},
             0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF] = value,
             0x8000...0xFFFF => self.mapper.prgWrite(addr, value),
         }
@@ -104,12 +144,15 @@ pub const Bus = struct {
     /// through `peekRegister` rather than `readRegister` for the same reason
     /// — reading through `peek` must never be observable by the emulated
     /// program (no VBL-flag clear, no write-toggle flip, no buffered-read
-    /// advance).
+    /// advance, no controller shift-register advance).
     pub fn peek(self: *const Bus, addr: u16) u8 {
         return switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF],
             0x2000...0x3FFF => self.ppu.peekRegister(0x2000 | (addr & 0x0007)),
-            0x4000...0x5FFF => self.open_bus,
+            0x4000...0x4015 => self.open_bus,
+            0x4016 => (self.open_bus & 0xFE) | self.controllers[0].peek(),
+            0x4017 => (self.open_bus & 0xFE) | self.controllers[1].peek(),
+            0x4018...0x5FFF => self.open_bus,
             0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF],
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
@@ -188,4 +231,31 @@ test "Bus.peek reaches the PPU without clearing the VBL flag" {
     const peeked = bus.peek(0x2002);
     try testing.expect((peeked & 0x80) != 0);
     try testing.expect(bus.ppu.status.vblank); // still set: peek must not clear it
+}
+
+test "$4016 write strobes both controller ports; $4016/$4017 reads carry each port's own data" {
+    const prg = [_]u8{0} ** 0x4000;
+    var bus = testBus(&prg);
+    bus.controllers[0].setButtons(controller_mod.button_a);
+    bus.controllers[1].setButtons(controller_mod.button_b);
+    bus.write(0x4016, 0x01); // strobe high on both ports
+    bus.write(0x4016, 0x00); // strobe low: latches each port's own buttons
+    try testing.expectEqual(@as(u8, 1), bus.read(0x4016) & 0x01); // port 0: A
+    try testing.expectEqual(@as(u8, 0), bus.read(0x4017) & 0x01); // port 1: A is not held
+}
+
+test "$4016/$4017 reads carry open-bus bits everywhere but bit 0" {
+    const prg = [_]u8{0} ** 0x4000;
+    var bus = testBus(&prg);
+    bus.write(0x4016, 0x00); // strobe low; both ports' shift regs start at 0
+    bus.write(0x0000, 0xFF); // *after* the $4016 write, so open_bus = 0xFF here
+    try testing.expectEqual(@as(u8, 0xFE), bus.read(0x4016) & 0xFE);
+}
+
+test "$4017 write is the APU frame counter, not controller port 1 -- it does not strobe anything" {
+    const prg = [_]u8{0} ** 0x4000;
+    var bus = testBus(&prg);
+    bus.controllers[1].setButtons(controller_mod.button_a);
+    bus.write(0x4017, 0x01); // would strobe if this were mistakenly wired to Controller
+    try testing.expect(!bus.controllers[1].strobe);
 }

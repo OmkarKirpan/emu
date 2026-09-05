@@ -53,6 +53,53 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // ENG-68 (M3): the sprite/OAM conformance stage. `oam_read`/`oam_stress`
+    // use the standard `$6000` protocol like `ppu_vbl_nmi` above;
+    // `sprite_hit_tests_2005.10.05`/`sprite_overflow_tests` predate that
+    // convention and report via nametable text instead -- see each
+    // directory's `ATTRIBUTION.md`. All confirmed mapper 0/NROM.
+    test_mod.addAnonymousImport("oam_read", .{
+        .root_source_file = b.path("tests/roms/oam_read/oam_read.nes"),
+    });
+    test_mod.addAnonymousImport("oam_stress", .{
+        .root_source_file = b.path("tests/roms/oam_stress/oam_stress.nes"),
+    });
+    const sprite_hit_names = [_][]const u8{
+        "01.basics",
+        "02.alignment",
+        "03.corners",
+        "04.flip",
+        "05.left_clip",
+        "06.right_edge",
+        "07.screen_bottom",
+        "08.double_height",
+        "09.timing_basics",
+        "10.timing_order",
+        "11.edge_timing",
+    };
+    for (sprite_hit_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("sprite_hit_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/sprite_hit_tests_2005.10.05/{s}.nes", .{name})),
+        });
+    }
+    const sprite_overflow_names = [_][]const u8{
+        "1.Basics", "2.Details", "3.Timing", "4.Obscure", "5.Emulator",
+    };
+    for (sprite_overflow_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("sprite_overflow_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/sprite_overflow_tests/{s}.nes", .{name})),
+        });
+    }
+
+    // ENG-68's native NROM sprite+input integration fixture. An original,
+    // hand-written ROM (not a vendored third-party fixture -- no
+    // ATTRIBUTION.md needed), assembled with cc65; see
+    // tests/roms/nrom_demo/README.md for why (copyright: no real commercial
+    // game is vendored here) and how to reproduce the build.
+    test_mod.addAnonymousImport("sprite_input_demo", .{
+        .root_source_file = b.path("tests/roms/nrom_demo/sprite_input_demo.nes"),
+    });
+
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");

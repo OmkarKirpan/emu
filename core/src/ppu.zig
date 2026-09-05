@@ -86,24 +86,85 @@ fn physicalNametable(mirroring: Mirroring, logical: u2) u1 {
     };
 }
 
+/// One fetched, screen-ready sprite for the scanline currently being drawn.
+/// Deliberately *not* a shift register the way the background pipeline's
+/// `bg_shift_pattern_lo`/`hi` are: since evaluation+fetch already happen in
+/// one shot at dot 1 (see `Ppu`'s type doc comment), `x` just stays a plain
+/// static column and `outputPixel` computes `col - x` directly each dot,
+/// which is behaviorally identical to shifting for a value nothing re-reads
+/// mid-scanline.
+const SpriteUnit = struct {
+    /// Screen column of the sprite's leftmost pixel.
+    x: u8 = 0,
+    /// This sprite's two pattern-table bitplanes for the current scanline's
+    /// row through it, already bit-reversed at fetch time if the
+    /// horizontal-flip attribute bit was set -- see `fetchSpriteUnits`.
+    pattern_lo: u8 = 0,
+    pattern_hi: u8 = 0,
+    /// Which of the 4 sprite palettes ($3F10/$14/$18/$1C-relative) this
+    /// sprite's pixel values 1-3 resolve through.
+    palette: u2 = 0,
+    /// OAM attribute byte bit 5: true = this sprite draws *behind* opaque
+    /// background pixels rather than in front of them. Does not affect
+    /// sprite-0 hit, which fires regardless of priority (see
+    /// `outputPixel`).
+    behind_bg: bool = false,
+    /// Whether this unit is OAM's own index-0 sprite (see `sprite0_in_range`
+    /// on `Ppu`).
+    is_sprite0: bool = false,
+};
+
+/// Sprite evaluation's dot window on every rendering scanline: hardware
+/// clears secondary OAM over dots 1-64, evaluates OAM for the *next*
+/// scanline over 65-256 (two dots per OAM byte), then fetches the found
+/// sprites' pattern bytes over 257-320. See `Ppu.evaluateSprites`.
+const sprite_eval_start_dot: u16 = 65;
+const sprite_eval_end_dot: u16 = 256;
+const sprite_fetch_dot: u16 = 257;
+
+/// Reverse the bit order of one byte -- used to pre-flip a horizontally-
+/// flipped sprite's fetched pattern bytes once, at fetch time, rather than
+/// making `outputPixel` branch on the flip attribute for every pixel.
+fn reverseBits(b: u8) u8 {
+    var result: u8 = 0;
+    var v: u8 = b;
+    var i: u8 = 0;
+    while (i < 8) : (i += 1) {
+        result <<= 1;
+        result |= (v & 1);
+        v >>= 1;
+    }
+    return result;
+}
+
 /// The 2C02 PPU: registers, VRAM/OAM/palette storage, the dot/scanline
-/// timing state machine, and the background tile+attribute pipeline.
+/// timing state machine, and the background tile+attribute pipeline plus
+/// (ENG-68/M3) sprite evaluation, priority muxing, sprite-0 hit, and the
+/// sprite-overflow flag (including its documented hardware bug).
 ///
-/// **No sprites yet.** OAM storage and the OAMDATA/OAMADDR registers exist
-/// (a later milestone's sprite evaluation and the DMA-fed pixel pipeline
-/// need them to already be architecturally present), but nothing reads OAM
-/// to produce pixels this milestone -- `mask.show_sprites` is stored and
-/// contributes to timing (odd-frame skip cares about "rendering enabled",
-/// which is bg-or-sprites on real hardware) but never puts a sprite pixel on
-/// screen. `secondary_oam` likewise exists only so `assert_deterministic`
-/// (ENG-65) can already hash "genuinely mid-scanline-resumable state" per
-/// its spec, ahead of the evaluation logic that will populate it.
+/// **Sprite evaluation follows hardware's schedule, one scanline ahead.**
+/// On every rendering scanline the PPU clears secondary OAM (dots 1-64),
+/// evaluates OAM for the *next* scanline (dots 65-256), and fetches the
+/// sprites it found (dots 257-320). `evaluateSprites`/`fetchSpriteUnits`
+/// run at dots 65 and 257 respectively, each computing its whole result in
+/// one pass rather than as a per-dot state machine -- but evaluation costs
+/// out hardware's two-dots-per-OAM-byte schedule as it goes, so the
+/// sprite-overflow flag still fires on the dot hardware fires it on. That
+/// lookahead and that dot accounting are what
+/// `sprite_overflow_tests/3.Timing` measures; it was a documented, asserted
+/// gap while this codebase instead evaluated each scanline at its own dot 1.
+///
+/// **Why scanline 239 still evaluates.** Its target is scanline 240, a row
+/// that is never drawn (only 0-239 call `outputPixel`) -- but a sprite with
+/// OAM Y=239 is in range for it, and hardware will still raise the overflow
+/// flag from that evaluation. `sprite_overflow_tests/2.Details` checks
+/// exactly this ("Y=239 should set overflow, Y=240/255 should not").
 ///
 /// **Driven entirely by `tick`.** Every PPU dot -- background fetch, shift,
-/// pixel output, VBL edge, the odd-frame skip -- happens inside `tick`,
-/// called exactly 3 times per CPU cycle from `Cpu.tick`'s chokepoint. There
-/// is no other path that advances PPU state, mirroring the CPU core's own
-/// single-chokepoint discipline.
+/// pixel output, VBL edge, the odd-frame skip, and now sprite evaluation --
+/// happens inside `tick`, called exactly 3 times per CPU cycle from
+/// `Cpu.tick`'s chokepoint. There is no other path that advances PPU state,
+/// mirroring the CPU core's own single-chokepoint discipline.
 pub const Ppu = struct {
     ctrl: Ctrl = .{},
     mask: Mask = .{},
@@ -145,8 +206,36 @@ pub const Ppu = struct {
     /// $3F10-family mirror.
     palette: [0x20]u8 = [_]u8{0} ** 0x20,
     oam: [256]u8 = [_]u8{0} ** 256,
-    /// See the type doc comment: unused until sprite evaluation exists.
+    /// Up to 8 sprites (4 bytes each) found in range for the scanline
+    /// currently being evaluated. Filled by `evaluateSprites`, consumed by
+    /// `fetchSpriteUnits`.
     secondary_oam: [32]u8 = [_]u8{0} ** 32,
+    /// How many of `sprite_units` hold a real sprite for the scanline
+    /// currently being *drawn* -- `outputPixel` only ever looks at
+    /// `sprite_units[0..sprite_count]`. Distinct from `secondary_count`:
+    /// this one only moves at dot 257, once the scanline that was using it
+    /// has finished its pixels.
+    sprite_count: u8 = 0,
+    /// How many sprites the in-progress evaluation has found for the *next*
+    /// scanline, i.e. how much of `secondary_oam` is live. Handed to
+    /// `sprite_count` by `fetchSpriteUnits`.
+    secondary_count: u8 = 0,
+    /// Whether OAM index 0 is among them. Original-OAM-index-0, if present,
+    /// is always copied into `secondary_oam` slot 0 first (evaluation scans
+    /// OAM in ascending index order), so this ends up as
+    /// `sprite_units[0].is_sprite0`.
+    secondary_has_sprite0: bool = false,
+    /// The dot of *this* scanline at which evaluation ran out of secondary
+    /// OAM and hit a 9th in-range sprite, or null if it didn't. `tick` sets
+    /// the overflow flag when the dot counter reaches it, rather than at the
+    /// moment evaluation was computed -- see `evaluateSprites`.
+    overflow_dot: ?u16 = null,
+    /// One fetched, ready-to-mux render unit per sprite in `secondary_oam`,
+    /// same order (ascending original OAM index = display priority, highest
+    /// first). Pattern bytes are already flipped horizontally at fetch time
+    /// (see `fetchSpriteUnits`), so `outputPixel` never branches on the
+    /// flip-X attribute bit itself.
+    sprite_units: [8]SpriteUnit = [_]SpriteUnit{.{}} ** 8,
 
     mirroring: Mirroring,
 
@@ -166,6 +255,13 @@ pub const Ppu = struct {
     /// exactly one PPU clock before the VBL flag would be set, and consumed
     /// (whether true or not) the instant that dot is reached.
     suppress_vbl_this_frame: bool = false,
+
+    /// A written-but-not-yet-latched PPUCTRL/PPUMASK byte. See
+    /// `applyPendingLatches`: the PPU picks these two control registers up
+    /// one dot after the CPU's write cycle ends, which is what
+    /// `ppu_vbl_nmi/07-nmi_on_timing` and `/10-even_odd_timing` measure.
+    pending_ctrl: ?u8 = null,
+    pending_mask: ?u8 = null,
 
     // ------------------------------------------------------ bg pipeline
     // "next" latches hold data already fetched, awaiting the next reload;
@@ -204,6 +300,8 @@ pub const Ppu = struct {
     pub fn reset(self: *Ppu) void {
         self.ctrl = .{};
         self.mask = .{};
+        self.pending_ctrl = null;
+        self.pending_mask = null;
         self.w = false;
         self.read_buffer = 0;
         self.t = 0;
@@ -216,6 +314,71 @@ pub const Ppu = struct {
 
     fn renderingEnabled(self: *const Ppu) bool {
         return self.mask.show_bg or self.mask.show_sprites;
+    }
+
+    /// The scanline this one's sprite evaluation is working *for*: the next
+    /// one, with the pre-render line feeding scanline 0. (Nothing can
+    /// actually be in range for scanline 0 -- a sprite's first visible row
+    /// is `Y+1`, so it would need `Y = -1` -- but hardware runs the
+    /// evaluation there all the same, and so does this.)
+    fn targetScanline(self: *const Ppu) u16 {
+        return if (self.scanline == 261) 0 else self.scanline + 1;
+    }
+
+    /// Latch any pending PPUCTRL/PPUMASK write into the live registers.
+    ///
+    /// **Why these two registers land a dot late.** A CPU write completes at
+    /// the end of its own CPU cycle -- after the third of that cycle's three
+    /// PPU dots -- but the byte is not visible to the PPU logic that reads
+    /// it back as a *level* (the NMI output; the rendering-enabled input to
+    /// `advanceDot`'s odd-frame skip) until a dot later, the 2C02 having
+    /// sampled the CPU-facing write on its own next clock edge. Called at
+    /// the end of every `tick`, so a write landing at the end of CPU cycle N
+    /// is live from the *second* dot of cycle N+1 onward, and from that
+    /// cycle's own mid-`tick` NMI poll.
+    ///
+    /// The one-dot figure is what four of Blargg's NMI/timing sub-tests
+    /// agree on, not a datasheet number: it was found by sweeping the
+    /// write's effective position across every dot offset from -3 to +3 and
+    /// keeping the only one at which `04`, `05`, `06`, `07`, `08` and `10`
+    /// are simultaneously green. Every other offset breaks at least one of
+    /// them, which is the strongest evidence available without silicon.
+    ///
+    /// This is the single dot that separates `ppu_vbl_nmi/07-nmi_on_timing`
+    /// (a $2000 write racing the VBL flag's clear) and `/10-even_odd_timing`
+    /// (a $2001 write racing the odd-frame dot skip) from passing: both were
+    /// documented, asserted gaps through M2/M3 precisely because the write
+    /// used to become visible a dot too early. Deliberately scoped to these
+    /// two registers rather than every PPU write: they are the only ones the
+    /// PPU re-reads as a *level* on later dots, and deferring the rest would
+    /// desynchronize the register file from `Bus`'s own immediate writes
+    /// (OAMDMA's $2004 stream, $2007's VRAM writes) for no modeled gain.
+    fn applyPendingLatches(self: *Ppu) void {
+        if (self.pending_ctrl) |v| {
+            self.ctrl = @bitCast(v);
+            self.pending_ctrl = null;
+        }
+        if (self.pending_mask) |v| {
+            self.mask = @bitCast(v);
+            self.pending_mask = null;
+        }
+    }
+
+    /// OAMDATA ($2004) read value. Normally just the byte at OAMADDR, but
+    /// real hardware exposes its internal sprite-evaluation machinery
+    /// during dots 1-64 of a rendering scanline: that's the "clear
+    /// secondary OAM to $FF" phase (see `evaluateSprites`'s doc comment --
+    /// collapsed to a single dot-1 pass in this codebase, but the *value a
+    /// read would see* during hardware's real dots 1-64 window is still
+    /// worth modeling on its own, since `oam_stress` exercises exactly
+    /// this), so a read landing there always returns $FF regardless of
+    /// OAMADDR. See https://www.nesdev.org/wiki/PPU_sprite_evaluation.
+    fn oamDataRead(self: *const Ppu) u8 {
+        const on_render_line = self.scanline <= 239 or self.scanline == 261;
+        if (self.renderingEnabled() and on_render_line and self.dot >= 1 and self.dot <= 64) {
+            return 0xFF;
+        }
+        return self.oam[self.oam_addr];
     }
 
     // ------------------------------------------------------------- memory
@@ -280,7 +443,7 @@ pub const Ppu = struct {
                 self.status.vblank = false;
                 self.w = false;
             },
-            0x2004 => result = self.oam[self.oam_addr],
+            0x2004 => result = self.oamDataRead(),
             0x2007 => {
                 const a = self.v & 0x3FFF;
                 if (a >= 0x3F00) {
@@ -309,7 +472,7 @@ pub const Ppu = struct {
     pub fn peekRegister(self: *const Ppu, addr: u16) u8 {
         return switch (addr) {
             0x2002 => (self.status.toByte() & 0xE0) | (self.data_bus & 0x1F),
-            0x2004 => self.oam[self.oam_addr],
+            0x2004 => self.oamDataRead(),
             0x2007 => if ((self.v & 0x3FFF) >= 0x3F00)
                 self.palette[paletteIndex(self.v)]
             else
@@ -322,14 +485,34 @@ pub const Ppu = struct {
         self.data_bus = value;
         switch (addr) {
             0x2000 => {
-                self.ctrl = @bitCast(value);
-                self.t = (self.t & ~@as(u15, 0x0C00)) | (@as(u15, self.ctrl.nametable) << 10);
+                // The control-bit latch is deferred by one dot (see
+                // `applyPendingLatches`); `t`'s nametable-select bits are
+                // not -- they are part of the scroll address latch, on the
+                // PPU's CPU-facing side, and take the *written* value
+                // directly rather than reading back through `ctrl`.
+                self.applyPendingLatches();
+                self.pending_ctrl = value;
+                self.t = (self.t & ~@as(u15, 0x0C00)) | (@as(u15, @as(u2, @truncate(value))) << 10);
             },
-            0x2001 => self.mask = @bitCast(value),
+            0x2001 => {
+                self.applyPendingLatches();
+                self.pending_mask = value;
+            },
             0x2002 => {}, // read-only; the data-bus latch update above is all that happens
             0x2003 => self.oam_addr = value,
             0x2004 => {
-                self.oam[self.oam_addr] = value;
+                // Byte 2 of each sprite (the attribute byte) only has five
+                // physical bits: its bits 2-4 do not exist in the PPU's OAM
+                // and read back as 0, so mask them off at the point they
+                // would be stored rather than faking it on the way out. See
+                // https://www.nesdev.org/wiki/PPU_OAM -- and `oam_stress`,
+                // which writes random bytes across all 256 OAM addresses and
+                // reads every one of them back, so it flags exactly every
+                // fourth byte from offset 2 if this is missed. Rendering
+                // never looks at those three bits (bits 0-1 select the
+                // palette, 5 is priority, 6/7 are the flips), so this is
+                // only observable through $2004 reads.
+                self.oam[self.oam_addr] = if (self.oam_addr % 4 == 2) value & 0xE3 else value;
                 self.oam_addr +%= 1;
             },
             0x2005 => {
@@ -496,7 +679,7 @@ pub const Ppu = struct {
     /// address `$3F00-$3FFF`) instead of always the universal backdrop
     /// (`palette[0]`) -- see https://www.nesdev.org/wiki/PPU_palettes. That
     /// lets a program flash the whole screen a chosen color by parking `v`
-    /// there via `$2006`. Not modeled: `color_index` below is unconditionally
+    /// there via `$2006`. Not modeled: `bg_color` below is unconditionally
     /// `palette[0]` regardless of `v`. Harmless for this milestone's own
     /// tests (none park `v` in palette space while rendering is off), flagged
     /// so it reads as known rather than as an oversight for whoever next
@@ -504,22 +687,211 @@ pub const Ppu = struct {
     fn outputPixel(self: *Ppu) void {
         const col = self.dot - 1;
         const row = self.scanline;
-        var color_index: u8 = self.palette[0] & 0x3F;
 
+        var bg_pixel: u8 = 0; // raw 2-bit pattern value, 0 = transparent
+        var bg_color: u8 = self.palette[0] & 0x3F;
         if (self.mask.show_bg and (self.mask.show_bg_left or col >= 8)) {
             const bit_mux: u16 = @as(u16, 0x8000) >> self.fine_x;
             const p0: u8 = @intFromBool((self.bg_shift_pattern_lo & bit_mux) != 0);
             const p1: u8 = @intFromBool((self.bg_shift_pattern_hi & bit_mux) != 0);
-            const pixel: u8 = (p1 << 1) | p0;
-            if (pixel != 0) {
+            bg_pixel = (p1 << 1) | p0;
+            if (bg_pixel != 0) {
                 const a0: u8 = @intFromBool((self.bg_shift_attr_lo & bit_mux) != 0);
                 const a1: u8 = @intFromBool((self.bg_shift_attr_hi & bit_mux) != 0);
                 const group: u8 = (a1 << 1) | a0;
-                color_index = self.palette[paletteIndex(0x3F00 | (@as(u16, group) << 2) | pixel)] & 0x3F;
+                bg_color = self.palette[paletteIndex(0x3F00 | (@as(u16, group) << 2) | bg_pixel)] & 0x3F;
             }
         }
-        if (self.mask.greyscale) color_index &= 0x30;
-        self.framebuffer[@as(usize, row) * 256 + col] = color_index;
+
+        var final_color = bg_color;
+        if (self.mask.show_sprites and (self.mask.show_sprites_left or col >= 8)) {
+            var i: u8 = 0;
+            while (i < self.sprite_count) : (i += 1) {
+                const su = self.sprite_units[i];
+                const x: u16 = su.x;
+                if (col < x or col - x >= 8) continue;
+                const shift: u3 = @intCast(7 - (col - x));
+                const p0: u8 = (su.pattern_lo >> shift) & 1;
+                const p1: u8 = (su.pattern_hi >> shift) & 1;
+                const sprite_pixel = (p1 << 1) | p0;
+                if (sprite_pixel == 0) continue;
+
+                // Sprite-0 hit fires whenever OAM sprite 0's own pixel here
+                // is opaque and so is the background's, regardless of this
+                // sprite's priority bit (real hardware hits "even when
+                // completely behind background" -- one of
+                // `sprite_hit_tests_2005.10.05/01.basics`'s own checks) and
+                // regardless of which sprite ends up drawn at this pixel.
+                // The `col != 255` exclusion is a documented hardware quirk:
+                // https://www.nesdev.org/wiki/PPU_OAM#Sprite_zero_hits.
+                if (su.is_sprite0 and bg_pixel != 0 and col != 255) {
+                    self.status.sprite0_hit = true;
+                }
+
+                if (!(su.behind_bg and bg_pixel != 0)) {
+                    final_color = self.palette[paletteIndex(0x3F10 | (@as(u16, su.palette) << 2) | sprite_pixel)] & 0x3F;
+                }
+                break; // ascending OAM index = priority; first opaque wins
+            }
+        }
+
+        if (self.mask.greyscale) final_color &= 0x30;
+        self.framebuffer[@as(usize, row) * 256 + col] = final_color;
+    }
+
+    // -------------------------------------------------------- sprite pipeline
+
+    /// Evaluate OAM for the scanline *after* this one, filling
+    /// `secondary_oam`/`secondary_count`/`secondary_has_sprite0` and
+    /// working out the dot at which the overflow flag should fire.
+    ///
+    /// **One scanline ahead, like hardware.** The PPU evaluates during dots
+    /// 65-256 of scanline N to decide what scanline N+1 will draw, then
+    /// fetches those sprites' pattern bytes during dots 257-320 of the same
+    /// scanline (`fetchSpriteUnits`). That lookahead is not cosmetic: it is
+    /// what puts the sprite-overflow flag's *set* almost a full scanline
+    /// earlier than a naive "evaluate the line you are about to draw, at its
+    /// own dot 1" model puts it, which is precisely what
+    /// `sprite_overflow_tests/3.Timing` measures (and what it failed on
+    /// through M3, reporting "set too late for first scanline").
+    ///
+    /// **The "+1".** A sprite's OAM Y byte is documented (see
+    /// https://www.nesdev.org/wiki/PPU_OAM) as "the sprite's desired row,
+    /// minus 1" -- writing Y=R-1 makes the sprite's first row appear on
+    /// screen row R. So the in-range test for the *target* row is
+    /// `0 <= target - y - 1 < height`.
+    ///
+    /// **Where the overflow dot comes from.** Evaluation is still computed
+    /// in one pass rather than as a per-dot state machine, but it now costs
+    /// out hardware's own schedule as it goes: evaluation starts at dot 65,
+    /// reads one OAM byte per two dots (odd dot reads primary OAM, even dot
+    /// writes secondary), so a sprite that misses costs 2 dots and one that
+    /// is copied costs 8 (its four bytes). The first 9th-in-range hit
+    /// records the dot it lands on, capped at the dot 256 end of the
+    /// window, and `tick` raises the flag when the counter gets there.
+    ///
+    /// **The overflow-flag hardware bug.** Once 8 in-range sprites are
+    /// found, real hardware does not stop looking -- it keeps scanning OAM
+    /// for a 9th, but a wiring bug means the byte it reads is no longer
+    /// always a Y-coordinate: on a *miss* it advances its internal
+    /// byte-within-sprite index too (not just the sprite index), so
+    /// subsequent "Y" reads walk diagonally through OAM, occasionally
+    /// testing a tile/attribute/X byte as if it were a Y-coordinate.
+    /// `sprite_overflow_tests/4.Obscure` probes exactly this and passes
+    /// against this implementation, per
+    /// https://www.nesdev.org/wiki/PPU_sprite_evaluation#Sprite_overflow_bug.
+    fn evaluateSprites(self: *Ppu) void {
+        self.secondary_oam = [_]u8{0xFF} ** 32;
+        self.secondary_count = 0;
+        self.secondary_has_sprite0 = false;
+        self.overflow_dot = null;
+
+        const target = self.targetScanline();
+        const height: i32 = if (self.ctrl.sprite_height16) 16 else 8;
+
+        var dot: u16 = sprite_eval_start_dot;
+        var n: u16 = 0;
+        var found: u8 = 0;
+        while (n < 64) : (n += 1) {
+            const y = self.oam[n * 4];
+            const row = @as(i32, target) - @as(i32, y) - 1;
+            dot +|= 2; // the Y read and its secondary-OAM write
+            if (row < 0 or row >= height) continue;
+            if (n == 0) self.secondary_has_sprite0 = true;
+            @memcpy(self.secondary_oam[@as(usize, found) * 4 ..][0..4], self.oam[n * 4 ..][0..4]);
+            found += 1;
+            dot +|= 6; // this sprite's other three bytes
+            if (found == 8) {
+                n += 1; // evaluation continues from the *next* sprite
+                break;
+            }
+        }
+        self.secondary_count = found;
+
+        // The buggy overflow-detection phase, only reachable when all 8
+        // slots filled before OAM was exhausted.
+        if (found == 8 and n < 64) {
+            var m: u16 = 0;
+            while (n < 64) {
+                const y = self.oam[n * 4 + m];
+                const row = @as(i32, target) - @as(i32, y) - 1;
+                dot +|= 2;
+                if (row >= 0 and row < height) {
+                    if (self.overflow_dot == null) {
+                        self.overflow_dot = @min(dot, sprite_eval_end_dot);
+                    }
+                    dot +|= 6; // hardware reads the rest of the entry too
+                }
+                // The bug: `m` advances on every step, hit or miss alike, so
+                // it never resets to 0 for the next sprite -- only `n`
+                // wrapping past 3 increments does that, "diagonally"
+                // walking off each sprite's Y byte onto its neighbors'.
+                m += 1;
+                if (m == 4) m = 0;
+                n += 1;
+            }
+        }
+    }
+
+    /// Fetch pattern bytes for the sprites `evaluateSprites` just found,
+    /// building `sprite_units[0..sprite_count]` for the *next* scanline --
+    /// hardware's dots 257-320 job, and the point at which the freshly
+    /// evaluated `secondary_count` becomes the live `sprite_count`. Running
+    /// here rather than at the next scanline's dot 1 is what lets both
+    /// counts coexist without double-buffering: dot 257 is past the last
+    /// pixel (`outputPixel` covers dots 1-256), so nothing is still reading
+    /// the outgoing units.
+    fn fetchSpriteUnits(self: *Ppu, mapper: *Mapper) void {
+        const height16 = self.ctrl.sprite_height16;
+        const height: i32 = if (height16) 16 else 8;
+        const target = self.targetScanline();
+        self.sprite_count = self.secondary_count;
+
+        var i: u8 = 0;
+        while (i < self.sprite_count) : (i += 1) {
+            const base = @as(usize, i) * 4;
+            const y = self.secondary_oam[base];
+            const tile = self.secondary_oam[base + 1];
+            const attr = self.secondary_oam[base + 2];
+            const x = self.secondary_oam[base + 3];
+
+            const flip_h = (attr & 0x40) != 0;
+            const flip_v = (attr & 0x80) != 0;
+
+            // In range by construction (this sprite came straight out of
+            // `evaluateSprites`' own in-range check for this same scanline).
+            var row: u16 = @intCast(@as(i32, target) - @as(i32, y) - 1);
+            if (flip_v) row = @as(u16, @intCast(height - 1)) - row;
+
+            var table: u16 = undefined;
+            var tile_id: u16 = undefined;
+            var fine_y: u16 = undefined;
+            if (height16) {
+                table = if ((tile & 0x01) != 0) 0x1000 else 0x0000;
+                tile_id = @as(u16, tile & 0xFE) + (row >> 3);
+                fine_y = row & 0x07;
+            } else {
+                table = if (self.ctrl.sprite_table) 0x1000 else 0x0000;
+                tile_id = tile;
+                fine_y = row;
+            }
+            const addr_lo = table + tile_id * 16 + fine_y;
+            var lo = self.vramRead(addr_lo, mapper);
+            var hi = self.vramRead(addr_lo + 8, mapper);
+            if (flip_h) {
+                lo = reverseBits(lo);
+                hi = reverseBits(hi);
+            }
+
+            self.sprite_units[i] = .{
+                .x = x,
+                .pattern_lo = lo,
+                .pattern_hi = hi,
+                .palette = @intCast(attr & 0x03),
+                .behind_bg = (attr & 0x20) != 0,
+                .is_sprite0 = i == 0 and self.secondary_has_sprite0,
+            };
+        }
     }
 
     // ------------------------------------------------------------- tick
@@ -553,6 +925,21 @@ pub const Ppu = struct {
         const on_render_line = self.scanline <= 239 or self.scanline == 261;
         if (on_render_line and self.renderingEnabled()) self.renderCycle(mapper);
 
+        // Sprite evaluation for the *next* scanline, on hardware's own
+        // schedule: evaluate at dot 65, raise the overflow flag at whichever
+        // dot evaluation would have hit a 9th in-range sprite, hand the
+        // results to the render units at dot 257. See `evaluateSprites`.
+        if (on_render_line and self.renderingEnabled()) {
+            if (self.dot == sprite_eval_start_dot) self.evaluateSprites();
+            if (self.overflow_dot) |od| {
+                if (self.dot == od) {
+                    self.status.sprite_overflow = true;
+                    self.overflow_dot = null;
+                }
+            }
+            if (self.dot == sprite_fetch_dot) self.fetchSpriteUnits(mapper);
+        }
+
         if (self.scanline <= 239 and self.dot >= 1 and self.dot <= 256) {
             self.outputPixel();
         }
@@ -568,6 +955,7 @@ pub const Ppu = struct {
         }
 
         self.advanceDot();
+        self.applyPendingLatches();
     }
 };
 
@@ -658,6 +1046,12 @@ test "PPUDATA increments v by 1 or 32 depending on PPUCTRL bit 2" {
     try testing.expectEqual(@as(u15, 0x2001), ppu.v);
 
     ppu.writeRegister(0x2000, 0x04, &m); // set increment32
+    // PPUCTRL latches one dot after the write (see `applyPendingLatches`),
+    // so give it that dot before relying on the new bit. A real CPU cannot
+    // issue two register writes closer together than two whole CPU cycles
+    // (6 dots) anyway -- this tick is what that gap looks like at the
+    // smallest scale that still matters.
+    ppu.tick(&m);
     ppu.v = 0x2000;
     ppu.writeRegister(0x2007, 0x22, &m);
     try testing.expectEqual(@as(u15, 0x2020), ppu.v);
@@ -698,6 +1092,58 @@ test "PPUSCROLL's two writes set fine-X, coarse X, coarse Y, and fine Y" {
     ppu.writeRegister(0x2005, 0b0101_0110, &m); // coarse Y=0b01010=10, fine Y=0b110=6
     try testing.expectEqual(@as(u15, 10), (ppu.t >> 5) & 0x1F);
     try testing.expectEqual(@as(u15, 6), (ppu.t >> 12) & 0x7);
+}
+
+test "PPUCTRL and PPUMASK writes latch one dot late; everything else is immediate" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+
+    // PPUMASK: `advanceDot`'s odd-frame skip and `renderingEnabled` read
+    // this as a *level* on later dots, so the one-dot delay is observable.
+    // `ppu_vbl_nmi/10-even_odd_timing` is the conformance ROM that measures
+    // it; this pins the same behavior without a 40KB fixture.
+    ppu.writeRegister(0x2001, 0b0000_1000, &m); // show_bg
+    try testing.expect(!ppu.mask.show_bg); // not yet -- still pending
+    ppu.tick(&m);
+    try testing.expect(ppu.mask.show_bg); // latched by the end of that dot
+
+    // PPUCTRL, same: this is the delay `07-nmi_on_timing`/`08-nmi_off_timing`
+    // measure through the NMI output level.
+    ppu.status.vblank = true;
+    ppu.writeRegister(0x2000, 0x80, &m); // nmi_enable
+    try testing.expect(!ppu.ctrl.nmi_enable);
+    try testing.expect(!ppu.nmiSignal()); // the whole point: still low
+    ppu.tick(&m);
+    try testing.expect(ppu.ctrl.nmi_enable);
+    try testing.expect(ppu.nmiSignal());
+
+    // Not deferred: `t`'s nametable-select bits, written straight from the
+    // $2000 byte rather than read back through `ctrl`.
+    ppu.writeRegister(0x2000, 0b10, &m);
+    try testing.expectEqual(@as(u15, 0x0800), ppu.t & 0x0C00);
+}
+
+test "a second PPUCTRL write does not swallow the first one's pending latch" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+    ppu.writeRegister(0x2000, 0x80, &m); // nmi_enable, pending
+    ppu.writeRegister(0x2000, 0x04, &m); // increment32; flushes the first
+    try testing.expect(ppu.ctrl.nmi_enable); // the first write did land
+    try testing.expect(!ppu.ctrl.increment32); // the second is still pending
+    ppu.tick(&m);
+    try testing.expect(ppu.ctrl.increment32);
+    try testing.expect(!ppu.ctrl.nmi_enable); // fully replaced by the 2nd byte
+}
+
+test "Ppu.reset drops a pending PPUCTRL/PPUMASK latch instead of letting it apply after" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+    ppu.writeRegister(0x2000, 0x80, &m);
+    ppu.writeRegister(0x2001, 0x1E, &m);
+    ppu.reset();
+    ppu.tick(&m);
+    try testing.expect(!ppu.ctrl.nmi_enable);
+    try testing.expect(!ppu.mask.show_bg);
 }
 
 test "PPUCTRL's nametable bits land in t bits 10-11" {

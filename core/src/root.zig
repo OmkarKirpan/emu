@@ -3,6 +3,7 @@ pub const mapper = @import("mapper.zig");
 pub const bus = @import("bus.zig");
 pub const cpu = @import("cpu.zig");
 pub const ppu = @import("ppu.zig");
+pub const controller = @import("controller.zig");
 
 pub const Rom = rom.Rom;
 pub const Header = rom.Header;
@@ -18,6 +19,7 @@ pub const Ppu = ppu.Ppu;
 pub const Ctrl = ppu.Ctrl;
 pub const Mask = ppu.Mask;
 pub const Status = ppu.Status;
+pub const Controller = controller.Controller;
 
 // Force analysis + codegen of the public surface in non-test builds
 // (notably `zig build wasm`), which otherwise compiles an empty module
@@ -47,6 +49,10 @@ comptime {
     _ = &Ppu.readRegister;
     _ = &Ppu.writeRegister;
     _ = &Ppu.peekRegister;
+    _ = &Controller.setButtons;
+    _ = &Controller.setStrobe;
+    _ = &Controller.read;
+    _ = &Controller.peek;
 }
 
 test {
@@ -55,11 +61,14 @@ test {
     _ = bus;
     _ = cpu;
     _ = ppu;
-    // Native-only: pulls in the vendored nestest/ppu_vbl_nmi fixtures via
-    // anonymous imports declared in build.zig. Deliberately reachable only
-    // from this test block so `zig build wasm` never has to embed the
+    _ = controller;
+    // Native-only: pulls in the vendored nestest/ppu_vbl_nmi/sprite fixtures
+    // via anonymous imports declared in build.zig. Deliberately reachable
+    // only from this test block so `zig build wasm` never has to embed the
     // vendored test-ROM data.
     _ = @import("nestest_test.zig");
     _ = @import("ppu_vbl_nmi_test.zig");
     _ = @import("ppu_background_test.zig");
+    _ = @import("ppu_sprites_test.zig");
+    _ = @import("nrom_sprite_input_test.zig");
 }

@@ -21,10 +21,14 @@
 //! ENG-61 specifies. A future mapper with bank-switch/IRQ state (MMC1/MMC3,
 //! M7) will need its own section here too.
 //!
-//! There is no controller input to log yet (M3), so "given identical
-//! inputs" is trivially satisfied by there being no inputs at all --
-//! deferred intentionally rather than building event-log machinery this
-//! milestone doesn't need.
+//! **Controller state (ENG-68, M3)**: `hashControllers` now covers each
+//! port's shift-register/strobe/latched-buttons state, on the same
+//! "grows to cover more" basis. There is still no recorded input-log/replay
+//! harness -- `assertDeterministic`'s two power-on runs never drive any
+//! controller input, so "given identical inputs" stays trivially satisfied
+//! by there being no inputs at all in either run. Building an event-log
+//! replay mechanism remains future work this milestone doesn't need; what's
+//! hashed here is just the architectural register state itself.
 
 const std = @import("std");
 const testing = std.testing;
@@ -34,6 +38,7 @@ const bus_mod = @import("bus.zig");
 const cpu_mod = @import("cpu.zig");
 const ppu_mod = @import("ppu.zig");
 const mapper_mod = @import("mapper.zig");
+const controller_mod = @import("controller.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Digest = [Sha256.digest_length]u8;
@@ -67,6 +72,7 @@ fn hashState(cpu: *const cpu_mod.Cpu, bus: *const bus_mod.Bus) Digest {
     hasher.update(&bus.prg_ram);
     hashPpu(&hasher, &bus.ppu);
     hashMapper(&hasher, &bus.mapper);
+    hashControllers(&hasher, &bus.controllers);
 
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -101,6 +107,16 @@ fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
         p.bg_next_tile_lo,
         p.bg_next_tile_hi,
     });
+    // The one-dot PPUCTRL/PPUMASK latch delay (`Ppu.applyPendingLatches`)
+    // is real mid-cycle state a resume would have to restore: `$FF` here
+    // stands for "nothing pending", distinct from a pending write of any
+    // real byte value.
+    hasher.update(&[_]u8{
+        p.pending_ctrl orelse 0xFF,
+        @intFromBool(p.pending_ctrl != null),
+        p.pending_mask orelse 0xFF,
+        @intFromBool(p.pending_mask != null),
+    });
     hasher.update(std.mem.asBytes(&p.v));
     hasher.update(std.mem.asBytes(&p.t));
     hasher.update(std.mem.asBytes(&p.bg_shift_pattern_lo));
@@ -114,6 +130,41 @@ fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
     hasher.update(&p.palette);
     hasher.update(&p.oam);
     hasher.update(&p.secondary_oam);
+    // ENG-68 (M3): the sprite pipeline's per-scanline derived state. Purely
+    // a deterministic function of OAM+registers+scanline, so two power-on
+    // runs would already hash identically without this -- included anyway
+    // for ENG-61's "mid-scanline-resumable state" completeness, same spirit
+    // as `secondary_oam` above.
+    hasher.update(&[_]u8{
+        p.sprite_count,
+        p.secondary_count,
+        @intFromBool(p.secondary_has_sprite0),
+        @intFromBool(p.overflow_dot != null),
+    });
+    hasher.update(std.mem.asBytes(&(p.overflow_dot orelse @as(u16, 0))));
+    for (p.sprite_units[0..p.sprite_count]) |su| {
+        hasher.update(&[_]u8{
+            su.x,
+            su.pattern_lo,
+            su.pattern_hi,
+            @as(u8, su.palette),
+            @intFromBool(su.behind_bg),
+            @intFromBool(su.is_sprite0),
+        });
+    }
+}
+
+/// ENG-68 (M3): controller shift-register state. Per `determinism.zig`'s
+/// own module doc comment, there is still no recorded input-log/replay
+/// harness (that remains future work) -- `assertDeterministic`'s two
+/// power-on runs never drive controller input, so `buttons` stays 0 in
+/// both -- but the architectural *register* state introduced this
+/// milestone belongs in the hash on the same "grows to cover more as later
+/// milestones add state" basis every other section here does.
+fn hashControllers(hasher: *Sha256, controllers: *const [2]controller_mod.Controller) void {
+    for (controllers) |c| {
+        hasher.update(&[_]u8{ c.buttons, c.shift, @intFromBool(c.strobe) });
+    }
 }
 
 /// See the module doc comment: only CHR-RAM is mutable state worth hashing.
@@ -227,4 +278,22 @@ test "the hash does NOT change if a CHR-ROM cartridge's CHR contents differ (ENG
     const a = hashState(&cpu_a, &bus_a);
     const b = hashState(&cpu_b, &bus_b);
     try testing.expect(std.mem.eql(u8, &a, &b));
+}
+
+test "the hash changes if controller state (ENG-68) differs" {
+    const buf = minimalNromBuf();
+    const rom = try rom_mod.Rom.load(&buf);
+
+    var bus_a = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
+    var cpu_a = cpu_mod.Cpu.init(&bus_a);
+    cpu_a.reset();
+
+    var bus_b = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
+    bus_b.controllers[0].setButtons(0x01); // the only difference from bus_a/cpu_a
+    var cpu_b = cpu_mod.Cpu.init(&bus_b);
+    cpu_b.reset();
+
+    const a = hashState(&cpu_a, &bus_a);
+    const b = hashState(&cpu_b, &bus_b);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
 }
