@@ -4,7 +4,10 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "sync-core": "node scripts/sync-core.mjs",
+    "predev": "npm run sync-core",
     "dev": "vite",
+    "prebuild": "npm run sync-core",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview"

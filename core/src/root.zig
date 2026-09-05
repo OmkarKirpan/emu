@@ -4,6 +4,7 @@ pub const bus = @import("bus.zig");
 pub const cpu = @import("cpu.zig");
 pub const ppu = @import("ppu.zig");
 pub const controller = @import("controller.zig");
+pub const palette = @import("palette.zig");
 
 pub const Rom = rom.Rom;
 pub const Header = rom.Header;
@@ -62,6 +63,7 @@ test {
     _ = cpu;
     _ = ppu;
     _ = controller;
+    _ = palette;
     // Native-only: pulls in the vendored nestest/ppu_vbl_nmi/sprite fixtures
     // via anonymous imports declared in build.zig. Deliberately reachable
     // only from this test block so `zig build wasm` never has to embed the

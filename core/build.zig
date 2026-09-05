@@ -105,13 +105,13 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
-    // The wasm32-freestanding build: proves the module compiles for the
-    // delivery target. No shared_memory/atomics yet (that's ENG-56, M5) and
-    // no exported ABI functions yet (that's ENG-60, M4) — this step exists
-    // purely so a wasm regression is caught before those milestones need it.
+    // The wasm32-freestanding build: `src/wasm.zig` (not `root.zig` — see
+    // its own doc comment) is the actual delivery artifact as of ENG-69
+    // (M4), exporting the ABI ENG-60 designed. Still no shared_memory/
+    // atomics (that's ENG-56, M5).
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
+        .root_source_file = b.path("src/wasm.zig"),
         .target = wasm_target,
         .optimize = optimize,
     });
