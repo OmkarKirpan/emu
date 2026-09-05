@@ -115,23 +115,3 @@ pub fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
     }
     try testing.expectEqual(@as(u8, 0), status);
 }
-
-/// Runs a sub-test that is a *documented, understood* gap rather than a
-/// pass: asserts the result is exactly the known failure code, so a
-/// regression to something *else* still fails the suite, then skips
-/// instead of claiming a pass that isn't real.
-pub fn expectKnownGap(name: []const u8, rom_bytes: []const u8, known_code: u8) !void {
-    var m: Machine = undefined;
-    try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
-
-    var buf: [256]u8 = undefined;
-    std.debug.print(
-        "\n{s}: documented gap, result code ${X:0>2} -- {s}\n",
-        .{ name, status, statusText(&m.bus, &buf) },
-    );
-    // If the failure ever changes shape, this test should start failing for
-    // real instead of silently continuing to skip.
-    try testing.expectEqual(known_code, status);
-    return error.SkipZigTest;
-}

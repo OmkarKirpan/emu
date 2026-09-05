@@ -36,7 +36,7 @@
 //! `Ppu.applyPendingLatches` and `Cpu.write`.
 //!
 //! The shared `$6000`-protocol polling/reset-handling logic (`Machine`,
-//! `expectPass`, `expectKnownGap`) lives in `blargg_harness.zig`,
+//! `expectPass`) lives in `blargg_harness.zig`,
 //! factored out here when `ppu_sprites_test.zig` (ENG-68) needed the exact
 //! same logic for `oam_read`/`oam_stress`.
 

@@ -16,12 +16,13 @@
 //!     full derivation. `NametableMachine`/`runToResult` below implement
 //!     that detection instead of polling `$6000`.
 //!
-//! See `Ppu`'s and `evaluateSprites`'s doc comments for the specific,
-//! deliberate simplification this codebase makes (sprite evaluation
-//! collapsed to one shot at dot 1, not spread across real hardware's dots
-//! 65-256/257-320) and why it is expected to cost exactly the
-//! cycle-of-the-frame *timing* sub-tests (`sprite_overflow_tests/3.Timing`
-//! and its neighbors), not sprite-evaluation *correctness*.
+//! All four suites pass in full. `oam_stress` and
+//! `sprite_overflow_tests/3.Timing` were documented, asserted gaps when
+//! this stage first landed: the former needed OAM byte 2's three
+//! non-existent bits masked (`Ppu.writeRegister`'s $2004 case), the latter
+//! needed sprite evaluation moved onto hardware's real schedule -- one
+//! scanline ahead, over dots 65-256, costing two dots per OAM byte so the
+//! overflow flag lands on the right dot (`Ppu.evaluateSprites`).
 
 const std = @import("std");
 const testing = std.testing;
@@ -38,21 +39,17 @@ test "oam_read" {
     try harness.expectPass("oam_read", @embedFile("oam_read"));
 }
 
-// oam_stress: a *documented* gap, per the suite's own readme.txt --
-// "On an NTSC NES, this passes only for one of the four random PPU-CPU
-// synchronizations at power/reset." What it actually probes past basic
-// OAMADDR/OAMDATA semantics (already covered, and passing, in oam_read and
-// in ppu.zig's own register tests) is analog OAM "decay": unrefreshed OAM
-// cells drift after enough real time with rendering off, in a way that
-// depends on the exact silicon and is why even real hardware only passes
-// 1-in-4 power-on phases. That decay is not modeled here -- deliberately,
-// on the same footing as every other emulator that skips it (it has no
-// digital, phase-independent definition to implement against) -- so this
-// is asserted against its one measured, deterministic (this codebase has
-// no power-on phase randomness to vary) result code rather than silently
-// skipped.
-test "oam_stress (documented gap: analog OAM-decay behavior, not modeled -- see the suite's own readme.txt on 1-in-4 pass odds even on real hardware)" {
-    try harness.expectKnownGap("oam_stress", @embedFile("oam_stress"), 0x01);
+// oam_stress writes random bytes across all 256 OAM addresses and reads
+// every one back, so it is the test that catches OAM byte 2's three
+// non-existent bits (see `Ppu.writeRegister`'s $2004 case): miss that mask
+// and it reports exactly every fourth byte from offset 2 as wrong. It was
+// a documented gap through M3 on a mistaken reading of its readme's
+// "passes only for one of the four random PPU-CPU synchronizations"
+// caveat -- that caveat is about $2004 access timing during rendering, not
+// about the analog OAM decay it was first attributed to, and the actual
+// failure was this plain digital one.
+test "oam_stress" {
+    try harness.expectPass("oam_stress", @embedFile("oam_stress"));
 }
 
 // ------------------------------------------- nametable-text-protocol suites
@@ -128,25 +125,6 @@ fn expectPassText(name: []const u8, rom_bytes: []const u8) !void {
     }
 }
 
-/// See `blargg_harness.expectKnownGap`'s doc comment for the pattern: assert
-/// the exact known failure code (so a *different* regression still fails
-/// the suite for real), then skip rather than claim a pass that isn't real.
-fn expectKnownGapText(name: []const u8, rom_bytes: []const u8, known_code: u32) !void {
-    var m: NametableMachine = undefined;
-    try m.init(rom_bytes);
-    switch (try runToResult(&m)) {
-        .passed => {
-            std.debug.print("\n{s}: now passes -- this was a documented gap at #{d}, update this test\n", .{ name, known_code });
-            return error.TestUnexpectedResult;
-        },
-        .failed => |code| {
-            std.debug.print("\n{s}: documented gap, FAILED #{d}\n", .{ name, code });
-            try testing.expectEqual(known_code, code);
-            return error.SkipZigTest;
-        },
-    }
-}
-
 test "sprite_hit 01.basics" {
     try expectPassText("sprite_hit/01.basics", @embedFile("sprite_hit_01.basics"));
 }
@@ -187,20 +165,15 @@ test "sprite_overflow 1.Basics" {
 test "sprite_overflow 2.Details" {
     try expectPassText("sprite_overflow/2.Details", @embedFile("sprite_overflow_2.Details"));
 }
-// A documented gap, exactly per `Ppu`'s and `evaluateSprites`'s doc
-// comments: this suite tests the sprite-overflow flag's cycle-of-the-frame
-// timing, which this codebase's dot-collapsed evaluation model (evaluate
-// *for* the scanline being drawn, at its own dot 1, rather than one
-// scanline ahead the way real hardware's dots 65-256 do) cannot reproduce --
-// every occurrence becomes visible to the CPU one scanline later than real
-// hardware. Measured: fails at sub-test #5 ("Set too early/too late for
-// first scanline"), the *first* timing-specific check in the suite -- test
-// #4 in the same pair ("set too early") already implicitly passed (the ROM
-// would report #4, not #5, if the flag fired before hardware's window), so
-// this is exactly the "late by our one-scanline lag" shape predicted, not a
-// wider divergence.
-test "sprite_overflow 3.Timing (documented gap: cycle-of-the-frame overflow timing needs the one-scanline-ahead evaluation model this milestone's dot-collapsed pipeline does not have)" {
-    try expectKnownGapText("sprite_overflow/3.Timing", @embedFile("sprite_overflow_3.Timing"), 5);
+// 3.Timing measures *when* in the frame the overflow flag fires, to within
+// a CPU clock or two. It was a documented, asserted gap through M3, failing
+// at sub-test #5 ("set too late for first scanline"), because evaluation
+// used to run at the dot 1 of the scanline being drawn rather than one
+// scanline ahead on hardware's dots 65-256 schedule. Both halves of that --
+// the lookahead and the two-dots-per-OAM-byte accounting that places the
+// flag's dot -- are what `Ppu.evaluateSprites` now does.
+test "sprite_overflow 3.Timing" {
+    try expectPassText("sprite_overflow/3.Timing", @embedFile("sprite_overflow_3.Timing"));
 }
 test "sprite_overflow 4.Obscure" {
     try expectPassText("sprite_overflow/4.Obscure", @embedFile("sprite_overflow_4.Obscure"));

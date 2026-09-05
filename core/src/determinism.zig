@@ -135,7 +135,13 @@ fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
     // runs would already hash identically without this -- included anyway
     // for ENG-61's "mid-scanline-resumable state" completeness, same spirit
     // as `secondary_oam` above.
-    hasher.update(&[_]u8{ p.sprite_count, @intFromBool(p.sprite0_in_range) });
+    hasher.update(&[_]u8{
+        p.sprite_count,
+        p.secondary_count,
+        @intFromBool(p.secondary_has_sprite0),
+        @intFromBool(p.overflow_dot != null),
+    });
+    hasher.update(std.mem.asBytes(&(p.overflow_dot orelse @as(u16, 0))));
     for (p.sprite_units[0..p.sprite_count]) |su| {
         hasher.update(&[_]u8{
             su.x,

@@ -20,5 +20,8 @@ posture as every other vendored Blargg/Kevtris ROM in this tree; see
 time and runs it against the standard Blargg `$6000` status-byte protocol,
 exactly like `ppu_vbl_nmi`'s fixtures. Randomly stress-tests OAMADDR
 ($2003)/OAMDATA ($2004) read/write semantics for tens of seconds of emulated
-NES time; the harness's cycle budget is sized generously for that. Native
+NES time; the harness's cycle budget is sized generously for that. Because
+it reads back every one of the 256 OAM bytes it writes, this is also the
+test that pins OAM byte 2's three non-existent bits (see
+`Ppu.writeRegister`'s $2004 case). Native
 test binary only — `zig build wasm` never sees this data.

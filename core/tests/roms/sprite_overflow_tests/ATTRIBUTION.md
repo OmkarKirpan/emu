@@ -38,9 +38,9 @@ suite's `ATTRIBUTION.md` for how this was confirmed and how the harness
 **Must run in order.** The suite's own `readme.txt` states later ROMs
 assume earlier ones already pass — `3.Timing`, `4.Obscure`, and
 `5.Emulator` in particular probe increasingly fine-grained edge cases of
-the same overflow-detection logic `1.Basics`/`2.Details` establish. Where
-this codebase's dot-collapsed sprite-evaluation model (see `Ppu`'s and
-`evaluateSprites`'s doc comments) cannot reproduce hardware's exact
-cycle-of-the-frame overflow timing, the corresponding sub-test is run as a
-documented, asserted gap rather than silently skipped — see
-`ppu_sprites_test.zig`.
+the same overflow-detection logic `1.Basics`/`2.Details` establish. All
+five pass. `3.Timing` was a documented, asserted gap when this stage first
+landed, because sprite evaluation ran at the dot 1 of the scanline being
+drawn instead of one scanline ahead on hardware's dots 65-256 schedule;
+`Ppu.evaluateSprites` now does the latter, and costs out two dots per OAM
+byte so the overflow flag lands on the dot hardware lands it on.

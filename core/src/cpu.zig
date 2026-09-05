@@ -2163,8 +2163,12 @@ test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advanci
     h.stepN(4);
 
     for (0..256) |i| {
-        const expected: u8 = @intCast(i ^ 0xA5);
         const oam_index: u8 = @truncate(0x40 +% i);
+        // Byte 2 of each sprite drops bits 2-4 on the way into OAM -- they
+        // do not exist in the PPU (see `Ppu.writeRegister`'s $2004 case).
+        // DMA goes through that same path, so it masks identically.
+        const written: u8 = @intCast(i ^ 0xA5);
+        const expected: u8 = if (oam_index % 4 == 2) written & 0xE3 else written;
         try testing.expectEqual(expected, h.bus.ppu.oam[oam_index]);
     }
     // 256 writes through OAMDATA auto-increment OAMADDR 256 times, wrapping
