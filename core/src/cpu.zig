@@ -363,6 +363,52 @@ pub const Cpu = struct {
         self.snapshotNmiReady();
         self.bus.write(addr, value);
         self.pollNmi();
+        // OAMDMA. `Bus` cannot handle $4014 itself -- see its doc comment --
+        // because the 513-514 CPU cycles this burns have to flow through
+        // this exact chokepoint (PPU ticking, NMI polling) like any other
+        // cycle. Checked after the ordinary write above so `open_bus` still
+        // updates first, same as every other write to this address.
+        if (addr == 0x4014) self.runOamDma(value);
+    }
+
+    /// Advance the clock by one CPU cycle with no bus access: `tick` plus
+    /// the same NMI re-snapshot/re-poll pair `read`/`write` perform around
+    /// their own access, minus the access itself. Used for `step`'s jammed-
+    /// CPU idle cycle and for `runOamDma`'s halt/alignment cycles, both of
+    /// which burn CPU time with nothing semantically observable happening.
+    fn idleCycle(self: *Cpu) void {
+        self.tick();
+        self.snapshotNmiReady();
+        self.pollNmi();
+    }
+
+    /// OAMDMA ($4014): copy 256 bytes from $(page)00-$(page)FF into OAM
+    /// through OAMDATA ($2004), exactly as if the CPU had done 256
+    /// individual `STA $2004` writes -- so it honors and advances OAMADDR
+    /// (`Ppu.writeRegister`'s existing $2004 case) as if it were still doing
+    /// so, just far faster than any real game would loop it by hand. Costs
+    /// 513 CPU cycles (1 halt cycle + 256 read/write pairs), or 514 if the
+    /// triggering write landed on an odd CPU cycle (one extra alignment
+    /// cycle before the first read) -- see https://www.nesdev.org/wiki/DMA.
+    ///
+    /// Driven entirely through `idleCycle`/`read`/`write`, so every cycle
+    /// this burns still ticks the PPU 3 dots and polls NMI exactly like
+    /// ordinary instruction execution -- a VBL NMI raised mid-DMA is
+    /// serviced the moment `step` is next called, matching real hardware
+    /// (which halts only the CPU's own bus activity, never the rest of the
+    /// console).
+    fn runOamDma(self: *Cpu, page: u8) void {
+        // The alignment cycle comes *before* the halt cycle: it exists to
+        // land the halt cycle itself on an even CPU cycle, which is what
+        // lets the 256 read/write pairs that follow fall on the same
+        // even/odd phase every time regardless of when $4014 was written.
+        if (self.cycles % 2 == 1) self.idleCycle();
+        self.idleCycle(); // the halt/"get" cycle -- always happens
+        var i: u16 = 0;
+        while (i < 256) : (i += 1) {
+            const value = self.read((@as(u16, page) << 8) | i);
+            self.write(0x2004, value);
+        }
     }
 
     fn fetch(self: *Cpu) u8 {
@@ -501,14 +547,13 @@ pub const Cpu = struct {
     /// nothing exercised by this milestone's test ROMs needs.
     pub fn step(self: *Cpu) void {
         if (self.jammed) {
-            // A jammed core still consumes bus cycles, so this must go through
-            // `tick` like every other cycle -- see the note there. No bus
-            // access happens this cycle, but NMI state is still re-derived
-            // for consistency with every other path (a jammed CPU can never
-            // service it anyway -- only RESET recovers from JAM).
-            self.tick();
-            self.snapshotNmiReady();
-            self.pollNmi();
+            // A jammed core still consumes bus cycles, so this must go
+            // through `tick` like every other cycle -- see `idleCycle`'s
+            // doc comment. No bus access happens this cycle, but NMI state
+            // is still re-derived for consistency with every other path (a
+            // jammed CPU can never service it anyway -- only RESET
+            // recovers from JAM).
+            self.idleCycle();
             return;
         }
 
@@ -2089,6 +2134,61 @@ test "a mapper-asserted IRQ is seen by the CPU without mapper-specific code" {
     // Acknowledging through the same interface drops it again.
     h.bus.mapper.irqAcknowledge();
     try testing.expect(!h.bus.mapper.irqPending());
+}
+
+test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advancing OAMADDR" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{
+        0xA9, 0x40, // LDA #$40
+        0x8D, 0x03, 0x20, // STA $2003 (OAMADDR = $40)
+        0xA9, 0x02, // LDA #$02 (source page)
+        0x8D, 0x14, 0x40, // STA $4014 (trigger OAMDMA from $0200-$02FF)
+    });
+    for (0..256) |i| h.bus.wram[0x0200 + i] = @intCast(i ^ 0xA5); // recognizable pattern
+    h.stepN(4);
+
+    for (0..256) |i| {
+        const expected: u8 = @intCast(i ^ 0xA5);
+        const oam_index: u8 = @truncate(0x40 +% i);
+        try testing.expectEqual(expected, h.bus.ppu.oam[oam_index]);
+    }
+    // 256 writes through OAMDATA auto-increment OAMADDR 256 times, wrapping
+    // a full u8 cycle back to where it started.
+    try testing.expectEqual(@as(u8, 0x40), h.bus.ppu.oam_addr);
+}
+
+test "OAMDMA costs 513 CPU cycles when triggered on an even cycle, 514 on odd" {
+    // NOP implied (2 cycles) + STA $4014 (4 cycles): the write lands on
+    // cycle 6 (even) -> 513-cycle DMA.
+    {
+        var h: TestHarness = undefined;
+        h.init(&[_]u8{ 0xEA, 0x8D, 0x14, 0x40 });
+        h.stepN(2);
+        try testing.expectEqual(@as(u64, 6 + 513), h.cpu.cycles);
+    }
+    // NOP $00 zero-page (3 cycles) + STA $4014 (4 cycles): the write lands
+    // on cycle 7 (odd) -> 514-cycle DMA.
+    {
+        var h: TestHarness = undefined;
+        h.init(&[_]u8{ 0x04, 0x00, 0x8D, 0x14, 0x40 });
+        h.stepN(2);
+        try testing.expectEqual(@as(u64, 7 + 514), h.cpu.cycles);
+    }
+}
+
+test "OAMDMA still ticks the PPU 3 dots/cycle throughout, not just for ordinary instructions" {
+    var h: TestHarness = undefined;
+    h.init(&[_]u8{ 0x8D, 0x14, 0x40 }); // STA $4014, page $00
+    // `init()` zeroes `cpu.cycles` after `reset()` (whose own 7 cycles
+    // already ticked the PPU 21 dots), so the dot position right after
+    // `init()` -- not (0,0) -- is the correct zero point for this check.
+    const dot_before: u64 = h.bus.ppu.frame * 341 * 262 +
+        @as(u64, h.bus.ppu.scanline) * 341 + h.bus.ppu.dot;
+
+    h.stepN(1); // the whole DMA runs inside this single `step` call
+    const dot_after: u64 = h.bus.ppu.frame * 341 * 262 +
+        @as(u64, h.bus.ppu.scanline) * 341 + h.bus.ppu.dot;
+    try testing.expectEqual(h.cpu.cycles * 3, dot_after - dot_before);
 }
 
 test "the decode table covers all 256 opcodes with sane lengths" {

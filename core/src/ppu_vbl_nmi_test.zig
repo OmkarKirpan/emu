@@ -27,149 +27,36 @@
 //! it is exactly the mechanism that lets `06-suppression` and its neighbors
 //! probe "one PPU clock later" timings at all (see `ppu.zig`'s
 //! `advanceDot` and its test coverage) -- none of the 10 sub-tests here
-//! depend on sprite rendering, which this milestone deliberately does not
-//! implement.
+//! depend on sprite rendering (ENG-68, M3), which was not implemented yet
+//! when this suite was first wired up.
+//!
+//! The shared `$6000`-protocol polling/reset-handling logic (`Machine`,
+//! `expectPass`, `expectKnownGap`) now lives in `blargg_harness.zig`,
+//! factored out here when `ppu_sprites_test.zig` (ENG-68) needed the exact
+//! same logic for `oam_read`/`oam_stress`.
 
-const std = @import("std");
-const testing = std.testing;
-
-const rom_mod = @import("rom.zig");
-const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
 const determinism = @import("determinism.zig");
-
-/// NTSC CPU clock, Hz. Used only to convert Blargg's "at least 100 msec"
-/// reset-delay requirement into a cycle count.
-const cpu_hz: u64 = 1_789_773;
-
-/// Generous ceiling on total emulated CPU cycles per sub-test (roughly 60
-/// seconds of NES time). Every one of these tests completes in a small
-/// fraction of a second of NES time; this exists purely so a genuine hang
-/// (a bug that makes the ROM spin forever) fails the test instead of
-/// hanging CI.
-const max_cycles: u64 = 60 * cpu_hz;
-
-/// >=100ms of emulated NES time, rounded up, per the `$81` protocol.
-const min_reset_delay_cycles: u64 = (100 * cpu_hz) / 1000 + 1;
-
-const max_resets: u32 = 10;
-
-const HarnessError = error{ Timeout, TooManyResets };
-
-/// Grab the null-terminated ASCII detail text at $6004, for failure output.
-fn statusText(bus: *const bus_mod.Bus, buf: []u8) []const u8 {
-    var i: usize = 0;
-    while (i < buf.len) : (i += 1) {
-        const c = bus.peek(@intCast(0x6004 + i));
-        if (c == 0) break;
-        buf[i] = c;
-    }
-    return buf[0..i];
-}
-
-/// One booted machine, kept as a struct so `cpu`'s pointer to `bus` stays
-/// valid: `Cpu` borrows `*Bus`, so the pair has to reach its final address
-/// before being wired together. Two-phase init (`var m: Machine = undefined;
-/// try m.init(rom)`) is the same shape `cpu.zig`'s own `TestHarness` uses.
-const Machine = struct {
-    bus: bus_mod.Bus,
-    cpu: cpu_mod.Cpu,
-
-    fn init(self: *Machine, rom_bytes: []const u8) !void {
-        const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
-        self.cpu = cpu_mod.Cpu.init(&self.bus);
-        self.cpu.reset();
-    }
-
-    /// Run until `$6000` reports a terminal result code, and return it.
-    ///
-    /// Polls `$6000` via `bus.peek` (side-effect-free -- the ROM itself owns
-    /// that address's real read/write through `Bus.read`/`Bus.write` as part
-    /// of `cpu.step`; polling separately must not perturb anything). Handles
-    /// the `$81` "needs a reset, delayed >=100ms" code by running out that
-    /// delay in emulated NES time and then calling `cpu.reset()`, exactly per
-    /// the documented protocol. Bounded by `max_cycles` so a ROM that spins
-    /// forever fails the test instead of hanging CI.
-    fn runToTerminalStatus(self: *Machine) !u8 {
-        var resets: u32 = 0;
-        while (true) {
-            if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-            self.cpu.step();
-            if (self.bus.peek(0x6001) != 0xDE or
-                self.bus.peek(0x6002) != 0xB0 or
-                self.bus.peek(0x6003) != 0x61) continue;
-            const s = self.bus.peek(0x6000);
-            if (s == 0x80) continue;
-            if (s == 0x81) {
-                resets += 1;
-                if (resets > max_resets) return HarnessError.TooManyResets;
-                const target = self.cpu.cycles + min_reset_delay_cycles;
-                while (self.cpu.cycles < target) {
-                    if (self.cpu.cycles > max_cycles) return HarnessError.Timeout;
-                    self.cpu.step();
-                }
-                self.cpu.reset();
-                continue;
-            }
-            return s;
-        }
-    }
-};
-
-/// Run one Blargg-protocol ROM, asserting its result code is `$00` (pass).
-fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
-    var m: Machine = undefined;
-    try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
-
-    if (status != 0) {
-        var buf: [256]u8 = undefined;
-        std.debug.print(
-            "\nppu_vbl_nmi/{s}: result code ${X:0>2}\n  detail: {s}\n",
-            .{ name, status, statusText(&m.bus, &buf) },
-        );
-    }
-    try testing.expectEqual(@as(u8, 0), status);
-}
-
-/// Runs a sub-test that is a *documented, understood* gap (see the two
-/// call sites below) rather than a pass: asserts the result is exactly the
-/// known failure code, so a regression to something *else* still fails the
-/// suite, then skips instead of claiming a pass that isn't real.
-fn expectKnownGap(name: []const u8, rom_bytes: []const u8, known_code: u8) !void {
-    var m: Machine = undefined;
-    try m.init(rom_bytes);
-    const status = try m.runToTerminalStatus();
-
-    var buf: [256]u8 = undefined;
-    std.debug.print(
-        "\nppu_vbl_nmi/{s}: documented gap, result code ${X:0>2} -- {s}\n",
-        .{ name, status, statusText(&m.bus, &buf) },
-    );
-    // If the failure ever changes shape, this test should start failing for
-    // real instead of silently continuing to skip.
-    try testing.expectEqual(known_code, status);
-    return error.SkipZigTest;
-}
+const harness = @import("blargg_harness.zig");
+const expectPass = harness.expectPass;
+const expectKnownGap = harness.expectKnownGap;
 
 test "ppu_vbl_nmi 01-vbl_basics" {
-    try expectPass("01-vbl_basics", @embedFile("01-vbl_basics"));
+    try expectPass("ppu_vbl_nmi/01-vbl_basics", @embedFile("01-vbl_basics"));
 }
 test "ppu_vbl_nmi 02-vbl_set_time" {
-    try expectPass("02-vbl_set_time", @embedFile("02-vbl_set_time"));
+    try expectPass("ppu_vbl_nmi/02-vbl_set_time", @embedFile("02-vbl_set_time"));
 }
 test "ppu_vbl_nmi 03-vbl_clear_time" {
-    try expectPass("03-vbl_clear_time", @embedFile("03-vbl_clear_time"));
+    try expectPass("ppu_vbl_nmi/03-vbl_clear_time", @embedFile("03-vbl_clear_time"));
 }
 test "ppu_vbl_nmi 04-nmi_control" {
-    try expectPass("04-nmi_control", @embedFile("04-nmi_control"));
+    try expectPass("ppu_vbl_nmi/04-nmi_control", @embedFile("04-nmi_control"));
 }
 test "ppu_vbl_nmi 05-nmi_timing" {
-    try expectPass("05-nmi_timing", @embedFile("05-nmi_timing"));
+    try expectPass("ppu_vbl_nmi/05-nmi_timing", @embedFile("05-nmi_timing"));
 }
 test "ppu_vbl_nmi 06-suppression" {
-    try expectPass("06-suppression", @embedFile("06-suppression"));
+    try expectPass("ppu_vbl_nmi/06-suppression", @embedFile("06-suppression"));
 }
 // 07-nmi_on_timing: a documented, understood gap -- see the doc comment
 // below. 08-nmi_off_timing, its mirror-image test (disabling NMI near the
@@ -213,13 +100,13 @@ test "ppu_vbl_nmi 06-suppression" {
 // exactly the one-row/one-PPU-dot shift this analysis predicts, and no
 // wider than that.
 test "ppu_vbl_nmi 07-nmi_on_timing (documented gap: write-vs-VBL-clear needs sub-CPU-cycle precision this milestone's CPU/PPU integration does not have)" {
-    try expectKnownGap("07-nmi_on_timing", @embedFile("07-nmi_on_timing"), 0x01);
+    try expectKnownGap("ppu_vbl_nmi/07-nmi_on_timing", @embedFile("07-nmi_on_timing"), 0x01);
 }
 test "ppu_vbl_nmi 08-nmi_off_timing" {
-    try expectPass("08-nmi_off_timing", @embedFile("08-nmi_off_timing"));
+    try expectPass("ppu_vbl_nmi/08-nmi_off_timing", @embedFile("08-nmi_off_timing"));
 }
 test "ppu_vbl_nmi 09-even_odd_frames" {
-    try expectPass("09-even_odd_frames", @embedFile("09-even_odd_frames"));
+    try expectPass("ppu_vbl_nmi/09-even_odd_frames", @embedFile("09-even_odd_frames"));
 }
 
 // 10-even_odd_timing: the same underlying gap as 07, applied to PPUMASK
@@ -234,7 +121,7 @@ test "ppu_vbl_nmi 09-even_odd_frames" {
 // at "Clock is skipped too late, relative to enabling BG" -- the identical
 // one-PPU-dot-late shape as 07, not a different or wider divergence.
 test "ppu_vbl_nmi 10-even_odd_timing (documented gap: same root cause as 07, for PPUMASK/odd-frame-skip)" {
-    try expectKnownGap("10-even_odd_timing", @embedFile("10-even_odd_timing"), 0x03);
+    try expectKnownGap("ppu_vbl_nmi/10-even_odd_timing", @embedFile("10-even_odd_timing"), 0x03);
 }
 
 // `assert_deterministic` (ENG-65), wired into this stage per ENG-66's
