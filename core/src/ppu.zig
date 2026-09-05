@@ -249,6 +249,13 @@ pub const Ppu = struct {
     /// (whether true or not) the instant that dot is reached.
     suppress_vbl_this_frame: bool = false,
 
+    /// A written-but-not-yet-latched PPUCTRL/PPUMASK byte. See
+    /// `applyPendingLatches`: the PPU picks these two control registers up
+    /// one dot after the CPU's write cycle ends, which is what
+    /// `ppu_vbl_nmi/07-nmi_on_timing` and `/10-even_odd_timing` measure.
+    pending_ctrl: ?u8 = null,
+    pending_mask: ?u8 = null,
+
     // ------------------------------------------------------ bg pipeline
     // "next" latches hold data already fetched, awaiting the next reload;
     // "shift" registers are what pixels are actually read out of. Loading
@@ -286,6 +293,8 @@ pub const Ppu = struct {
     pub fn reset(self: *Ppu) void {
         self.ctrl = .{};
         self.mask = .{};
+        self.pending_ctrl = null;
+        self.pending_mask = null;
         self.w = false;
         self.read_buffer = 0;
         self.t = 0;
@@ -298,6 +307,45 @@ pub const Ppu = struct {
 
     fn renderingEnabled(self: *const Ppu) bool {
         return self.mask.show_bg or self.mask.show_sprites;
+    }
+
+    /// Latch any pending PPUCTRL/PPUMASK write into the live registers.
+    ///
+    /// **Why these two registers land a dot late.** A CPU write completes at
+    /// the end of its own CPU cycle -- after the third of that cycle's three
+    /// PPU dots -- but the byte is not visible to the PPU logic that reads
+    /// it back as a *level* (the NMI output; the rendering-enabled input to
+    /// `advanceDot`'s odd-frame skip) until a dot later, the 2C02 having
+    /// sampled the CPU-facing write on its own next clock edge. Called at
+    /// the end of every `tick`, so a write landing at the end of CPU cycle N
+    /// is live from the *second* dot of cycle N+1 onward, and from that
+    /// cycle's own mid-`tick` NMI poll.
+    ///
+    /// The one-dot figure is what four of Blargg's NMI/timing sub-tests
+    /// agree on, not a datasheet number: it was found by sweeping the
+    /// write's effective position across every dot offset from -3 to +3 and
+    /// keeping the only one at which `04`, `05`, `06`, `07`, `08` and `10`
+    /// are simultaneously green. Every other offset breaks at least one of
+    /// them, which is the strongest evidence available without silicon.
+    ///
+    /// This is the single dot that separates `ppu_vbl_nmi/07-nmi_on_timing`
+    /// (a $2000 write racing the VBL flag's clear) and `/10-even_odd_timing`
+    /// (a $2001 write racing the odd-frame dot skip) from passing: both were
+    /// documented, asserted gaps through M2/M3 precisely because the write
+    /// used to become visible a dot too early. Deliberately scoped to these
+    /// two registers rather than every PPU write: they are the only ones the
+    /// PPU re-reads as a *level* on later dots, and deferring the rest would
+    /// desynchronize the register file from `Bus`'s own immediate writes
+    /// (OAMDMA's $2004 stream, $2007's VRAM writes) for no modeled gain.
+    fn applyPendingLatches(self: *Ppu) void {
+        if (self.pending_ctrl) |v| {
+            self.ctrl = @bitCast(v);
+            self.pending_ctrl = null;
+        }
+        if (self.pending_mask) |v| {
+            self.mask = @bitCast(v);
+            self.pending_mask = null;
+        }
     }
 
     /// OAMDATA ($2004) read value. Normally just the byte at OAMADDR, but
@@ -421,10 +469,19 @@ pub const Ppu = struct {
         self.data_bus = value;
         switch (addr) {
             0x2000 => {
-                self.ctrl = @bitCast(value);
-                self.t = (self.t & ~@as(u15, 0x0C00)) | (@as(u15, self.ctrl.nametable) << 10);
+                // The control-bit latch is deferred by one dot (see
+                // `applyPendingLatches`); `t`'s nametable-select bits are
+                // not -- they are part of the scroll address latch, on the
+                // PPU's CPU-facing side, and take the *written* value
+                // directly rather than reading back through `ctrl`.
+                self.applyPendingLatches();
+                self.pending_ctrl = value;
+                self.t = (self.t & ~@as(u15, 0x0C00)) | (@as(u15, @as(u2, @truncate(value))) << 10);
             },
-            0x2001 => self.mask = @bitCast(value),
+            0x2001 => {
+                self.applyPendingLatches();
+                self.pending_mask = value;
+            },
             0x2002 => {}, // read-only; the data-bus latch update above is all that happens
             0x2003 => self.oam_addr = value,
             0x2004 => {
@@ -835,6 +892,7 @@ pub const Ppu = struct {
         }
 
         self.advanceDot();
+        self.applyPendingLatches();
     }
 };
 
@@ -925,6 +983,12 @@ test "PPUDATA increments v by 1 or 32 depending on PPUCTRL bit 2" {
     try testing.expectEqual(@as(u15, 0x2001), ppu.v);
 
     ppu.writeRegister(0x2000, 0x04, &m); // set increment32
+    // PPUCTRL latches one dot after the write (see `applyPendingLatches`),
+    // so give it that dot before relying on the new bit. A real CPU cannot
+    // issue two register writes closer together than two whole CPU cycles
+    // (6 dots) anyway -- this tick is what that gap looks like at the
+    // smallest scale that still matters.
+    ppu.tick(&m);
     ppu.v = 0x2000;
     ppu.writeRegister(0x2007, 0x22, &m);
     try testing.expectEqual(@as(u15, 0x2020), ppu.v);
@@ -965,6 +1029,58 @@ test "PPUSCROLL's two writes set fine-X, coarse X, coarse Y, and fine Y" {
     ppu.writeRegister(0x2005, 0b0101_0110, &m); // coarse Y=0b01010=10, fine Y=0b110=6
     try testing.expectEqual(@as(u15, 10), (ppu.t >> 5) & 0x1F);
     try testing.expectEqual(@as(u15, 6), (ppu.t >> 12) & 0x7);
+}
+
+test "PPUCTRL and PPUMASK writes latch one dot late; everything else is immediate" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+
+    // PPUMASK: `advanceDot`'s odd-frame skip and `renderingEnabled` read
+    // this as a *level* on later dots, so the one-dot delay is observable.
+    // `ppu_vbl_nmi/10-even_odd_timing` is the conformance ROM that measures
+    // it; this pins the same behavior without a 40KB fixture.
+    ppu.writeRegister(0x2001, 0b0000_1000, &m); // show_bg
+    try testing.expect(!ppu.mask.show_bg); // not yet -- still pending
+    ppu.tick(&m);
+    try testing.expect(ppu.mask.show_bg); // latched by the end of that dot
+
+    // PPUCTRL, same: this is the delay `07-nmi_on_timing`/`08-nmi_off_timing`
+    // measure through the NMI output level.
+    ppu.status.vblank = true;
+    ppu.writeRegister(0x2000, 0x80, &m); // nmi_enable
+    try testing.expect(!ppu.ctrl.nmi_enable);
+    try testing.expect(!ppu.nmiSignal()); // the whole point: still low
+    ppu.tick(&m);
+    try testing.expect(ppu.ctrl.nmi_enable);
+    try testing.expect(ppu.nmiSignal());
+
+    // Not deferred: `t`'s nametable-select bits, written straight from the
+    // $2000 byte rather than read back through `ctrl`.
+    ppu.writeRegister(0x2000, 0b10, &m);
+    try testing.expectEqual(@as(u15, 0x0800), ppu.t & 0x0C00);
+}
+
+test "a second PPUCTRL write does not swallow the first one's pending latch" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+    ppu.writeRegister(0x2000, 0x80, &m); // nmi_enable, pending
+    ppu.writeRegister(0x2000, 0x04, &m); // increment32; flushes the first
+    try testing.expect(ppu.ctrl.nmi_enable); // the first write did land
+    try testing.expect(!ppu.ctrl.increment32); // the second is still pending
+    ppu.tick(&m);
+    try testing.expect(ppu.ctrl.increment32);
+    try testing.expect(!ppu.ctrl.nmi_enable); // fully replaced by the 2nd byte
+}
+
+test "Ppu.reset drops a pending PPUCTRL/PPUMASK latch instead of letting it apply after" {
+    var ppu = testPpu(.horizontal);
+    var m = testMapper();
+    ppu.writeRegister(0x2000, 0x80, &m);
+    ppu.writeRegister(0x2001, 0x1E, &m);
+    ppu.reset();
+    ppu.tick(&m);
+    try testing.expect(!ppu.ctrl.nmi_enable);
+    try testing.expect(!ppu.mask.show_bg);
 }
 
 test "PPUCTRL's nametable bits land in t bits 10-11" {

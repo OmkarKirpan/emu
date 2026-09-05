@@ -59,10 +59,8 @@ including the `$81` ("needs a reset, delayed ≥100ms") reset-and-continue
 step some sub-tests require. Native test binary only — `zig build wasm`
 never sees this data, exactly like nestest's fixtures.
 
-8 of the 10 sub-tests pass outright. The remaining 2
-(`07-nmi_on_timing`, `10-even_odd_timing`) hit the same documented,
-understood architectural gap — see the doc comments directly above each of
-their `test` blocks in `ppu_vbl_nmi_test.zig` for the full derivation — and
-are asserted against their known (non-`$00`) result code rather than
-silently skipped, so a change to their failure shape fails the suite for
-real instead of masking a regression.
+All 10 sub-tests pass. `07-nmi_on_timing` and `10-even_odd_timing` were
+documented, asserted gaps through M2 and M3 — both fixed by giving
+PPUCTRL/PPUMASK writes the one-dot latch delay real hardware has, so a
+write can no longer be seen by the PPU a dot before it lands. See
+`Ppu.applyPendingLatches` and `Cpu.write` for the model and the evidence.

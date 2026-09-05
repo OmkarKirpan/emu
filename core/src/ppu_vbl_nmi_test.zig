@@ -30,15 +30,19 @@
 //! depend on sprite rendering (ENG-68, M3), which was not implemented yet
 //! when this suite was first wired up.
 //!
+//! **All 10 sub-tests pass.** `07-nmi_on_timing` and `10-even_odd_timing`
+//! were documented, asserted gaps through M2 and M3 -- both fixed by giving
+//! PPUCTRL/PPUMASK writes the one-dot latch delay real hardware has; see
+//! `Ppu.applyPendingLatches` and `Cpu.write`.
+//!
 //! The shared `$6000`-protocol polling/reset-handling logic (`Machine`,
-//! `expectPass`, `expectKnownGap`) now lives in `blargg_harness.zig`,
+//! `expectPass`, `expectKnownGap`) lives in `blargg_harness.zig`,
 //! factored out here when `ppu_sprites_test.zig` (ENG-68) needed the exact
 //! same logic for `oam_read`/`oam_stress`.
 
 const determinism = @import("determinism.zig");
 const harness = @import("blargg_harness.zig");
 const expectPass = harness.expectPass;
-const expectKnownGap = harness.expectKnownGap;
 
 test "ppu_vbl_nmi 01-vbl_basics" {
     try expectPass("ppu_vbl_nmi/01-vbl_basics", @embedFile("01-vbl_basics"));
@@ -58,49 +62,15 @@ test "ppu_vbl_nmi 05-nmi_timing" {
 test "ppu_vbl_nmi 06-suppression" {
     try expectPass("ppu_vbl_nmi/06-suppression", @embedFile("06-suppression"));
 }
-// 07-nmi_on_timing: a documented, understood gap -- see the doc comment
-// below. 08-nmi_off_timing, its mirror-image test (disabling NMI near the
-// VBL *set* rather than enabling it near the VBL *clear*), passes outright,
-// which is what pins the gap down to this specific direction rather than to
-// NMI edge-timing in general.
-//
-// `Cpu.read` and `Cpu.write` are structurally identical in their access
-// ordering -- both call `tick()` (3 PPU dots per cycle, with a single NMI
-// poll wedged after the first of the 3) *before* touching the bus, then poll
-// once more *after* the access -- see the doc comments on `Cpu.tick`,
-// `Cpu.read`/`Cpu.write`, and `Cpu.nmi_ready`. That single mid-tick poll
-// point is what gives `06-suppression`, `08-nmi_off_timing`, and the
-// dispatch-delay behavior `04-nmi_control`/`05-nmi_timing` check real
-// single-PPU-dot precision for the *level* they each sample there (the VBL
-// flag, gated by PPUCTRL's NMI-enable bit) -- verified by writing out the
-// R-vs-D (read-dot vs. set-dot) case analysis for all three within-a-cycle
-// alignments and confirming each matches the NESdev-documented suppression
-// window exactly.
-//
-// `07-nmi_on_timing` needs the *opposite* comparison: whether a WRITE
-// (enabling NMI) landed before or after the VBL flag's *clear* at
-// (scanline 261, dot 1). Because a write's own bus effect in this milestone
-// always applies only after that cycle's 3 PPU dots have already run, a
-// clear landing on *any* of those 3 dots is indistinguishable from the
-// write's point of view -- all three collapse to "the clear already
-// happened", one PPU-dot-alignment more than Blargg's ROM expects (it wants
-// exactly one of those three to still read as "before the clear"). This was
-// confirmed empirically, not assumed: forcing the write to apply *before*
-// its cycle's own dots (so it can plainly see whichever PPU state came
-// immediately before) makes every row fire instead of the expected 5-of-9,
-// and forcing it to apply after only the first dot shifts the boundary the
-// wrong way and regresses 08. Resolving this for real needs a write's bus
-// effect to be positionable at a specific *sub-cycle* (single-PPU-dot)
-// point relative to the PPU's own event -- i.e. genuinely interleaved
-// per-dot CPU/PPU co-simulation, not "3 ticks, then one bus access" -- which
-// is a real architectural step up, not a local bug fix, and is deliberately
-// out of scope for M2's "drive the PPU off the CPU's existing tick
-// chokepoint" integration. Measured: rows 0-4 read "N" (fires) as expected;
-// row 5 also reads "N" where Blargg's ROM expects "-" (does not fire) --
-// exactly the one-row/one-PPU-dot shift this analysis predicts, and no
-// wider than that.
-test "ppu_vbl_nmi 07-nmi_on_timing (documented gap: write-vs-VBL-clear needs sub-CPU-cycle precision this milestone's CPU/PPU integration does not have)" {
-    try expectKnownGap("ppu_vbl_nmi/07-nmi_on_timing", @embedFile("07-nmi_on_timing"), 0x01);
+// 07 and 08 are mirror images: 08 disables NMI near the VBL flag's *set*,
+// 07 enables it near the VBL flag's *clear*. Both now pass, but only
+// together, and only because of the one-dot PPUCTRL/PPUMASK latch delay
+// modeled in `Ppu.applyPendingLatches` plus its `Cpu.write` counterpart
+// (no NMI poll at the end of a write cycle) -- see both doc comments. 07
+// was a documented, asserted gap through M2 and M3: with the write landing
+// a dot too early, its row 5 fired where hardware does not.
+test "ppu_vbl_nmi 07-nmi_on_timing" {
+    try expectPass("ppu_vbl_nmi/07-nmi_on_timing", @embedFile("07-nmi_on_timing"));
 }
 test "ppu_vbl_nmi 08-nmi_off_timing" {
     try expectPass("ppu_vbl_nmi/08-nmi_off_timing", @embedFile("08-nmi_off_timing"));
@@ -109,19 +79,16 @@ test "ppu_vbl_nmi 09-even_odd_frames" {
     try expectPass("ppu_vbl_nmi/09-even_odd_frames", @embedFile("09-even_odd_frames"));
 }
 
-// 10-even_odd_timing: the same underlying gap as 07, applied to PPUMASK
-// instead of PPUCTRL -- it probes exactly when a write enabling/disabling
-// background rendering becomes visible to the odd-frame dot-skip decision
-// (`Ppu.advanceDot`, scanline 261 dot 339), which is a plain level check,
-// not edge-triggered, so the NMI-specific mid-cycle poll that fixes
-// `06`/`08` has no analogue here. Same root cause, same fix needed
-// (sub-CPU-cycle write timing); see 07's doc comment for the full
-// derivation. Measured: the ROM's own first two sub-checks (dot-skip count
-// for a sequence of enable/disable transitions) pass; it fails specifically
-// at "Clock is skipped too late, relative to enabling BG" -- the identical
-// one-PPU-dot-late shape as 07, not a different or wider divergence.
-test "ppu_vbl_nmi 10-even_odd_timing (documented gap: same root cause as 07, for PPUMASK/odd-frame-skip)" {
-    try expectKnownGap("ppu_vbl_nmi/10-even_odd_timing", @embedFile("10-even_odd_timing"), 0x03);
+// 10-even_odd_timing probes the same one-dot write-visibility question as
+// 07, but through PPUMASK rather than PPUCTRL: exactly when a write
+// enabling/disabling background rendering becomes visible to the odd-frame
+// dot-skip decision (`Ppu.advanceDot`, scanline 261 dot 339). That is a
+// plain level check, with no NMI edge involved at all, which is what makes
+// it the cleaner of the two demonstrations that the fix is really about
+// *when the PPU latches the written byte* and not about NMI polling: it
+// passes on the latch delay alone.
+test "ppu_vbl_nmi 10-even_odd_timing" {
+    try expectPass("ppu_vbl_nmi/10-even_odd_timing", @embedFile("10-even_odd_timing"));
 }
 
 // `assert_deterministic` (ENG-65), wired into this stage per ENG-66's

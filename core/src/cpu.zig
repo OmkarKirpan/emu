@@ -358,11 +358,26 @@ pub const Cpu = struct {
         return value;
     }
 
+    /// **Why there is no `pollNmi()` at the end of a write, unlike `read`.**
+    /// A write's effect on the PPU is not visible to the PPU's own logic
+    /// until one dot later -- see `Ppu.applyPendingLatches` for PPUCTRL and
+    /// PPUMASK specifically. Sampling the NMI line here, in between the
+    /// write and the dot that latches it, would let this cycle observe an
+    /// NMI edge that the very byte being written is about to cancel: the
+    /// concrete case is Blargg's `ppu_vbl_nmi/08-nmi_off_timing`, where a
+    /// $2000 write disabling NMI races the VBL flag's set. With a poll
+    /// here, the edge latches first and the interrupt fires one row earlier
+    /// than hardware. Dropping it defers this cycle's sample to the next
+    /// cycle's mid-`tick` poll -- which is *after* the latch, so the write
+    /// and the sample resolve in hardware's order. Nothing is lost: every
+    /// cycle, `tick` still polls after its first dot, so no edge goes
+    /// unlatched, only up to two dots later than a write cycle used to see
+    /// it. `07`/`08`/`10-even_odd_timing` all pass only with this and the
+    /// latch delay together; `04`/`05`/`06` stay passing.
     fn write(self: *Cpu, addr: u16, value: u8) void {
         self.tick();
         self.snapshotNmiReady();
         self.bus.write(addr, value);
-        self.pollNmi();
         // OAMDMA. `Bus` cannot handle $4014 itself -- see its doc comment --
         // because the 513-514 CPU cycles this burns have to flow through
         // this exact chokepoint (PPU ticking, NMI polling) like any other

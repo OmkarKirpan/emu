@@ -107,6 +107,16 @@ fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
         p.bg_next_tile_lo,
         p.bg_next_tile_hi,
     });
+    // The one-dot PPUCTRL/PPUMASK latch delay (`Ppu.applyPendingLatches`)
+    // is real mid-cycle state a resume would have to restore: `$FF` here
+    // stands for "nothing pending", distinct from a pending write of any
+    // real byte value.
+    hasher.update(&[_]u8{
+        p.pending_ctrl orelse 0xFF,
+        @intFromBool(p.pending_ctrl != null),
+        p.pending_mask orelse 0xFF,
+        @intFromBool(p.pending_mask != null),
+    });
     hasher.update(std.mem.asBytes(&p.v));
     hasher.update(std.mem.asBytes(&p.t));
     hasher.update(std.mem.asBytes(&p.bg_shift_pattern_lo));
