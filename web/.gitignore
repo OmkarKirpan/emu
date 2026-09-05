@@ -17,6 +17,11 @@ dist-ssr
 src/wasm/nes_core.wasm
 src/roms/
 
+# Playwright's local run output
+test-results/
+playwright-report/
+blob-report/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
