@@ -1,5 +1,6 @@
 // ENG-62's `AudioWorkletProcessor` -- the consumer half of the lock-free
-// ring-buffer protocol whose producer half is `core/src/audio_ring.zig`
+// ring-buffer protocol whose producer half is `core/src/audio_ring.zig`,
+// fed by the real APU as of ENG-71 (M6) rather than M5's sine test tone
 // (see that file's module doc comment for the full picture and the
 // division of ownership between the two sides).
 //
@@ -9,9 +10,9 @@
 // sharing one memory with the Worker's without manual per-thread stack
 // partitioning -- sidestepped entirely by keeping this side of the boundary
 // pure JS doing nothing but `Atomics` index bookkeeping and a `memcpy` into
-// the output buffer. Loaded via `new URL('./testToneProcessor.js',
+// the output buffer. Loaded via `new URL('./audioRingProcessor.js',
 // import.meta.url)` + `audioWorklet.addModule()` from the main thread (see
-// `AudioTestTone.tsx`) -- Vite's generic asset-URL handling, not its
+// `AudioOutput.tsx`) -- Vite's generic asset-URL handling, not its
 // Worker-specific `?worker` import, since this isn't a Worker.
 //
 // ## Control-block layout
@@ -40,7 +41,7 @@ function targetFillSamples() {
   return Math.round(3072 * (sampleRate / 48000))
 }
 
-class TestToneProcessor extends AudioWorkletProcessor {
+class AudioRingProcessor extends AudioWorkletProcessor {
   constructor() {
     super()
     /** @type {Float32Array | null} */
@@ -76,7 +77,7 @@ class TestToneProcessor extends AudioWorkletProcessor {
    * rather than draining whatever stale backlog piled up -- refocusing a
    * tab must never produce a burst of sped-up audio. This is the
    * consumer's call to make (it owns `read_index`), triggered by
-   * `AudioTestTone.tsx`'s `onstatechange` handler via the Worker.
+   * `AudioOutput.tsx`'s `onstatechange` handler via the Worker.
    */
   resync() {
     if (!this.control) return
@@ -126,7 +127,7 @@ class TestToneProcessor extends AudioWorkletProcessor {
 }
 
 /** Mono source duplicated across every requested output channel, if the
- * node was ever given more than one (it isn't today -- `AudioTestTone.tsx`
+ * node was ever given more than one (it isn't today -- `AudioOutput.tsx`
  * requests `outputChannelCount: [1]` -- but this keeps `process()` correct
  * if that ever changes without anyone remembering to revisit this file). */
 function copyToRemainingChannels(outputChannels, channel0) {
@@ -135,4 +136,4 @@ function copyToRemainingChannels(outputChannels, channel0) {
   }
 }
 
-registerProcessor('test-tone-processor', TestToneProcessor)
+registerProcessor('audio-ring-processor', AudioRingProcessor)

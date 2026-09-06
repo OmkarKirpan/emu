@@ -33,7 +33,7 @@ export type EmulatorWorkerInbound =
 
 /** The ENG-62 ring handshake: forwarded down the transferred worklet port
  * as-is, and posted to the main thread (debug/test hook only, see
- * `AudioTestTone.tsx`) with an `'audio-ready'` discriminant added. */
+ * `AudioOutput.tsx`) with an `'audio-ready'` discriminant added. */
 export interface RingHandshake {
   sab: SharedArrayBuffer
   ringByteOffset: number

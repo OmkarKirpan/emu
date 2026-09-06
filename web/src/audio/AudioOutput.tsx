@@ -17,7 +17,7 @@ declare global {
   }
 }
 
-interface AudioTestToneProps {
+interface AudioOutputProps {
   /** The already-running `emulatorWorker.ts` instance (or `null` before
    * `EmulatorScreen` has finished spawning it) -- shared with the video
    * path, not a worker of this component's own. See that worker's module
@@ -33,9 +33,10 @@ interface AudioTestToneProps {
  * autoplay-gesture requirement -- audio, unlike `EmulatorScreen`'s video,
  * cannot just start playing on mount), the worklet module, and the
  * handshake that connects them to the shared Worker's wasm instance -- and
- * plays the resulting test tone.
+ * plays the real APU audio (ENG-71, M6) the emulated game itself produces,
+ * not a test tone.
  */
-export function AudioTestTone({ worker }: AudioTestToneProps) {
+export function AudioOutput({ worker }: AudioOutputProps) {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -91,10 +92,10 @@ export function AudioTestTone({ worker }: AudioTestToneProps) {
       try {
         const audioContext = new AudioContext()
         audioContextRef.current = audioContext
-        await audioContext.audioWorklet.addModule(new URL('./testToneProcessor.js', import.meta.url))
+        await audioContext.audioWorklet.addModule(new URL('./audioRingProcessor.js', import.meta.url))
         await audioContext.resume()
 
-        const node = new AudioWorkletNode(audioContext, 'test-tone-processor', {
+        const node = new AudioWorkletNode(audioContext, 'audio-ring-processor', {
           numberOfInputs: 0,
           numberOfOutputs: 1,
           outputChannelCount: [1],
@@ -130,9 +131,9 @@ export function AudioTestTone({ worker }: AudioTestToneProps) {
   }, [worker, status.kind])
 
   return (
-    <div className="audio-test-tone">
+    <div className="audio-output">
       <button type="button" onClick={start} disabled={!worker || status.kind === 'starting' || status.kind === 'running'}>
-        {status.kind === 'running' ? 'Test tone playing' : 'Enable test tone'}
+        {status.kind === 'running' ? 'Audio playing' : 'Enable audio'}
       </button>
       {status.kind === 'error' && <p className="audio-error">{status.message}</p>}
       {status.kind === 'running' && debugInfo && (

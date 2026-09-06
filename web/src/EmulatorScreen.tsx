@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AudioTestTone } from './audio/AudioTestTone'
+import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
@@ -42,7 +42,7 @@ declare global {
 /**
  * The M5 (ENG-70) wasm host: transfers its `<canvas>` to a dedicated Worker
  * (`emulator/emulatorWorker.ts`) via `OffscreenCanvas`, which owns the one
- * wasm instance for the whole pipeline -- video, and (once `AudioTestTone`
+ * wasm instance for the whole pipeline -- video, and (once `AudioOutput`
  * enables it) audio -- and paints via `putImageData` on its own ~60Hz timer.
  * No more `requestAnimationFrame`-driven stepping on this thread; see
  * `emulatorWorker.ts`'s `scheduleLoop` for why that's not a loss. Keyboard
@@ -102,7 +102,7 @@ export function EmulatorScreen() {
     }
 
     // Set eagerly (not once `'status'` confirms the ROM booted): `worker`
-    // only needs to exist for `AudioTestTone`'s button to work, and
+    // only needs to exist for `AudioOutput`'s button to work, and
     // `startAudio`'s message queue on the Worker side (see
     // `emulatorWorker.ts`) already covers a click racing the boot sequence.
     setWorker(emulatorWorker)
@@ -163,7 +163,7 @@ export function EmulatorScreen() {
           renderer: {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
         </p>
       )}
-      <AudioTestTone worker={worker} />
+      <AudioOutput worker={worker} />
     </>
   )
 }
