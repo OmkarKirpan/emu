@@ -77,19 +77,22 @@ jobs:
       # does not exist" no matter how the project was set up.
       - name: Deploy to Cloudflare
         id: deploy
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: web
           command: deploy
 
-      # The actual ENG-70 acceptance check. Prefers `deployment-url` (the
-      # per-deploy URL, so it verifies the build just uploaded rather than
-      # whatever the alias currently points at) and falls back to the stable
-      # production URL if the action didn't surface one -- an empty URL would
-      # otherwise make `check-headers.mjs` fail on usage rather than on
-      # anything it actually checked.
+      # The actual ENG-70 acceptance check. Prefers `deployment-url`, so it
+      # verifies the build just uploaded rather than whatever the alias
+      # currently points at. That output came back *empty* on wrangler-action
+      # v3 for a Workers deploy (v3 scrapes it from stdout; v4 reads the
+      # structured output file wrangler >= 3.81 writes), which is why the
+      # action is pinned to v4 above. The fallback stays regardless: an empty
+      # URL would otherwise make `check-headers.mjs` fail on argument usage
+      # rather than on anything it actually checked -- failing for a reason
+      # that has nothing to do with the deploy.
       - name: Verify cross-origin isolation on the deployed build
         working-directory: web
         run: node scripts/check-headers.mjs "${{ steps.deploy.outputs.deployment-url || env.PRODUCTION_URL }}"
