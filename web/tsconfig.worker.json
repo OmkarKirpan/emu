@@ -10,7 +10,10 @@
     // `tsconfig.node.json` existing separately for the Node-context config
     // files).
     "lib": ["ES2023", "WebWorker"],
-    "types": ["vite/client"],
+    // `@webgpu/types`: WebGPU isn't in TypeScript's built-in DOM lib, and
+    // it's only needed by Worker-scope code (`renderer.ts`), so it's scoped
+    // to this project rather than the app's.
+    "types": ["vite/client", "@webgpu/types"],
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,
 
@@ -25,5 +28,5 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/emulator/emulatorWorker.ts"]
+  "include": ["src/emulator/emulatorWorker.ts", "src/emulator/renderer.ts"]
 }

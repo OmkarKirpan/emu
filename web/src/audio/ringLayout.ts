@@ -20,3 +20,18 @@ export const READ_INDEX = 0
 export const WRITE_INDEX = INT32S_PER_LINE
 export const UNDERRUN_COUNT = INT32S_PER_LINE * 2
 export const CONTROL_INT32_LENGTH = INT32S_PER_LINE * 3
+
+/**
+ * ENG-62's steady-state target fill (~64ms of cushion), scaled to the
+ * device's real sample rate -- 3072 samples is that figure only at the
+ * 48kHz it was quoted against, and the time budget is what was actually
+ * decided on.
+ *
+ * The third copy of this formula, unavoidably: `audio_ring.zig`'s
+ * `targetFill` is the producer's, `testToneProcessor.js` has the
+ * consumer's (it can't import, see above), and this is for the JS-side
+ * code that *can* import it.
+ */
+export function targetFillSamples(sampleRate: number): number {
+  return Math.round(3072 * (sampleRate / 48000))
+}
