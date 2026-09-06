@@ -493,3 +493,170 @@ test "Noise output is 0 (muted) when bit 0 of the shift register is set, or the 
     n.length_counter = 0;
     try testing.expectEqual(@as(u4, 0), n.output());
 }
+
+/// https://www.nesdev.org/wiki/APU_DMC -- NTSC rate table, CPU cycles per
+/// output-level step.
+pub const dmc_rate_table = [16]u9{
+    428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+};
+
+/// **Known gap**: no CPU-cycle-stealing DMA is modeled for sample fetches
+/// (real hardware stalls the CPU 1-4 cycles per fetch). `tickTimer` reads
+/// the sample byte straight through the mapper with no CPU-side stall --
+/// see this plan's Global Constraints / `docs/adr/0002-apu-mixing-and-
+/// filtering.md` for why that's an acceptable, explicitly-flagged
+/// simplification for this milestone's conformance ROMs.
+pub const Dmc = struct {
+    enabled: bool = false,
+    irq_enabled: bool = false,
+    loop: bool = false,
+    rate_index: u4 = 0,
+    timer: u9 = 0,
+
+    output_level: u7 = 0,
+
+    sample_address: u16 = 0xC000,
+    sample_length: u16 = 1,
+    current_address: u16 = 0xC000,
+    bytes_remaining: u16 = 0,
+
+    sample_buffer: ?u8 = null,
+    shift_register: u8 = 0,
+    bits_remaining: u4 = 0,
+    silence: bool = true,
+
+    irq_flag: bool = false,
+
+    /// $4010: IL--.RRRR
+    pub fn writeReg0(self: *Dmc, value: u8) void {
+        self.irq_enabled = (value & 0x80) != 0;
+        self.loop = (value & 0x40) != 0;
+        self.rate_index = @truncate(value & 0x0F);
+        if (!self.irq_enabled) self.irq_flag = false;
+    }
+
+    /// $4011: -DDD.DDDD -- direct output-level load, no delta stepping.
+    pub fn writeReg1(self: *Dmc, value: u8) void {
+        self.output_level = @truncate(value & 0x7F);
+    }
+
+    /// $4012: AAAA.AAAA -- sample address = $C000 + A*64.
+    pub fn writeReg2(self: *Dmc, value: u8) void {
+        self.sample_address = 0xC000 + (@as(u16, value) << 6);
+    }
+
+    /// $4013: LLLL.LLLL -- sample length = L*16 + 1.
+    pub fn writeReg3(self: *Dmc, value: u8) void {
+        self.sample_length = (@as(u16, value) << 4) + 1;
+    }
+
+    /// Called by `Apu.writeStatus` when $4015's DMC-enable bit rises from 0
+    /// to 1 with bytes_remaining already 0 -- see that method.
+    pub fn restart(self: *Dmc) void {
+        self.current_address = self.sample_address;
+        self.bytes_remaining = self.sample_length;
+    }
+
+    fn applyDeltaBit(self: *Dmc) void {
+        const bit0 = self.shift_register & 1;
+        if (bit0 == 1) {
+            if (self.output_level <= 125) self.output_level += 2;
+        } else {
+            if (self.output_level >= 2) self.output_level -= 2;
+        }
+    }
+
+    fn checkCompletion(self: *Dmc) void {
+        if (self.bytes_remaining != 0) return;
+        if (self.loop) {
+            self.restart();
+        } else if (self.irq_enabled) {
+            self.irq_flag = true;
+        }
+    }
+
+    /// Called every APU cycle -- see `Apu.tick`. `mapper` is read directly
+    /// (no CPU cycle stealing, see the type doc comment) whenever the
+    /// 1-byte sample buffer is empty and a byte remains.
+    pub fn tickTimer(self: *Dmc, mapper: *const Mapper) void {
+        if (self.sample_buffer == null and self.bytes_remaining > 0) {
+            self.sample_buffer = mapper.prgRead(self.current_address);
+            self.current_address = if (self.current_address == 0xFFFF) 0x8000 else self.current_address + 1;
+            self.bytes_remaining -= 1;
+            self.checkCompletion();
+        }
+
+        if (self.timer == 0) {
+            self.timer = dmc_rate_table[self.rate_index];
+
+            if (self.bits_remaining == 0) {
+                self.bits_remaining = 8;
+                if (self.sample_buffer) |b| {
+                    self.silence = false;
+                    self.shift_register = b;
+                    self.sample_buffer = null;
+                } else {
+                    self.silence = true;
+                }
+            }
+
+            if (!self.silence) self.applyDeltaBit();
+            self.shift_register >>= 1;
+            self.bits_remaining -= 1;
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    pub fn output(self: *const Dmc) u7 {
+        return self.output_level;
+    }
+};
+
+test "dmc_rate_table has the documented 16 NTSC entries" {
+    try testing.expectEqual(@as(u9, 428), dmc_rate_table[0]);
+    try testing.expectEqual(@as(u9, 54), dmc_rate_table[15]);
+}
+
+test "Dmc.writeReg2/3 compute sample address and length per the documented formulas" {
+    var d = Dmc{};
+    d.writeReg2(0x01); // $C000 + 1*64 = $C040
+    d.writeReg3(0x01); // 1*16 + 1 = 17
+    try testing.expectEqual(@as(u16, 0xC040), d.sample_address);
+    try testing.expectEqual(@as(u16, 17), d.sample_length);
+}
+
+test "Dmc.restart reloads current_address/bytes_remaining from sample_address/sample_length" {
+    var d = Dmc{ .sample_address = 0xC100, .sample_length = 33 };
+    d.restart();
+    try testing.expectEqual(@as(u16, 0xC100), d.current_address);
+    try testing.expectEqual(@as(u16, 33), d.bytes_remaining);
+}
+
+test "Dmc output level moves by +-2 per shift-register bit, clamped to 0..127" {
+    var d = Dmc{ .output_level = 1, .shift_register = 0b0 };
+    // bit0=0 -> would subtract 2, but level(1) < 2 -> no change (clamped)
+    d.applyDeltaBit();
+    try testing.expectEqual(@as(u7, 1), d.output_level);
+
+    d.output_level = 126;
+    d.shift_register = 0b1;
+    d.applyDeltaBit(); // bit0=1 -> add 2, but 126 > 125 -> no change (clamped)
+    try testing.expectEqual(@as(u7, 126), d.output_level);
+
+    d.output_level = 60;
+    d.shift_register = 0b1;
+    d.applyDeltaBit();
+    try testing.expectEqual(@as(u7, 62), d.output_level);
+}
+
+test "Dmc sets the IRQ flag on sample completion only when not looping and IRQ is enabled" {
+    var d = Dmc{ .loop = false, .irq_enabled = true, .bytes_remaining = 0 };
+    d.checkCompletion();
+    try testing.expect(d.irq_flag);
+
+    var looped = Dmc{ .loop = true, .irq_enabled = true, .bytes_remaining = 0, .sample_address = 0xC000, .sample_length = 5 };
+    looped.checkCompletion();
+    try testing.expect(!looped.irq_flag);
+    try testing.expectEqual(@as(u16, 5), looped.bytes_remaining); // restarted
+}
