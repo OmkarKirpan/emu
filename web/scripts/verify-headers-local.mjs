@@ -1,19 +1,24 @@
 #!/usr/bin/env node
-// Runs `check-headers.mjs` against `wrangler pages dev` -- Cloudflare's own
-// local emulator for Pages, including `_headers` processing -- instead of
-// against a live deployment. That closes most of the gap between "`vite
-// preview` applies the same header *config*" (which `e2e/isolation.spec.ts`
-// already covers, cheaply, in every test run) and "the actual Cloudflare
-// _headers file, parsed by Cloudflare's own logic, produces the right
-// response headers for the real asset paths, including the content-hashed
-// wasm one" -- without needing the account or secrets `deploy.yml` does.
+// Runs `check-headers.mjs` against `wrangler dev` -- Cloudflare's own local
+// emulator, running this repo's actual `wrangler.jsonc`, `_headers`
+// processing included -- instead of against a live deployment. That closes
+// most of the gap between "`vite preview` applies the same header *config*"
+// (which `e2e/isolation.spec.ts` already covers, cheaply, in every test
+// run) and "the actual Cloudflare _headers file, parsed by Cloudflare's own
+// logic, produces the right response headers for the real asset paths,
+// including the content-hashed wasm one" -- without needing the account or
+// secrets `deploy.yml` does.
+//
+// `wrangler dev`, not `wrangler pages dev`: this app deploys as a Worker
+// serving static assets (see `wrangler.jsonc` for why), so this runs the
+// same runtime path production does rather than the Pages one.
 //
 // This is why it can run in CI on every PR (`ci.yml`), unlike
 // `deploy.yml`'s post-deploy check: that check verifies the one thing this
-// script structurally can't -- that the real Cloudflare Pages project is
-// actually configured to serve this repo's `dist/` -- and stays the final
-// word on that. This script is the regression guard for everything else,
-// running long before a deploy is even possible.
+// script structurally can't -- that the real Cloudflare-side project is
+// actually serving this repo's `dist/` -- and stays the final word on that.
+// This script is the regression guard for everything else, running long
+// before a deploy is even possible.
 //
 // Requires `dist/` already built (`npm run build`).
 
@@ -36,7 +41,7 @@ if (!existsSync(new URL('../dist', import.meta.url))) {
 // way it does on POSIX. That means `wrangler.pid` is the shell's pid, not
 // wrangler's own -- which is exactly why killing the tree, not just that one
 // pid, matters below.
-const wrangler = spawn('npx', ['wrangler', 'pages', 'dev', 'dist', '--port', String(PORT)], {
+const wrangler = spawn('npx', ['wrangler', 'dev', '--port', String(PORT)], {
   cwd: WEB_ROOT,
   shell: true,
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -55,7 +60,7 @@ function killTree() {
   killed = true
   if (isWindows) {
     // `taskkill /T` walks the process tree Windows tracks by parent pid --
-    // but `wrangler pages dev` runs the actual server as Cloudflare's
+    // but `wrangler dev` runs the actual server as Cloudflare's
     // `workerd.exe`, which in testing here doesn't stay attached to that
     // tree (observed as a leaked `workerd.exe` still holding PORT after
     // `taskkill /T` returned). Free the port directly as the reliable path,
@@ -83,7 +88,7 @@ async function waitUntilReady() {
   const deadline = Date.now() + READY_TIMEOUT_MS
   while (Date.now() < deadline) {
     if (wrangler.exitCode !== null) {
-      throw new Error(`wrangler pages dev exited early (code ${wrangler.exitCode})\n${wranglerOutput}`)
+      throw new Error(`wrangler dev exited early (code ${wrangler.exitCode})\n${wranglerOutput}`)
     }
     try {
       // A per-attempt timeout, not just the overall deadline: a `fetch` to a
@@ -97,7 +102,7 @@ async function waitUntilReady() {
     }
     await new Promise((resolve) => setTimeout(resolve, 300))
   }
-  throw new Error(`wrangler pages dev did not become ready within ${READY_TIMEOUT_MS}ms\n${wranglerOutput}`)
+  throw new Error(`wrangler dev did not become ready within ${READY_TIMEOUT_MS}ms\n${wranglerOutput}`)
 }
 
 try {

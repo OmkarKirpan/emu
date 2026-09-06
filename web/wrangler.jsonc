@@ -1,0 +1,23 @@
+{
+  // ENG-70 (M5): this app deploys as a Worker serving static assets, not as
+  // a Cloudflare Pages project. Not a preference -- Cloudflare's dashboard
+  // now routes project creation (including "upload assets") to Workers, so
+  // Pages projects can't reliably be created for this account at all, and
+  // `wrangler pages deploy` fails with "the Pages project does not exist".
+  //
+  // What matters for this app is unchanged either way: Workers static
+  // assets honours the same `dist/_headers` file Pages does, which is the
+  // whole reason a static host was ever a constrained choice here (no
+  // COOP/COEP -> no cross-origin isolation -> no `SharedArrayBuffer` -> the
+  // shared-memory wasm module refuses to instantiate). Verified against the
+  // real deployment: see `scripts/check-headers.mjs` and README.md.
+  //
+  // No `main` entry point on purpose: with only `assets` configured this is
+  // a purely static Worker, with no script of our own in the request path.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "emu",
+  "compatibility_date": "2026-09-06",
+  "assets": {
+    "directory": "./dist"
+  }
+}
