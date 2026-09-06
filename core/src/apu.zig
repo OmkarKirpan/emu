@@ -790,3 +790,265 @@ test "writing $40 or $C0 to $4017 clears a pending IRQ flag immediately" {
     _ = fs.write(0x40);
     try testing.expect(!fs.irq_flag);
 }
+
+/// https://www.nesdev.org/wiki/APU_Mixer.
+pub fn mixOutput(pulse1: u4, pulse2: u4, triangle: u4, noise: u4, dmc: u7) f32 {
+    const p1: f32 = @floatFromInt(pulse1);
+    const p2: f32 = @floatFromInt(pulse2);
+    const t: f32 = @floatFromInt(triangle);
+    const n: f32 = @floatFromInt(noise);
+    const d: f32 = @floatFromInt(dmc);
+
+    const pulse_sum = p1 + p2;
+    const pulse_out: f32 = if (pulse_sum == 0) 0 else 95.88 / (8128.0 / pulse_sum + 100.0);
+
+    const tnd_sum = t / 8227.0 + n / 12241.0 + d / 22638.0;
+    const tnd_out: f32 = if (tnd_sum == 0) 0 else 159.79 / (1.0 / tnd_sum + 100.0);
+
+    return pulse_out + tnd_out;
+}
+
+/// One-pole RC filter -- three of these, cascaded, model the NTSC NES's
+/// output filtering (90Hz HPF, 440Hz HPF, 14kHz LPF). See
+/// `docs/adr/0002-apu-mixing-and-filtering.md`.
+pub const OnePoleFilter = struct {
+    pub const Kind = enum { low_pass, high_pass };
+
+    kind: Kind,
+    alpha: f32,
+    prev_in: f32 = 0,
+    prev_out: f32 = 0,
+
+    pub fn init(kind: Kind, cutoff_hz: f32, sample_rate: f32) OnePoleFilter {
+        const dt = 1.0 / sample_rate;
+        const rc = 1.0 / (2.0 * std.math.pi * cutoff_hz);
+        const alpha = switch (kind) {
+            .low_pass => dt / (rc + dt),
+            .high_pass => rc / (rc + dt),
+        };
+        return .{ .kind = kind, .alpha = alpha };
+    }
+
+    pub fn process(self: *OnePoleFilter, x: f32) f32 {
+        const y = switch (self.kind) {
+            .low_pass => self.prev_out + self.alpha * (x - self.prev_out),
+            .high_pass => self.alpha * (self.prev_out + x - self.prev_in),
+        };
+        self.prev_in = x;
+        self.prev_out = y;
+        return y;
+    }
+};
+
+pub const Apu = struct {
+    pulse1: Pulse = .{ .is_pulse1 = true },
+    pulse2: Pulse = .{ .is_pulse1 = false },
+    triangle: Triangle = .{},
+    noise: Noise = .{},
+    dmc: Dmc = .{},
+    frame: FrameSequencer = .{},
+
+    hpf1: OnePoleFilter = OnePoleFilter.init(.high_pass, 90.0, 1_789_773.0),
+    hpf2: OnePoleFilter = OnePoleFilter.init(.high_pass, 440.0, 1_789_773.0),
+    lpf: OnePoleFilter = OnePoleFilter.init(.low_pass, 14_000.0, 1_789_773.0),
+
+    even_cycle: bool = false,
+
+    pub fn init() Apu {
+        return .{};
+    }
+
+    pub fn writeRegister(self: *Apu, addr: u16, value: u8) void {
+        switch (addr) {
+            0x4000 => self.pulse1.writeReg0(value),
+            0x4001 => self.pulse1.writeReg1(value),
+            0x4002 => self.pulse1.writeReg2(value),
+            0x4003 => self.pulse1.writeReg3(value),
+            0x4004 => self.pulse2.writeReg0(value),
+            0x4005 => self.pulse2.writeReg1(value),
+            0x4006 => self.pulse2.writeReg2(value),
+            0x4007 => self.pulse2.writeReg3(value),
+            0x4008 => self.triangle.writeReg0(value),
+            0x400A => self.triangle.writeReg2(value),
+            0x400B => self.triangle.writeReg3(value),
+            0x400C => {
+                // --LC.VVVV -- same shape as pulse's byte 0, minus the duty
+                // bits (noise has no duty cycle).
+                self.noise.envelope.loop_flag = (value & 0x20) != 0;
+                self.noise.envelope.constant_volume = (value & 0x10) != 0;
+                self.noise.envelope.volume_or_period = @truncate(value & 0x0F);
+            },
+            0x400E => self.noise.writeReg2(value),
+            0x400F => self.noise.writeReg3(value),
+            0x4010 => self.dmc.writeReg0(value),
+            0x4011 => self.dmc.writeReg1(value),
+            0x4012 => self.dmc.writeReg2(value),
+            0x4013 => self.dmc.writeReg3(value),
+            0x4015 => self.writeStatus(value),
+            0x4017 => {
+                const event = self.frame.write(value);
+                self.applyFrameEvent(event);
+            },
+            else => {},
+        }
+    }
+
+    fn writeStatus(self: *Apu, value: u8) void {
+        self.pulse1.enabled = (value & 0x01) != 0;
+        self.pulse2.enabled = (value & 0x02) != 0;
+        self.triangle.enabled = (value & 0x04) != 0;
+        self.noise.enabled = (value & 0x08) != 0;
+        if (!self.pulse1.enabled) self.pulse1.length_counter = 0;
+        if (!self.pulse2.enabled) self.pulse2.length_counter = 0;
+        if (!self.triangle.enabled) self.triangle.length_counter = 0;
+        if (!self.noise.enabled) self.noise.length_counter = 0;
+
+        const dmc_enable = (value & 0x10) != 0;
+        self.dmc.irq_flag = false;
+        if (!dmc_enable) {
+            self.dmc.bytes_remaining = 0;
+        } else if (self.dmc.bytes_remaining == 0) {
+            self.dmc.restart();
+        }
+    }
+
+    pub fn readStatus(self: *Apu) u8 {
+        var status: u8 = 0;
+        if (self.pulse1.length_counter > 0) status |= 0x01;
+        if (self.pulse2.length_counter > 0) status |= 0x02;
+        if (self.triangle.length_counter > 0) status |= 0x04;
+        if (self.noise.length_counter > 0) status |= 0x08;
+        if (self.dmc.bytes_remaining > 0) status |= 0x10;
+        if (self.frame.irq_flag) status |= 0x40;
+        if (self.dmc.irq_flag) status |= 0x80;
+        self.frame.irq_flag = false; // reading clears the frame IRQ only
+        return status;
+    }
+
+    fn applyFrameEvent(self: *Apu, event: FrameEvent) void {
+        switch (event) {
+            .none => {},
+            .quarter => self.clockQuarterFrame(),
+            .half => self.clockHalfFrame(),
+            .quarter_and_half => {
+                self.clockQuarterFrame();
+                self.clockHalfFrame();
+            },
+        }
+    }
+
+    fn clockQuarterFrame(self: *Apu) void {
+        self.pulse1.envelope.clock();
+        self.pulse2.envelope.clock();
+        self.noise.envelope.clock();
+        self.triangle.clockLinearCounter();
+    }
+
+    fn clockHalfFrame(self: *Apu) void {
+        clockLength(&self.pulse1.length_counter, self.pulse1.envelope.loop_flag);
+        clockLength(&self.pulse2.length_counter, self.pulse2.envelope.loop_flag);
+        clockLength(&self.triangle.length_counter, self.triangle.control_flag);
+        clockLength(&self.noise.length_counter, self.noise.envelope.loop_flag);
+        self.pulse1.clockSweep();
+        self.pulse2.clockSweep();
+    }
+
+    pub fn irqPending(self: *const Apu) bool {
+        return self.frame.irq_flag or self.dmc.irq_flag;
+    }
+
+    /// Called once per CPU cycle from `Cpu.tick`. `FrameSequencer.tick`
+    /// owns its own cycle counting (see that type's doc comment) -- this
+    /// does not pre-increment anything on its behalf.
+    pub fn tick(self: *Apu, mapper: *const Mapper) void {
+        self.applyFrameEvent(self.frame.tick());
+
+        self.triangle.tickTimer();
+        self.even_cycle = !self.even_cycle;
+        if (self.even_cycle) {
+            self.pulse1.tickTimer();
+            self.pulse2.tickTimer();
+            self.noise.tickTimer();
+            self.dmc.tickTimer(mapper);
+        }
+
+        const raw = mixOutput(self.pulse1.output(), self.pulse2.output(), self.triangle.output(), self.noise.output(), self.dmc.output());
+        const filtered = self.lpf.process(self.hpf2.process(self.hpf1.process(raw)));
+        audio_ring.pushSample(filtered);
+    }
+};
+
+test "Apu.writeRegister routes $4000-$4013 to the right channel" {
+    var apu = Apu.init();
+    apu.writeRegister(0x4000, 0b00_0_1_0101); // pulse1 duty0, constant vol 5
+    try testing.expectEqual(@as(u4, 5), apu.pulse1.envelope.volume_or_period);
+    apu.writeRegister(0x4008, 0x80); // triangle control flag (bit 7, per CRRR.RRRR)
+    try testing.expect(apu.triangle.control_flag);
+    apu.writeRegister(0x400C, 0x20); // noise halt/loop
+    try testing.expect(apu.noise.envelope.loop_flag);
+    apu.writeRegister(0x4010, 0x80); // dmc irq enable
+    try testing.expect(apu.dmc.irq_enabled);
+}
+
+test "Apu.writeRegister($4015) enables/disables channels and clears their length counters when disabled" {
+    var apu = Apu.init();
+    apu.pulse1.length_counter = 10;
+    apu.writeRegister(0x4015, 0b0000_0000); // disable everything
+    try testing.expect(!apu.pulse1.enabled);
+    try testing.expectEqual(@as(u8, 0), apu.pulse1.length_counter);
+
+    apu.writeRegister(0x4015, 0b0000_0001); // enable pulse1 only
+    try testing.expect(apu.pulse1.enabled);
+    try testing.expect(!apu.pulse2.enabled);
+}
+
+test "Apu.writeRegister($4015) restarts the DMC only when bytes_remaining is already 0" {
+    var apu = Apu.init();
+    apu.dmc.bytes_remaining = 3;
+    apu.writeRegister(0x4015, 0x10); // DMC enable bit
+    try testing.expectEqual(@as(u16, 3), apu.dmc.bytes_remaining); // unaffected: already playing
+
+    apu.dmc.bytes_remaining = 0;
+    apu.writeRegister(0x4015, 0x10);
+    try testing.expect(apu.dmc.bytes_remaining > 0); // restarted
+}
+
+test "Apu.readStatus reports length-counter-nonzero bits, DMC active, and both IRQ flags, then clears only the frame IRQ" {
+    var apu = Apu.init();
+    apu.pulse1.length_counter = 1;
+    apu.dmc.bytes_remaining = 1;
+    apu.frame.irq_flag = true;
+    apu.dmc.irq_flag = true;
+    const status = apu.readStatus();
+    try testing.expectEqual(@as(u8, 0b1101_0001), status); // DMC-irq | frame-irq | dmc-active | pulse1
+    try testing.expect(!apu.frame.irq_flag); // cleared by the read
+    try testing.expect(apu.dmc.irq_flag); // NOT cleared by the read
+}
+
+test "Apu.irqPending is the OR of the frame IRQ and DMC IRQ flags" {
+    var apu = Apu.init();
+    try testing.expect(!apu.irqPending());
+    apu.frame.irq_flag = true;
+    try testing.expect(apu.irqPending());
+    apu.frame.irq_flag = false;
+    apu.dmc.irq_flag = true;
+    try testing.expect(apu.irqPending());
+}
+
+test "mixOutput is 0 when every channel is silent, and nonzero once one contributes" {
+    try testing.expectEqual(@as(f32, 0), mixOutput(0, 0, 0, 0, 0));
+    try testing.expect(mixOutput(15, 0, 0, 0, 0) > 0);
+    try testing.expect(mixOutput(0, 0, 15, 0, 0) > 0);
+}
+
+test "OnePoleFilter high-pass blocks DC after settling; low-pass passes DC unchanged" {
+    var hpf = OnePoleFilter.init(.high_pass, 90.0, 48000.0);
+    var i: usize = 0;
+    while (i < 10000) : (i += 1) _ = hpf.process(1.0); // feed a constant -- DC
+    try testing.expect(@abs(hpf.process(1.0)) < 0.01);
+
+    var lpf = OnePoleFilter.init(.low_pass, 14000.0, 48000.0);
+    i = 0;
+    while (i < 10000) : (i += 1) _ = lpf.process(1.0);
+    try testing.expect(@abs(lpf.process(1.0) - 1.0) < 0.01);
+}
