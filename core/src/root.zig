@@ -45,6 +45,7 @@ test {
     _ = ppu;
     _ = controller;
     _ = palette;
+    _ = @import("apu.zig");
     // Wasm-only subsystem (ENG-62, M5), but its ring-buffer/DRC logic is
     // plain Zig with no wasm-specific codegen -- reachable only from this
     // test block (not the `pub const` graph above) so it's exercised
