@@ -1,0 +1,75 @@
+name: Deploy
+
+# ENG-70 (M5): deploys the production build to Cloudflare Pages, then
+# verifies cross-origin isolation on the *deployed* URL -- the acceptance
+# criterion is explicitly "verified against the real production build (not
+# just `vite preview`)", and a host that ignores `dist/_headers` fails in a
+# way no local check can see (see `web/scripts/check-headers.mjs`).
+#
+# Cloudflare Pages, not GitHub Pages: this app cannot run without
+# `Cross-Origin-Opener-Policy`/`Cross-Origin-Embedder-Policy` response
+# headers (no cross-origin isolation -> no `SharedArrayBuffer` -> the
+# shared-memory wasm module refuses to instantiate), and GitHub Pages has no
+# mechanism for setting custom response headers at all. See README.md.
+#
+# ## Required repository secrets
+#   CLOUDFLARE_API_TOKEN   -- a token with the "Cloudflare Pages: Edit" permission
+#   CLOUDFLARE_ACCOUNT_ID  -- from the Cloudflare dashboard URL / account home
+# ## Required one-time setup
+#   A Cloudflare Pages project named `PROJECT_NAME` below (create it as a
+#   "Direct Upload" project; this workflow uploads the built `dist/`, so no
+#   Cloudflare-side build configuration is needed or wanted).
+
+on:
+  push:
+    branches: [main]
+  # Deploying is also useful on demand -- e.g. to re-verify headers after
+  # changing Cloudflare-side settings without pushing a commit.
+  workflow_dispatch:
+
+env:
+  PROJECT_NAME: emu
+
+# Never let two deploys race to the same environment.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Without the secrets configured this job can only fail confusingly, so
+    # skip it outright until someone has done the one-time setup above.
+    if: vars.DEPLOY_ENABLED == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # `npm run build` -> `prebuild` -> `scripts/sync-core.mjs` -> `zig build
+      # wasm`: the wasm module is generated at build time, never committed.
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: Build
+        working-directory: web
+        run: npm run build
+
+      - name: Deploy to Cloudflare Pages
+        id: deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: web
+          command: pages deploy dist --project-name=${{ env.PROJECT_NAME }}
+
+      # The actual ENG-70 acceptance check. `deployment-url` is the
+      # immutable per-deploy URL, so this verifies the build that was just
+      # uploaded rather than whatever the alias currently points at.
+      - name: Verify cross-origin isolation on the deployed build
+        working-directory: web
+        run: node scripts/check-headers.mjs "${{ steps.deploy.outputs.deployment-url }}"

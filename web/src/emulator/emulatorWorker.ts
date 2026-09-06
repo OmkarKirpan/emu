@@ -5,7 +5,9 @@
 // two independent instances, one per thread, specifically to land audio
 // without touching the video path; see `docs/adr/0001-audio-playback-no-
 // howler.md`'s "Consequences"). `EmulatorScreen.tsx` transfers the
-// `<canvas>` here via `OffscreenCanvas`; input arrives over a shared
+// `<canvas>` here via `OffscreenCanvas`, and `renderer.ts` decides what
+// paints it -- WebGPU where it's actually available, Canvas 2D otherwise
+// (ENG-57); input arrives over a shared
 // `Int32Array` `Atomics`-published from the main thread (`InputBridge.ts`)
 // rather than message-passed, so a keypress reaches `set_input` with no
 // postMessage round trip. Audio starts later and separately (needs a user
@@ -15,9 +17,10 @@
 // forwards the wasm memory's `SharedArrayBuffer` plus the ring's byte
 // offsets and capacity down it.
 import { NesCore, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from '../wasm/core'
-import { CONTROL_INT32_LENGTH, READ_INDEX, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
+import { CONTROL_INT32_LENGTH, READ_INDEX, targetFillSamples, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
 import { NTSC_FRAME_MS } from '../timing'
-import type { EmulatorWorkerInbound, EmulatorWorkerOutbound, RingHandshake } from './protocol'
+import { createRenderer } from './renderer'
+import type { EmulatorWorkerInbound, EmulatorWorkerOutbound, RendererKind, RingHandshake } from './protocol'
 
 /** Typed wrapper over `self.postMessage` for messages to the main thread,
  * so a shape drifting out of sync with `protocol.ts` is a compile error
@@ -41,16 +44,26 @@ const RESYNC_THRESHOLD_MS = 250
  * depends on, so this can be coarse. */
 const STATS_INTERVAL_MS = 200
 
+/** Cap on how long `startAudio` will wait for the ring to fill before
+ * telling the main thread to connect the worklet anyway (~half a second at
+ * 60Hz). A ring that never reaches target means something is wrong
+ * upstream, and silent audio forever is a worse answer than audio that
+ * starts rough. */
+const MAX_PRIME_TICKS = 30
+
 let nesCore: NesCore | null = null
 let audioPort: MessagePort | null = null
 let audioReady = false
 let pendingAudioStart: { sampleRate: number; port: MessagePort } | null = null
+/** Set while the ring is filling toward target after `startAudio`; called
+ * once per tick until it announces `'audio-ready'` and clears itself. */
+let awaitAudioPrimed: (() => void) | null = null
 
 self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
   const message = event.data
   switch (message.type) {
     case 'start':
-      void start(message.canvas, message.romBytes, message.inputSab)
+      void start(message.canvas, message.romBytes, message.inputSab, message.preferredRenderer)
       break
     case 'reset':
       nesCore?.reset()
@@ -71,7 +84,12 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
   }
 }
 
-async function start(canvas: OffscreenCanvas, romBytes: ArrayBuffer, inputSab: SharedArrayBuffer): Promise<void> {
+async function start(
+  canvas: OffscreenCanvas,
+  romBytes: ArrayBuffer,
+  inputSab: SharedArrayBuffer,
+  preferredRenderer?: RendererKind,
+): Promise<void> {
   const core = await NesCore.create()
   const input = new Int32Array(inputSab)
 
@@ -94,9 +112,12 @@ async function start(canvas: OffscreenCanvas, romBytes: ArrayBuffer, inputSab: S
     height: FRAMEBUFFER_HEIGHT,
   })
 
-  const ctx = canvas.getContext('2d')
-  if (!ctx) {
-    post({ type: 'status', status: 'error', message: 'Canvas 2D is not available in this browser.' })
+  let renderer
+  try {
+    renderer = await createRenderer(canvas, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT, preferredRenderer)
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    post({ type: 'status', status: 'error', message })
     return
   }
 
@@ -110,7 +131,7 @@ async function start(canvas: OffscreenCanvas, romBytes: ArrayBuffer, inputSab: S
   }
 
   nesCore = core
-  post({ type: 'status', status: 'running' })
+  post({ type: 'status', status: 'running', renderer: renderer.kind })
   if (pendingAudioStart) {
     startAudio(pendingAudioStart.sampleRate, pendingAudioStart.port)
     pendingAudioStart = null
@@ -125,13 +146,15 @@ async function start(canvas: OffscreenCanvas, romBytes: ArrayBuffer, inputSab: S
     // second slot would add yet.
     const buttons = Atomics.load(input, 0)
     core.setInput(0, buttons)
-    const framebuffer = core.stepFrame()
-    ctx.putImageData(new ImageData(framebuffer, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT), 0, 0)
+    renderer.draw(core.stepFrame())
     // Skipped until a user gesture creates the `AudioContext` and this
     // Worker's `startAudio` runs -- no point producing test-tone samples
     // (with the wrong, still-default sample rate) that nothing will ever
     // consume.
-    if (audioReady) core.stepAudioFrame()
+    if (audioReady) {
+      core.stepAudioFrame()
+      awaitAudioPrimed?.()
+    }
   }, NTSC_FRAME_MS)
 }
 
@@ -150,24 +173,51 @@ function startAudio(sampleRate: number, port: MessagePort): void {
     controlByteOffset: nesCore.getAudioRingControlPtr(),
     capacity: nesCore.getAudioRingCapacity(),
   }
-  port.postMessage({ type: 'init', ...handshake })
-  // Debug/test hook only (see `AudioTestTone.tsx`) -- a `SharedArrayBuffer`
-  // is shared by structured clone, never transferred, so this and the
-  // worklet's view above are two independent windows onto the exact same
-  // bytes, not copies.
-  post({ type: 'audio-ready', ...handshake })
+  // A separate `Int32Array` view from the worklet's own, backed by the exact
+  // same bytes. Shared by the prime check and the stats push.
+  const control = new Int32Array(nesCore.memory.buffer, handshake.controlByteOffset, CONTROL_INT32_LENGTH)
 
-  audioReady = true
-  scheduleStats(nesCore.memory, handshake.controlByteOffset) // no stop handle kept -- see `start`'s matching comment
+  audioReady = true // the tick loop starts producing samples from here on
+
+  // Nothing is handed to the worklet until the ring has ENG-62's target
+  // fill in it -- neither the ring itself nor the main thread's cue to
+  // connect the node.
+  //
+  // Both halves matter, and the second one is the non-obvious one.
+  // Chrome calls `process()` on an `AudioWorkletNode` that exists in a
+  // running context even before it's connected to anything, so a worklet
+  // holding a still-empty ring spends that whole window counting underruns
+  // on a stream that hasn't started. Measured here: ~11-13 render quanta
+  // (~35ms) of them, and *deferring only the connect made it worse*, since
+  // that lengthens the window. Withholding the handshake instead lands the
+  // worklet in its own pre-init path, which outputs silence and counts
+  // nothing (see `testToneProcessor.js`'s `process`) -- so the underrun
+  // counter means what it should: "we were playing and starved", never
+  // "we hadn't started yet".
+  const primeTarget = targetFillSamples(sampleRate)
+  let ticksWaited = 0
+  awaitAudioPrimed = () => {
+    ticksWaited += 1
+    const fill = (Atomics.load(control, WRITE_INDEX) - Atomics.load(control, READ_INDEX)) >>> 0
+    if (fill < primeTarget && ticksWaited < MAX_PRIME_TICKS) return
+    awaitAudioPrimed = null
+
+    port.postMessage({ type: 'init', ...handshake })
+    // Debug/test hook aside (see `AudioTestTone.tsx`), this is the cue to
+    // connect the node -- a `SharedArrayBuffer` is shared by structured
+    // clone, never transferred, so this and the worklet's view are two
+    // independent windows onto the exact same bytes, not copies.
+    post({ type: 'audio-ready', ...handshake })
+  }
+
+  scheduleStats(control) // no stop handle kept -- see `start`'s matching comment
 }
 
 /** Periodically reads the shared control block and pushes a summary to the
- * main thread -- see `STATS_INTERVAL_MS`'s comment. A separate `Int32Array`
- * view from the worklet's own, but backed by the exact same bytes. No stop
- * handle: see `start`'s comment on why nothing here manages subsystem
- * lifecycles independently of the whole Worker's. */
-function scheduleStats(memory: WebAssembly.Memory, controlByteOffset: number): void {
-  const control = new Int32Array(memory.buffer, controlByteOffset, CONTROL_INT32_LENGTH)
+ * main thread -- see `STATS_INTERVAL_MS`'s comment. No stop handle: see
+ * `start`'s comment on why nothing here manages subsystem lifecycles
+ * independently of the whole Worker's. */
+function scheduleStats(control: Int32Array): void {
   setInterval(() => {
     const write = Atomics.load(control, WRITE_INDEX)
     const read = Atomics.load(control, READ_INDEX)

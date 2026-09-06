@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioTestTone } from './audio/AudioTestTone'
 import { InputBridge } from './emulator/InputBridge'
-import type { EmulatorWorkerOutbound } from './emulator/protocol'
+import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
 // The one original, license-clean NROM ROM this repo vendors -- see
 // `core/tests/roms/nrom_demo/README.md` for why it stands in for a real
@@ -11,7 +11,21 @@ import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
 // `scripts/sync-core.mjs` copies it here from `core/`.
 import demoRomUrl from './roms/sprite_input_demo.nes?url'
 
-type Status = { kind: 'loading' } | { kind: 'running' } | { kind: 'error'; message: string }
+type Status =
+  | { kind: 'loading' }
+  | { kind: 'running'; renderer: RendererKind }
+  | { kind: 'error'; message: string }
+
+/** Reads `?renderer=webgpu|canvas2d`, the manual override that makes
+ * ENG-70's "force Canvas2D fallback and confirm it still works" something
+ * you can actually do on a machine where WebGPU *is* available -- by hand,
+ * or from `e2e/renderer.spec.ts`. Anything else in the parameter is ignored
+ * rather than treated as an error: it's a debugging affordance, not an API.
+ */
+function preferredRendererFromQuery(): RendererKind | undefined {
+  const requested = new URLSearchParams(window.location.search).get('renderer')
+  return requested === 'webgpu' || requested === 'canvas2d' ? requested : undefined
+}
 
 /** Debug/test hook only: `web/e2e/helpers.ts`'s `readFramebuffer` reads this
  * instead of the canvas's own 2D context -- once `transferControlToOffscreen`
@@ -68,7 +82,11 @@ export function EmulatorScreen() {
         const view = new Uint8ClampedArray(message.sab, message.framebufferPtr, message.width * message.height * 4)
         window.__frameDebug__ = () => Array.from(view)
       } else if (message.type === 'status') {
-        setStatus(message.status === 'running' ? { kind: 'running' } : { kind: 'error', message: message.message })
+        setStatus(
+          message.status === 'running'
+            ? { kind: 'running', renderer: message.renderer }
+            : { kind: 'error', message: message.message },
+        )
       }
     }
     emulatorWorker.addEventListener('message', handleMessage)
@@ -97,7 +115,10 @@ export function EmulatorScreen() {
         }
         const romBytes = await romResponse.arrayBuffer()
         if (cancelled) return
-        emulatorWorker.postMessage({ type: 'start', canvas: offscreen, romBytes, inputSab }, [offscreen, romBytes])
+        emulatorWorker.postMessage(
+          { type: 'start', canvas: offscreen, romBytes, inputSab, preferredRenderer: preferredRendererFromQuery() },
+          [offscreen, romBytes],
+        )
       } catch (err: unknown) {
         if (cancelled) return
         // `RomLoadError` can't actually reach here (loading now happens
@@ -134,6 +155,14 @@ export function EmulatorScreen() {
       <button type="button" className="reset" onClick={handleReset} disabled={status.kind !== 'running'}>
         Reset
       </button>
+      {/* Which backend actually engaged isn't inferable from the browser
+          (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
+          `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}
+      {status.kind === 'running' && (
+        <p className="renderer-readout" data-renderer={status.renderer}>
+          renderer: {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
+        </p>
+      )}
       <AudioTestTone worker={worker} />
     </>
   )
