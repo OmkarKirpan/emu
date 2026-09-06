@@ -3,65 +3,13 @@
 // singleton" design) — `NesCore` just wraps that instance's raw exports in
 // a typed, memory-safety-aware surface.
 import initCore from './nes_core.wasm?init'
+import { RomLoadError, RomStatus } from './errors'
+
+export { RomLoadError, RomStatus }
 
 /** Framebuffer dimensions `get_framebuffer_ptr` (ENG-60) always describes. */
 export const FRAMEBUFFER_WIDTH = 256
 export const FRAMEBUFFER_HEIGHT = 240
-
-/**
- * `load_rom`'s `i32` status codes — see `core/src/wasm.zig`'s doc comment,
- * which is this table's source of truth. `Ok` is success; JS owns the
- * code -> message lookup (ENG-60), which is exactly what `RomLoadError`
- * below is.
- *
- * A plain object rather than a TS `enum`: this project's tsconfig enables
- * `erasableSyntaxOnly`, which (like Node's own type-stripping) rejects any
- * construct that isn't pure-type and erasable at compile time -- `enum`
- * (const or not) compiles to a real runtime object, so it doesn't qualify.
- */
-export const RomStatus = {
-  Ok: 0,
-  InvalidHeader: -1,
-  UnsupportedMapper: -2,
-  TruncatedData: -3,
-  RomTooLarge: -4,
-} as const
-export type RomStatus = (typeof RomStatus)[keyof typeof RomStatus]
-
-/** Thrown by `NesCore.loadRom` for any non-`Ok` status, carrying both the
- * raw code and `get_last_error_context()`'s reading at the time of failure
- * (see `wasm.zig` for what that number means per status). */
-export class RomLoadError extends Error {
-  readonly status: RomStatus
-  readonly context: number
-
-  constructor(status: RomStatus, context: number) {
-    super(RomLoadError.describe(status, context))
-    this.name = 'RomLoadError'
-    this.status = status
-    this.context = context
-  }
-
-  private static describe(status: RomStatus, context: number): string {
-    switch (status) {
-      case RomStatus.InvalidHeader:
-        return 'Not a valid iNES ROM file.'
-      case RomStatus.UnsupportedMapper:
-        return `Unsupported mapper ${context} (only NROM/mapper 0 is supported so far).`
-      case RomStatus.TruncatedData:
-        return `ROM file is truncated (only ${context} bytes were readable).`
-      case RomStatus.RomTooLarge:
-        return `ROM file is too large (the core's cap is ${context} bytes).`
-      default:
-        // Unreachable for the codes above, and `loadRom` never constructs
-        // this for `Ok` -- but a `default` (rather than an `Ok` arm that
-        // returns a lie) means a status code added on the Zig side reads as
-        // an honest unknown here instead of falling out of the switch as
-        // `undefined`.
-        return `ROM load failed (status ${status}).`
-    }
-  }
-}
 
 /** The exact free-function surface `wasm.zig` exports — see that file's own
  * doc comment for the full ABI contract this mirrors. */

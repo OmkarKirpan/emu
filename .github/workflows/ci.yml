@@ -20,3 +20,35 @@ jobs:
       - name: zig build wasm (delivery target — compiles only, no test)
         working-directory: core
         run: zig build wasm
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Needed transitively: `npm run build`/`test:e2e` both trigger
+      # `predev`/`prebuild` -> `scripts/sync-core.mjs`, which runs
+      # `zig build wasm` to produce the module `web/` actually ships.
+      - uses: mlugg/setup-zig@v2.2.1
+        with:
+          version: 0.16.0
+      - name: npm ci
+        working-directory: web
+        run: npm ci
+      - name: Install Playwright's Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: Lint (oxlint)
+        working-directory: web
+        run: npm run lint
+      - name: Typecheck (tsc -b)
+        working-directory: web
+        run: npx tsc -b
+      - name: Unit tests (vitest)
+        working-directory: web
+        run: npm run test
+      - name: End-to-end tests (playwright — builds + previews the production bundle)
+        working-directory: web
+        run: npm run test:e2e
