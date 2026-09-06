@@ -419,3 +419,77 @@ test "Triangle.output reads the sequence table directly, ignoring the envelope (
     t.sequence_pos = 3;
     try testing.expectEqual(triangle_sequence[3], t.output());
 }
+
+/// https://www.nesdev.org/wiki/APU_Noise -- NTSC period table, CPU cycles.
+pub const noise_period_table = [16]u12{
+    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+};
+
+pub const Noise = struct {
+    enabled: bool = false,
+    envelope: Envelope = .{},
+    length_counter: u8 = 0,
+    mode: bool = false, // false = tap bit 1 (32767-step); true = tap bit 6 (short)
+    period_index: u4 = 0,
+    timer: u12 = 0,
+    /// Power-on state must be nonzero -- an all-zero LFSR would lock up
+    /// (XOR of two zero bits is always zero, so it can never leave 0).
+    shift_register: u15 = 1,
+
+    /// $400E: M---.PPPP
+    pub fn writeReg2(self: *Noise, value: u8) void {
+        self.mode = (value & 0x80) != 0;
+        self.period_index = @truncate(value & 0x0F);
+    }
+
+    /// $400F: llll.l--- -- reloads length if enabled, restarts the envelope.
+    /// No sequencer phase to restart (unlike pulse) -- the LFSR just keeps
+    /// running.
+    pub fn writeReg3(self: *Noise, value: u8) void {
+        if (self.enabled) self.length_counter = length_table[value >> 3];
+        self.envelope.start = true;
+    }
+
+    /// Called every APU cycle -- see `Apu.tick`.
+    pub fn tickTimer(self: *Noise) void {
+        if (self.timer == 0) {
+            self.timer = noise_period_table[self.period_index];
+            const tap: u1 = if (self.mode) @truncate(self.shift_register >> 6) else @truncate(self.shift_register >> 1);
+            const feedback = (self.shift_register & 1) ^ tap;
+            self.shift_register = (self.shift_register >> 1) | (@as(u15, feedback) << 14);
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    pub fn output(self: *const Noise) u4 {
+        if (self.length_counter == 0 or (self.shift_register & 1) != 0) return 0;
+        return self.envelope.output();
+    }
+};
+
+test "noise_period_table has the documented 16 NTSC entries" {
+    try testing.expectEqual(@as(u12, 4), noise_period_table[0]);
+    try testing.expectEqual(@as(u12, 202), noise_period_table[8]);
+    try testing.expectEqual(@as(u12, 4068), noise_period_table[15]);
+}
+
+test "Noise LFSR mode 0 taps bit 1; feedback loads into bit 14, register shifts right" {
+    var n = Noise{ .shift_register = 0b000_0000_0000_0001, .mode = false };
+    n.tickTimer(); // forces one shift regardless of the timer via period 0 fast-path below
+    // bit0=1, bit1=0 -> feedback = 1^0 = 1 -> new bit14 = 1
+    try testing.expectEqual(@as(u15, 0b100_0000_0000_0000), n.shift_register);
+}
+
+test "Noise output is 0 (muted) when bit 0 of the shift register is set, or the length counter is 0" {
+    var n = Noise{ .shift_register = 0b1, .length_counter = 5 };
+    n.envelope.constant_volume = true;
+    n.envelope.volume_or_period = 7;
+    try testing.expectEqual(@as(u4, 0), n.output()); // bit0 set -> muted
+
+    n.shift_register = 0b10;
+    try testing.expectEqual(@as(u4, 7), n.output());
+
+    n.length_counter = 0;
+    try testing.expectEqual(@as(u4, 0), n.output());
+}
