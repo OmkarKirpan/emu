@@ -53,10 +53,10 @@ jobs:
         working-directory: web
         run: npm run test:e2e
       # ENG-70's header regression guard, without needing `deploy.yml`'s
-      # Cloudflare credentials: `wrangler pages dev` is Cloudflare's own
-      # local emulator for Pages, `_headers` processing included, so this
-      # exercises the same header-application logic a real deploy would.
+      # Cloudflare credentials: `wrangler dev` is Cloudflare's own local
+      # emulator, running the same `wrangler.jsonc` and `_headers` the real
+      # deploy does, so this exercises the same header-application logic.
       # `dist/` is already built by the e2e step above.
-      - name: Verify Cloudflare Pages headers (wrangler pages dev, no credentials needed)
+      - name: Verify Cloudflare headers (wrangler dev, no credentials needed)
         working-directory: web
         run: npm run verify-headers:local
