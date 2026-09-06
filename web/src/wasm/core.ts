@@ -74,7 +74,7 @@ export class NesCore {
     this.exports.reset()
   }
 
-  /** Advances exactly one NTSC video frame and returns a live view onto the
+  /** Advances exactly one NTSC video frame and returns a copy of the
    * resolved RGBA8 framebuffer (ENG-60) — safe to hand straight to
    * `ImageData`, and deliberately raw rather than pre-wrapped, so the
    * WebGPU texture-upload path this same buffer is designed to feed later
@@ -91,8 +91,25 @@ export class NesCore {
     this.exports.set_input(controller, buttons)
   }
 
+  /** A copy, not a live view, of the wasm-side framebuffer -- for two
+   * independent reasons. First, the original one: a `memory.grow` (which
+   * `alloc` can trigger, so every `loadRom` can) detaches every existing
+   * typed-array view over that memory, so a cached view would eventually go
+   * stale. Second, as of ENG-56/ENG-62 (M5): `memory.buffer` is now a
+   * `SharedArrayBuffer` (the wasm module is built with `shared_memory =
+   * true` for the audio ring buffer's sake, even though this particular
+   * instance -- the main-thread one `EmulatorScreen` uses -- never shares
+   * its memory with anyone), and browsers refuse to construct `ImageData`
+   * from a shared-buffer-backed typed array ("must not be shared").
+   * `new Uint8ClampedArray(typedArray)` always allocates a fresh, plain
+   * `ArrayBuffer` for the copy regardless of the source's buffer type,
+   * which fixes both problems in one call -- a plain copy can't be
+   * detached either. 245,760 bytes at 60fps is nothing next to the frame
+   * of emulation it's copied out of, or next to the copy `putImageData`
+   * itself already makes into the canvas's backing store. */
   private viewFramebuffer(): Uint8ClampedArray<ArrayBuffer> {
     const ptr = this.exports.get_framebuffer_ptr()
-    return new Uint8ClampedArray(this.exports.memory.buffer, ptr, FRAMEBUFFER_WIDTH * FRAMEBUFFER_HEIGHT * 4)
+    const live = new Uint8ClampedArray(this.exports.memory.buffer, ptr, FRAMEBUFFER_WIDTH * FRAMEBUFFER_HEIGHT * 4)
+    return new Uint8ClampedArray(live)
   }
 }

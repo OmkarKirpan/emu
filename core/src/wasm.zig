@@ -13,6 +13,14 @@
 //! types: the two builds share one implementation, just not one entry
 //! point.
 //!
+//! ## Audio ring buffer (ENG-62, M5)
+//! `init`/`get_audio_ring_ptr`/`get_audio_ring_control_ptr`/
+//! `get_audio_ring_capacity`/`step_audio_frame` are purely additive to the
+//! ABI above -- none of them can fail, so none returns a status code. Their
+//! actual logic lives in `audio_ring.zig`; see that file's module doc
+//! comment for the producer/consumer protocol and why the ring is its own
+//! subsystem, independent of `g_machine`/the loaded ROM.
+//!
 //! ## Status codes
 //! Every fallible export returns one of these (`0` = success); nothing else
 //! exported here can fail, so nothing else returns a status.
@@ -31,6 +39,7 @@
 const std = @import("std");
 const core = @import("root.zig");
 const palette = @import("palette.zig");
+const audio_ring = @import("audio_ring.zig");
 
 const status_ok: i32 = 0;
 const status_invalid_header: i32 = -1;
@@ -186,6 +195,44 @@ export fn set_input(controller: u8, buttons: u8) void {
 /// table in this file's doc comment for what the number means per code.
 export fn get_last_error_context() u32 {
     return g_last_error_context;
+}
+
+/// One instance's whole audio subsystem is reset by one call to this --
+/// called once by the host right after instantiation, before the first
+/// `step_audio_frame` (ENG-62's handshake: the device's real `AudioContext`
+/// sample rate is only known at runtime, so the core has to be told it).
+/// Independent of `load_rom`/`g_loaded`: the audio ring produces its test
+/// tone whether or not a ROM is loaded, and calling this doesn't touch
+/// `g_machine` at all -- see `audio_ring.zig`'s module doc comment.
+export fn init(sample_rate: f32) void {
+    audio_ring.init(sample_rate);
+}
+
+/// Called once, after `init` -- not per-frame, same convention as
+/// `get_framebuffer_ptr`. The host builds one `Float32Array` view over
+/// `[ptr, ptr + get_audio_ring_capacity() * 4)` and reuses it.
+export fn get_audio_ring_ptr() u32 {
+    return @intCast(@intFromPtr(audio_ring.ringPtr()));
+}
+
+/// Called once, after `init`. The host builds one `Int32Array` view over
+/// `[ptr, ptr + 3 * audio_ring.cache_line_bytes)` -- see `audio_ring.zig`'s
+/// `ControlBlock` doc comment for the exact field offsets that layout
+/// implies.
+export fn get_audio_ring_control_ptr() u32 {
+    return @intCast(@intFromPtr(audio_ring.controlPtr()));
+}
+
+export fn get_audio_ring_capacity() u32 {
+    return audio_ring.capacity;
+}
+
+/// Advances the test tone by one nominal NES frame's worth of samples and
+/// updates DRC -- see `audio_ring.zig`'s `stepFrame` for the full contract
+/// (in particular: always call this once per Worker tick, never batched as
+/// a multi-frame catch-up).
+export fn step_audio_frame() void {
+    audio_ring.stepFrame();
 }
 
 /// Palette-to-color resolve: `Ppu.framebuffer` stores raw 6-bit NES palette
