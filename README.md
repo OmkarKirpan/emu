@@ -17,7 +17,7 @@ Cross-Origin-Embedder-Policy: require-corp
 
 Without them `SharedArrayBuffer` is undefined and the wasm module refuses to instantiate — the app doesn't degrade, it doesn't start. **GitHub Pages is therefore not an option**: it provides no way to set custom response headers. Cloudflare Pages, Netlify and Vercel all can; this repo is configured for the first.
 
-These headers are declared exactly once, in `web/vite.config.ts`, and applied three ways from that single source: `server.headers` (dev), `preview.headers` (`vite preview`), and a generated `dist/_headers` (Cloudflare Pages). They're then verified at two levels — `web/e2e/isolation.spec.ts` in CI against the preview server, and `web/scripts/check-headers.mjs` against the live deployment URL after each deploy.
+These headers are declared exactly once, in `web/vite.config.ts`, and applied three ways from that single source: `server.headers` (dev), `preview.headers` (`vite preview`), and a generated `dist/_headers` (Cloudflare Pages). They're then verified at three levels — `web/e2e/isolation.spec.ts` in CI against the preview server; `web/scripts/verify-headers-local.mjs`, also in CI, running `web/scripts/check-headers.mjs` against `wrangler pages dev` (Cloudflare's own local Pages emulator, `_headers` processing included) so a `_headers`-specific regression is caught on every PR without needing Cloudflare credentials; and `check-headers.mjs` again, against the live deployment URL, after each real deploy.
 
 ### One-time setup
 

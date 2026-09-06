@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "check-headers": "node scripts/check-headers.mjs"
+    "check-headers": "node scripts/check-headers.mjs",
+    "verify-headers:local": "node scripts/verify-headers-local.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",
@@ -32,6 +33,7 @@
     "typescript": "~6.0.2",
     "vite": "^8.2.2",
     "vitest": "^5.0.0",
-    "wgsl_reflect": "^1.6.0"
+    "wgsl_reflect": "^1.6.0",
+    "wrangler": "^4.129.0"
   }
 }

@@ -12,6 +12,12 @@ name: Deploy
 # shared-memory wasm module refuses to instantiate), and GitHub Pages has no
 # mechanism for setting custom response headers at all. See README.md.
 #
+# `ci.yml` already runs this same check-headers.mjs against `wrangler pages
+# dev` (Cloudflare's local Pages emulator) on every PR, with no credentials
+# needed -- that's the regression guard. What only this workflow can verify
+# is the one thing the emulator can't stand in for: that the real Cloudflare
+# Pages project is actually configured to serve this repo's `dist/`.
+#
 # ## Required repository secrets
 #   CLOUDFLARE_API_TOKEN   -- a token with the "Cloudflare Pages: Edit" permission
 #   CLOUDFLARE_ACCOUNT_ID  -- from the Cloudflare dashboard URL / account home
