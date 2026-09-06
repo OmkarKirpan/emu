@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { KeyboardController } from './wasm/controller'
-import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH, NesCore } from './wasm/core'
-import { GamepadController } from './wasm/gamepad'
+import { AudioTestTone } from './audio/AudioTestTone'
+import { InputBridge } from './emulator/InputBridge'
+import type { EmulatorWorkerOutbound } from './emulator/protocol'
+import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
 // The one original, license-clean NROM ROM this repo vendors -- see
 // `core/tests/roms/nrom_demo/README.md` for why it stands in for a real
 // commercial game. Imported through Vite's asset graph (`?url`) rather than
@@ -9,121 +10,111 @@ import { GamepadController } from './wasm/gamepad'
 // 404ing at runtime, and the file gets content-hashed like every other asset.
 // `scripts/sync-core.mjs` copies it here from `core/`.
 import demoRomUrl from './roms/sprite_input_demo.nes?url'
-import { NTSC_FRAME_MS } from './timing'
 
 type Status = { kind: 'loading' } | { kind: 'running' } | { kind: 'error'; message: string }
 
-/**
- * Ceiling on how many frames one animation frame may catch up. A backgrounded
- * tab hands back a multi-second delta on return; without a cap the loop would
- * try to emulate all of it in a single blocking burst. Dropping that time is
- * the right trade -- an emulator that skips ahead beats one that freezes the
- * page.
- */
-const MAX_CATCHUP_FRAMES = 4
+/** Debug/test hook only: `web/e2e/helpers.ts`'s `readFramebuffer` reads this
+ * instead of the canvas's own 2D context -- once `transferControlToOffscreen`
+ * hands the canvas to the Worker, the placeholder element left behind
+ * refuses `getContext('2d')` entirely (ENG-57), so this is a live shared-
+ * memory view onto the wasm-side framebuffer instead, built from the
+ * `'video-ready'` handshake below. No production code path reads it. */
+declare global {
+  interface Window {
+    __frameDebug__?: () => number[]
+  }
+}
 
 /**
- * The M4 (ENG-69) wasm host: a plain `<canvas>`, `putImageData` on a
- * `requestAnimationFrame` loop -- deliberately no Worker/SharedArrayBuffer/
- * WebGPU for *this* pipeline yet (that's the rest of M5/ENG-70; the audio
- * ring buffer's own Worker is separate, see `web/src/audio/`), so this still
- * proves the wasm/JS ABI boundary (ENG-60) in isolation. Gamepad input
- * (ENG-70) was added alongside the original keyboard-only input.
+ * The M5 (ENG-70) wasm host: transfers its `<canvas>` to a dedicated Worker
+ * (`emulator/emulatorWorker.ts`) via `OffscreenCanvas`, which owns the one
+ * wasm instance for the whole pipeline -- video, and (once `AudioTestTone`
+ * enables it) audio -- and paints via `putImageData` on its own ~60Hz timer.
+ * No more `requestAnimationFrame`-driven stepping on this thread; see
+ * `emulatorWorker.ts`'s `scheduleLoop` for why that's not a loss. Keyboard
+ * and Gamepad input still originate here (`InputBridge`), published into
+ * shared memory rather than message-passed. Still Canvas 2D only -- a
+ * WebGPU renderer (ENG-57) is unimplemented follow-up work.
  */
 export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const coreRef = useRef<NesCore | null>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
+  const [worker, setWorker] = useState<Worker | null>(null)
 
   /** Drives the ABI's `reset` export -- the emulated console's RESET line,
    * not a reload: WRAM, VRAM and palette survive it exactly as they do on
    * hardware (see `Ppu.reset`). */
   const handleReset = useCallback(() => {
-    coreRef.current?.reset()
+    worker?.postMessage({ type: 'reset' })
     canvasRef.current?.focus()
-  }, [])
+  }, [worker])
 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-    const ctx = canvas.getContext('2d')
-    if (!ctx) {
-      setStatus({ kind: 'error', message: 'Canvas 2D is not available in this browser.' })
-      return
-    }
 
     let cancelled = false
-    let rafHandle = 0
-    const keyboard = new KeyboardController()
-    const gamepad = new GamepadController()
+    // One-shot and irreversible per canvas (ENG-57): after this, the
+    // `<canvas>` element left in the DOM is an inert placeholder -- CSS
+    // sizing still applies to it, but its own `getContext` is gone for good.
+    const offscreen = canvas.transferControlToOffscreen()
+    const emulatorWorker = new Worker(new URL('./emulator/emulatorWorker.ts', import.meta.url), { type: 'module' })
+    const inputSab = new SharedArrayBuffer(4)
+    const inputBridge = new InputBridge(new Int32Array(inputSab))
 
-    // An arrow rather than a hoisted `function`: TypeScript won't carry the
-    // `if (!ctx) return` narrowing above into a hoisted declaration's body
-    // (it could in principle be called before the narrowing runs), which
-    // would force a `ctx!` assertion inside the per-frame loop below --
-    // exactly where an assertion would keep compiling if that guard ever
-    // moved.
-    const boot = async () => {
-      const [core, romResponse] = await Promise.all([NesCore.create(), fetch(demoRomUrl)])
-      if (!romResponse.ok) {
-        throw new Error(`Failed to fetch demo ROM: HTTP ${romResponse.status}`)
+    const handleMessage = (event: MessageEvent<EmulatorWorkerOutbound>) => {
+      const message = event.data
+      if (message.type === 'video-ready') {
+        const view = new Uint8ClampedArray(message.sab, message.framebufferPtr, message.width * message.height * 4)
+        window.__frameDebug__ = () => Array.from(view)
+      } else if (message.type === 'status') {
+        setStatus(message.status === 'running' ? { kind: 'running' } : { kind: 'error', message: message.message })
       }
-      const romBytes = new Uint8Array(await romResponse.arrayBuffer())
-      core.loadRom(romBytes)
-      if (cancelled) return
-
-      coreRef.current = core
-      setStatus({ kind: 'running' })
-
-      // `requestAnimationFrame` fires at the *display's* refresh rate, which
-      // is not the NES's. Stepping one frame per callback would run the
-      // emulator at double speed on a 120Hz panel and at 2.4x on a 144Hz one,
-      // so frames are paced against wall-clock time and rAF is used only as
-      // the paint/vsync signal.
-      let pendingFrames = 0
-      let lastTick = performance.now()
-
-      const loop = (now: number) => {
-        rafHandle = requestAnimationFrame(loop)
-
-        pendingFrames = Math.min(
-          pendingFrames + (now - lastTick) / NTSC_FRAME_MS,
-          MAX_CATCHUP_FRAMES,
-        )
-        lastTick = now
-        if (pendingFrames < 1) return // display is ahead of the NES; nothing to draw yet
-
-        // `do`/`while` rather than `while`: the guard above already proved at
-        // least one frame is due, which is also what lets `framebuffer` be
-        // definitely assigned without a non-null assertion.
-        let framebuffer: Uint8ClampedArray<ArrayBuffer>
-        do {
-          pendingFrames -= 1
-          // Gamepad state is polled fresh (not event-driven, see
-          // `GamepadController`) and OR'd with the keyboard's -- both are
-          // controller 0, matching a NES's single canonical input per port
-          // rather than modeling keyboard and gamepad as separate ports.
-          core.setInput(0, keyboard.read() | gamepad.read())
-          framebuffer = core.stepFrame()
-        } while (pendingFrames >= 1)
-
-        ctx.putImageData(new ImageData(framebuffer, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT), 0, 0)
-      }
-      rafHandle = requestAnimationFrame(loop)
+    }
+    emulatorWorker.addEventListener('message', handleMessage)
+    // An uncaught exception inside the Worker doesn't otherwise reach this
+    // page at all (it's a separate global scope, and nothing here relays
+    // it) -- surfacing it here, `console.error` included, is what lets a
+    // real crash still show up as a visible error state instead of a
+    // silent "stuck on Loading…", and keeps it inside what `fixtures.ts`'s
+    // e2e suite already asserts against ("no console/page errors").
+    emulatorWorker.onerror = (event: ErrorEvent) => {
+      console.error('emulatorWorker error:', event.message)
+      setStatus({ kind: 'error', message: event.message })
     }
 
-    boot().catch((err: unknown) => {
-      if (cancelled) return
-      // `RomLoadError extends Error`, so one check covers both.
-      const message = err instanceof Error ? err.message : String(err)
-      setStatus({ kind: 'error', message })
-    })
+    // Set eagerly (not once `'status'` confirms the ROM booted): `worker`
+    // only needs to exist for `AudioTestTone`'s button to work, and
+    // `startAudio`'s message queue on the Worker side (see
+    // `emulatorWorker.ts`) already covers a click racing the boot sequence.
+    setWorker(emulatorWorker)
+
+    void (async () => {
+      try {
+        const romResponse = await fetch(demoRomUrl)
+        if (!romResponse.ok) {
+          throw new Error(`Failed to fetch demo ROM: HTTP ${romResponse.status}`)
+        }
+        const romBytes = await romResponse.arrayBuffer()
+        if (cancelled) return
+        emulatorWorker.postMessage({ type: 'start', canvas: offscreen, romBytes, inputSab }, [offscreen, romBytes])
+      } catch (err: unknown) {
+        if (cancelled) return
+        // `RomLoadError` can't actually reach here (loading now happens
+        // inside the Worker, which reports it as a plain `'status'`
+        // message), but a fetch failure is exactly as much "the emulator
+        // didn't come up" from this component's point of view.
+        const message = err instanceof Error ? err.message : String(err)
+        setStatus({ kind: 'error', message })
+      }
+    })()
 
     return () => {
       cancelled = true
-      cancelAnimationFrame(rafHandle)
-      keyboard.dispose()
-      coreRef.current = null
+      delete window.__frameDebug__
+      emulatorWorker.removeEventListener('message', handleMessage)
+      inputBridge.dispose()
+      emulatorWorker.terminate()
     }
   }, [])
 
@@ -143,6 +134,7 @@ export function EmulatorScreen() {
       <button type="button" className="reset" onClick={handleReset} disabled={status.kind !== 'running'}>
         Reset
       </button>
+      <AudioTestTone worker={worker} />
     </>
   )
 }

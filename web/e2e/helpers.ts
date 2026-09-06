@@ -15,11 +15,12 @@ export const BACKDROP_RGBA = [0, 0, 0, 255]
  * Waits until the demo is actually visible on screen, not just "loaded".
  *
  * The Reset button's enabled state (`EmulatorScreen`'s `status.kind ===
- * 'running'`) flips the instant `core.loadRom()` returns -- synchronously,
- * before the rAF loop has drawn a single frame. The ROM's *own* boot then
- * needs a few more real NES frames after that (two VBLANK waits before it
- * even turns rendering on -- see `sprite_input_demo.s`), the same settling
- * window the native test suite accounts for with its own `settle_frames`.
+ * 'running'`) flips the instant the Worker's `'status'` message reports the
+ * ROM loaded -- before its own tick loop has drawn a single frame. The
+ * ROM's *own* boot then needs a few more real NES frames after that (two
+ * VBLANK waits before it even turns rendering on -- see
+ * `sprite_input_demo.s`), the same settling window the native test suite
+ * accounts for with its own `settle_frames`.
  * Polling for the sprite's actual pixels rather than a fixed `waitForTimeout`
  * is what makes every other test in this suite safe to run in parallel:
  * a fixed delay that happens to be long enough on an idle machine can
@@ -34,16 +35,23 @@ export async function waitUntilRunning(page: Page): Promise<void> {
     .toBeGreaterThanOrEqual(0)
 }
 
-/** Reads the whole 256x240 RGBA framebuffer straight off the canvas's own
- * backing store -- not a screenshot, so this is exact pixel data with no
- * compositing, scaling, or PNG-encoding in the way. */
+/** Mirrors `EmulatorScreen.tsx`'s `Window.__frameDebug__` shape. Not shared
+ * via import: `e2e/`'s own `tsconfig.e2e.json` project doesn't include
+ * `src/`, so the ambient `declare global` there isn't visible here -- same
+ * reasoning as `audio.spec.ts`'s `AudioDebugWindow`. */
+type FrameDebugWindow = { __frameDebug__?: () => number[] }
+
+/** Reads the whole 256x240 RGBA framebuffer via `EmulatorScreen.tsx`'s
+ * `__frameDebug__` debug hook -- a live shared-memory view onto the wasm-
+ * side framebuffer, not the canvas's own 2D context: once the canvas is
+ * transferred to the emulator Worker (`OffscreenCanvas`, ENG-57), the
+ * placeholder element left in the DOM refuses `getContext('2d')` entirely.
+ * Exact pixel data either way, no compositing/PNG-encoding in the way. */
 export function readFramebuffer(page: Page): Promise<number[]> {
   return page.evaluate(() => {
-    const canvas = document.querySelector('canvas')
-    if (!canvas) throw new Error('canvas not found')
-    const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('2d context not found')
-    return Array.from(ctx.getImageData(0, 0, 256, 240).data)
+    const read = (window as unknown as FrameDebugWindow).__frameDebug__
+    if (!read) throw new Error('__frameDebug__ not installed yet -- the video-ready message never arrived')
+    return read()
   })
 }
 
