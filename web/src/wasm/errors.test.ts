@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { RomLoadError, RomStatus } from './core'
+import { RomLoadError, RomStatus } from './errors'
 
 // `NesCore` itself wraps a real wasm module and is deliberately not
 // unit-tested against a hand-maintained mock of `CoreExports` here -- a mock
 // can drift silently from the real ABI in `core/src/wasm.zig` in a way a
 // type-check alone wouldn't catch. It's covered by `e2e/emulator.spec.ts`
 // instead, against the actual compiled module. `RomLoadError`'s message
-// formatting is pure logic with no wasm dependency, so it belongs here.
+// formatting is pure logic with no wasm dependency, so it belongs here --
+// imported from `./errors` directly (not re-exported through `./core`) so
+// this test needs no `?init` import, and therefore no compiled
+// `nes_core.wasm`, to even resolve its module graph.
 describe('RomLoadError', () => {
   it('describes InvalidHeader without needing the context number', () => {
     const err = new RomLoadError(RomStatus.InvalidHeader, 0)
