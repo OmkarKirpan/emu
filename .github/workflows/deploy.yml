@@ -54,12 +54,16 @@ jobs:
     # skip it outright until someone has done the one-time setup above.
     if: vars.DEPLOY_ENABLED == 'true'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
+          # See ci.yml for why this is pinned off rather than left default.
+          package-manager-cache: false
       # `npm run build` -> `prebuild` -> `scripts/sync-core.mjs` -> `zig build
       # wasm`: the wasm module is generated at build time, never committed.
+      #
+      # Still Node 20 upstream (see ci.yml) -- nothing to bump to yet.
       - uses: mlugg/setup-zig@v2.2.1
         with:
           version: 0.16.0
