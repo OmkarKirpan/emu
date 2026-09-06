@@ -307,3 +307,115 @@ test "Pulse.output is 0 when muted, length-counter-silenced, or the duty bit is 
     p.sequence_pos = 1; // duty 0's "1" step
     try testing.expectEqual(@as(u4, 9), p.output());
 }
+
+/// https://www.nesdev.org/wiki/APU_Triangle
+pub const triangle_sequence = blk: {
+    var seq: [32]u4 = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) seq[i] = @intCast(15 - i);
+    while (i < 32) : (i += 1) seq[i] = @intCast(i - 16);
+    break :blk seq;
+};
+
+pub const Triangle = struct {
+    enabled: bool = false,
+    length_counter: u8 = 0,
+    control_flag: bool = false, // shared bit: length-counter halt AND linear-counter control
+
+    timer_period: u11 = 0,
+    timer: u11 = 0,
+    sequence_pos: u5 = 0,
+
+    linear_counter: u7 = 0,
+    linear_reload_value: u7 = 0,
+    linear_reload_flag: bool = false,
+
+    /// $4008: CRRR.RRRR
+    pub fn writeReg0(self: *Triangle, value: u8) void {
+        self.control_flag = (value & 0x80) != 0;
+        self.linear_reload_value = @truncate(value & 0x7F);
+    }
+
+    /// $400A: timer low 8 bits.
+    pub fn writeReg2(self: *Triangle, value: u8) void {
+        self.timer_period = (self.timer_period & 0x0700) | value;
+    }
+
+    /// $400B: llll.lHHH -- sets the linear-counter reload flag (the actual
+    /// reload happens on the next linear-counter clock, not here), reloads
+    /// length if enabled, leaves the phase/timer untouched (unlike pulse --
+    /// the triangle's sequencer is never phase-reset by a register write).
+    pub fn writeReg3(self: *Triangle, value: u8) void {
+        self.timer_period = (self.timer_period & 0x00FF) | (@as(u11, value & 0x07) << 8);
+        if (self.enabled) self.length_counter = length_table[value >> 3];
+        self.linear_reload_flag = true;
+    }
+
+    /// Called every CPU cycle (the triangle is clocked twice as fast as
+    /// pulse/noise/DMC) -- see `Apu.tick`.
+    pub fn tickTimer(self: *Triangle) void {
+        if (self.length_counter == 0 or self.linear_counter == 0) return;
+        if (self.timer == 0) {
+            self.timer = self.timer_period;
+            self.sequence_pos +%= 1;
+        } else {
+            self.timer -= 1;
+        }
+    }
+
+    /// Quarter-frame clock.
+    pub fn clockLinearCounter(self: *Triangle) void {
+        if (self.linear_reload_flag) {
+            self.linear_counter = self.linear_reload_value;
+        } else if (self.linear_counter > 0) {
+            self.linear_counter -= 1;
+        }
+        if (!self.control_flag) self.linear_reload_flag = false;
+    }
+
+    pub fn output(self: *const Triangle) u4 {
+        return triangle_sequence[self.sequence_pos];
+    }
+};
+
+test "triangle_sequence is the documented 32-step descend-then-ascend ramp" {
+    try testing.expectEqual(@as(u4, 15), triangle_sequence[0]);
+    try testing.expectEqual(@as(u4, 0), triangle_sequence[15]);
+    try testing.expectEqual(@as(u4, 0), triangle_sequence[16]);
+    try testing.expectEqual(@as(u4, 15), triangle_sequence[31]);
+}
+
+test "Triangle.tickTimer only advances the sequence when both counters are nonzero" {
+    var t = Triangle{ .timer_period = 0, .length_counter = 1, .linear_counter = 1 };
+    t.sequence_pos = 0;
+    t.tickTimer();
+    try testing.expectEqual(@as(u5, 1), t.sequence_pos);
+
+    t.length_counter = 0; // gated off
+    t.tickTimer();
+    try testing.expectEqual(@as(u5, 1), t.sequence_pos); // unchanged
+}
+
+test "Triangle linear counter: reload flag forces a reload, clears only when control_flag is false" {
+    var t = Triangle{ .linear_reload_value = 10, .linear_reload_flag = true, .control_flag = true };
+    t.clockLinearCounter();
+    try testing.expectEqual(@as(u7, 10), t.linear_counter);
+    try testing.expect(t.linear_reload_flag); // control_flag held it set
+
+    t.control_flag = false;
+    t.clockLinearCounter(); // reload flag still true from before? no -- only cleared when control_flag false AND this clock runs
+    try testing.expectEqual(@as(u7, 10), t.linear_counter);
+    try testing.expect(!t.linear_reload_flag);
+}
+
+test "Triangle.writeReg3 sets the linear-counter reload flag" {
+    var t = Triangle{};
+    t.writeReg3(0x00);
+    try testing.expect(t.linear_reload_flag);
+}
+
+test "Triangle.output reads the sequence table directly, ignoring the envelope (triangle has none)" {
+    var t = Triangle{};
+    t.sequence_pos = 3;
+    try testing.expectEqual(triangle_sequence[3], t.output());
+}
