@@ -1,10 +1,15 @@
-//! ENG-62's lock-free single-producer/single-consumer audio ring buffer,
-//! plus the M5 (ENG-70) stand-in producer: a wasm-side sine test-tone
-//! generator with dynamic rate control (DRC). Real APU output (mixing,
-//! anti-aliasing, decimation) is M6/ENG-71's job -- this module's whole
-//! purpose is to prove the ring-buffer/worklet/atomics plumbing with a
-//! signal that has no relationship to the emulated machine, so a plumbing
-//! bug here can never be confused with an audio-content bug later.
+//! ENG-62's lock-free single-producer/single-consumer audio ring buffer.
+//! Through M5 (ENG-70) the producer was a wasm-side sine test-tone
+//! generator with dynamic rate control (DRC), proving the ring-buffer/
+//! worklet/atomics plumbing with a signal that had no relationship to the
+//! emulated machine. As of M6 (ENG-71) the producer is the real `Apu`:
+//! `pushSample` is called once per CPU cycle from `Apu.tick` with that
+//! cycle's fully mixed-and-filtered sample, decimates it down to the
+//! device's sample rate via the same fractional-accumulator technique the
+//! old sine generator used per-frame (just at per-cycle granularity now),
+//! and pushes the result into the ring. `updateDrc` keeps the once-per-
+//! frame DRC bookkeeping (`fill_ema`/`current_ratio`) that `pushSample`
+//! reads.
 //!
 //! ## Producer/consumer split
 //! This module is the *producer*: it owns `write_index` (only this file
@@ -16,13 +21,13 @@
 //! file for the consumer side of the protocol implemented here.
 //!
 //! Everything the producer touches (`write_index`'s plain reads,
-//! `sample_accumulator`, `phase`, `fill_ema`) is safe as plain (non-atomic)
-//! state precisely because `stepFrame` is only ever called synchronously,
-//! from one thread (the Worker that owns this wasm instance) -- it is
-//! never re-entrant and never runs concurrently with itself. Only the two
-//! fields the *other* real OS thread (the browser's audio-rendering
-//! thread, running the worklet) touches need actual atomic operations:
-//! `read_index` (acquire-loaded here, release-stored there) and
+//! `sample_accumulator`, `fill_ema`, `current_ratio`) is safe as plain
+//! (non-atomic) state precisely because `pushSample`/`updateDrc` are only
+//! ever called synchronously, from one thread (the Worker that owns this
+//! wasm instance) -- never re-entrant, never running concurrently with
+//! itself. Only the two fields the *other* real OS thread (the browser's
+//! audio-rendering thread, running the worklet) touches need actual atomic
+//! operations: `read_index` (acquire-loaded here, release-stored there) and
 //! `write_index` (release-stored here, acquire-loaded there).
 //!
 //! ## Control-block layout
@@ -56,30 +61,33 @@ comptime {
 var ring: [capacity]f32 = [_]f32{0} ** capacity;
 var control: ControlBlock = .{};
 
-/// Test tone frequency (A4). Arbitrary but audible and easy to recognize
-/// by ear -- there's no "correct" value since this signal has no
-/// relationship to any emulated hardware.
-const tone_hz: f32 = 440.0;
-/// `std.math.tau` isn't relied on here so this file's numeric constants
-/// stay independently checkable without the stdlib in front of you.
-const tau: f32 = 6.283185307179586;
+/// NTSC CPU clock -- matches `blargg_harness.zig`'s `cpu_hz` exactly (kept
+/// as an independent, locally-checkable constant per this file's existing
+/// convention -- see this file's module doc comment history for why
+/// `tau` used to be duplicated the same way).
+const cpu_hz: f32 = 1_789_773.0;
 
 var device_sample_rate: f32 = 48000.0;
-var phase: f32 = 0.0;
 
-/// NTSC's true frame rate -- matches `EmulatorScreen.tsx`'s `NTSC_FRAME_MS`
-/// exactly (deliberately not a round 60; see that file's comment). One
-/// `stepFrame` call is defined to cover exactly one of these.
-const nes_frames_per_sec: f32 = 60.0988;
+/// Cached once by `init`/`recomputeNominal`, so `pushSample` (called
+/// ~1.79M times/sec) does one multiply instead of a division every call.
+var nominal_per_cycle: f32 = 0;
+var current_ratio: f32 = 1.0;
 
-/// Fractional accumulator for "samples per tick" -- mirrors
+/// Re-derives `nominal_per_cycle` for the (possibly just-changed) device
+/// sample rate -- called by `init`.
+fn recomputeNominal() void {
+    nominal_per_cycle = device_sample_rate / cpu_hz;
+}
+
+/// Fractional accumulator for "samples per CPU cycle" -- mirrors
 /// `EmulatorScreen.tsx`'s `pendingFrames` pattern for the same reason: the
-/// nominal rate (e.g. 48000/60.0988 = ~798.7) isn't an integer, and
-/// truncating it every tick instead of carrying the remainder forward
-/// would systematically under-produce and drift the ring toward empty.
-/// Invariant: always in `[0, 1)` after `stepFrame` returns, and never
-/// negative going in -- `drcRatio` can only scale `nominal_per_tick` by a
-/// small positive factor, so what's added here is always positive.
+/// nominal rate isn't an integer, and truncating it every cycle instead of
+/// carrying the remainder forward would systematically under-produce and
+/// drift the ring toward empty. Invariant: always in `[0, 1)` after
+/// `pushSample` returns, and never negative going in -- `drcRatio` can
+/// only scale `nominal_per_cycle` by a small positive factor, so what's
+/// added here is always positive.
 var sample_accumulator: f32 = 0.0;
 
 /// EMA-smoothed ring fill, in samples -- feeds `drcRatio` below. Smoothing
@@ -120,7 +128,8 @@ fn drcRatio() f32 {
 /// whatever ROM is or isn't loaded, per this file's module doc comment.
 pub fn init(sample_rate: f32) void {
     device_sample_rate = sample_rate;
-    phase = 0.0;
+    recomputeNominal();
+    current_ratio = 1.0;
     sample_accumulator = 0.0;
     fill_ema = targetFill();
     control = .{};
@@ -135,42 +144,37 @@ pub fn controlPtr() *ControlBlock {
     return &control;
 }
 
-/// Advances the test tone by exactly one nominal NES frame's worth of
-/// (DRC-adjusted) samples and publishes them. Called once per Worker tick
-/// (~60Hz, timer-driven -- see `audioWorker.ts`) -- deliberately always
-/// "one frame" per call, never a multi-frame catch-up burst: ENG-62 calls
-/// for *resetting* the ring on a large scheduling gap (background-tab
-/// throttling, `AudioContext` suspend/resume) rather than fast-forwarding
-/// through it, and that reset is the consumer's job (it owns `read_index`)
-/// -- see `testToneProcessor.js`.
-pub fn stepFrame() void {
+/// Called once per CPU cycle from `Apu.tick`, with that cycle's fully
+/// mixed-and-filtered sample. Decimates via a fractional-accumulator
+/// technique (mirroring the old per-frame sine generator, just at
+/// per-cycle granularity now) -- `current_ratio` (refreshed once per video
+/// frame by `updateDrc`, not recomputed here) is what DRC actually adjusts.
+pub fn pushSample(raw: f32) void {
+    sample_accumulator += nominal_per_cycle * current_ratio;
+    if (sample_accumulator < 1.0) return;
+    sample_accumulator -= 1.0;
+
     const read = @atomicLoad(i32, &control.read_index, .acquire);
     const write = control.write_index; // producer-owned; plain load is fine (see module doc comment)
     const filled: u32 = @bitCast(write -% read);
+    if (filled >= capacity) return; // defensive belt, same as before
+
+    ring[@as(u32, @bitCast(write)) & (capacity - 1)] = raw;
+    @atomicStore(i32, &control.write_index, write +% 1, .release);
+}
+
+/// Called once per JS tick (~60Hz, via `wasm.zig`'s `step_audio_frame`
+/// export -- name kept for ABI-comment continuity even though this no
+/// longer produces samples itself, see `pushSample`). Refreshes
+/// `fill_ema`/`current_ratio` for the *upcoming* frame's `pushSample`
+/// calls -- a one-frame lag that's negligible against this loop's
+/// multi-frame EMA time constant.
+pub fn updateDrc() void {
+    const read = @atomicLoad(i32, &control.read_index, .acquire);
+    const write = control.write_index;
+    const filled: u32 = @bitCast(write -% read);
     fill_ema += fill_ema_alpha * (@as(f32, @floatFromInt(filled)) - fill_ema);
-
-    const nominal_per_tick = device_sample_rate / nes_frames_per_sec;
-    sample_accumulator += nominal_per_tick * drcRatio();
-    var n: u32 = @intFromFloat(@floor(sample_accumulator));
-    sample_accumulator -= @floatFromInt(n);
-
-    // Defensive belt, not the primary mechanism (DRC is): never advance
-    // past the consumer and overwrite samples it hasn't read yet, even if
-    // fill_ema hasn't caught up to a sudden change yet (e.g. right after
-    // `init`, or right after the consumer's own resync).
-    const free_space = if (filled >= capacity) 0 else capacity - filled;
-    if (n > free_space) n = free_space;
-
-    const phase_step = tau * tone_hz / device_sample_rate;
-    const base: u32 = @bitCast(write);
-    var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        ring[(base +% i) & (capacity - 1)] = @sin(phase);
-        phase += phase_step;
-        if (phase >= tau) phase -= tau;
-    }
-
-    @atomicStore(i32, &control.write_index, write +% @as(i32, @bitCast(n)), .release);
+    current_ratio = drcRatio();
 }
 
 const testing = std.testing;
@@ -212,34 +216,41 @@ test "drcRatio never exceeds its documented ±0.5% clamp" {
     try testing.expect(drcRatio() >= 1.0 - drc_clamp);
 }
 
-test "production saturates at capacity rather than overwriting unread data" {
+test "pushSample saturates at capacity rather than overwriting unread data" {
     init(48000.0);
-    // 30 ticks at ~800 samples/tick is comfortably more than the 8192-sample
-    // capacity with nothing ever draining it.
-    var tick: u32 = 0;
-    while (tick < 30) : (tick += 1) {
-        stepFrame();
-        const filled: u32 = @bitCast(control.write_index -% control.read_index);
-        try testing.expect(filled <= capacity);
-    }
+    var i: u32 = 0;
+    // ~37 CPU cycles per output sample at 48kHz -- comfortably more than
+    // capacity/nominal_per_cycle iterations overproduces past 8192 with
+    // nothing draining it.
+    while (i < capacity * 40) : (i += 1) pushSample(1.0);
     const filled: u32 = @bitCast(control.write_index -% control.read_index);
     try testing.expectEqual(capacity, filled);
 }
 
-test "DRC keeps the ring stable near target fill under a fixed-rate consumer" {
+test "pushSample produces roughly nominal_per_frame samples per simulated video frame" {
     init(48000.0);
-    const fixed_drain: i32 = 798; // a fixed approximation of nominal, like a real device clock
-    var tick: u32 = 0;
-    while (tick < 500) : (tick += 1) {
-        stepFrame();
+    const cpu_cycles_per_frame = 29781; // ~1,789,773 / 60.0988
+    var i: u32 = 0;
+    while (i < cpu_cycles_per_frame) : (i += 1) pushSample(0.5);
+    const filled: u32 = @bitCast(control.write_index -% control.read_index);
+    // 48000/60.0988 ~= 798.7 -- allow slack for the fractional accumulator.
+    try testing.expect(filled > 780 and filled < 820);
+}
+
+test "updateDrc's fill_ema/ratio still keeps a continuously-produced ring stable near target" {
+    init(48000.0);
+    const cpu_cycles_per_frame = 29781;
+    const drain: i32 = 798;
+    var frame: u32 = 0;
+    while (frame < 500) : (frame += 1) {
+        updateDrc();
+        var i: u32 = 0;
+        while (i < cpu_cycles_per_frame) : (i += 1) pushSample(0.5);
         const filled_before_drain: u32 = @bitCast(control.write_index -% control.read_index);
         try testing.expect(filled_before_drain <= capacity);
-        const drain = @min(fixed_drain, @as(i32, @bitCast(filled_before_drain)));
-        simulateConsumerRead(@bitCast(drain));
+        const d = @min(drain, @as(i32, @bitCast(filled_before_drain)));
+        simulateConsumerRead(@bitCast(d));
     }
-    // After 500 ticks (~8.3s) to settle, the ring should be neither empty
-    // nor pinned at capacity -- proof DRC is actually correcting drift
-    // toward target rather than just riding one clamp permanently.
-    const settled_fill: u32 = @bitCast(control.write_index -% control.read_index);
-    try testing.expect(settled_fill > 0 and settled_fill < capacity);
+    const settled: u32 = @bitCast(control.write_index -% control.read_index);
+    try testing.expect(settled > 0 and settled < capacity);
 }

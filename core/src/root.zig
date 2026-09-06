@@ -3,6 +3,7 @@ pub const mapper = @import("mapper.zig");
 pub const bus = @import("bus.zig");
 pub const cpu = @import("cpu.zig");
 pub const ppu = @import("ppu.zig");
+pub const apu = @import("apu.zig");
 pub const controller = @import("controller.zig");
 pub const palette = @import("palette.zig");
 pub const machine = @import("machine.zig");
@@ -21,6 +22,7 @@ pub const Ppu = ppu.Ppu;
 pub const Ctrl = ppu.Ctrl;
 pub const Mask = ppu.Mask;
 pub const Status = ppu.Status;
+pub const Apu = apu.Apu;
 pub const Controller = controller.Controller;
 pub const Machine = machine.Machine;
 
@@ -43,6 +45,7 @@ test {
     _ = bus;
     _ = cpu;
     _ = ppu;
+    _ = apu;
     _ = controller;
     _ = palette;
     // Wasm-only subsystem (ENG-62, M5), but its ring-buffer/DRC logic is
@@ -59,4 +62,5 @@ test {
     _ = @import("ppu_background_test.zig");
     _ = @import("ppu_sprites_test.zig");
     _ = @import("nrom_sprite_input_test.zig");
+    _ = @import("apu_test.zig");
 }

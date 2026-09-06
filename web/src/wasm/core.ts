@@ -120,7 +120,7 @@ export class NesCore {
   /** Ring buffer byte offset into `memory` -- call once, after `initAudio`,
    * and build one `Float32Array` view over `[ptr, ptr +
    * getAudioRingCapacity() * 4)`. Forwarded to the `AudioWorkletProcessor`
-   * (see `audio/testToneProcessor.js`) as part of ENG-62's handshake. */
+   * (see `audio/audioRingProcessor.js`) as part of ENG-62's handshake. */
   getAudioRingPtr(): number {
     return this.exports.get_audio_ring_ptr()
   }

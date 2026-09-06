@@ -11,7 +11,7 @@
 // `Int32Array` `Atomics`-published from the main thread (`InputBridge.ts`)
 // rather than message-passed, so a keypress reaches `set_input` with no
 // postMessage round trip. Audio starts later and separately (needs a user
-// gesture on the main thread -- see `AudioTestTone.tsx`), following the
+// gesture on the main thread -- see `AudioOutput.tsx`), following the
 // exact ENG-62 handshake the previous slice already built: the
 // `AudioWorkletNode`'s `MessagePort` is transferred here, and this Worker
 // forwards the wasm memory's `SharedArrayBuffer` plus the ring's byte
@@ -40,7 +40,7 @@ function post(message: EmulatorWorkerOutbound): void {
 const RESYNC_THRESHOLD_MS = 250
 
 /** How often to push `{ type: 'stats' }` to the main thread -- a debug/test
- * hook (see `AudioTestTone.tsx`), not anything the steady-state audio path
+ * hook (see `AudioOutput.tsx`), not anything the steady-state audio path
  * depends on, so this can be coarse. */
 const STATS_INTERVAL_MS = 200
 
@@ -191,7 +191,7 @@ function startAudio(sampleRate: number, port: MessagePort): void {
   // (~35ms) of them, and *deferring only the connect made it worse*, since
   // that lengthens the window. Withholding the handshake instead lands the
   // worklet in its own pre-init path, which outputs silence and counts
-  // nothing (see `testToneProcessor.js`'s `process`) -- so the underrun
+  // nothing (see `audioRingProcessor.js`'s `process`) -- so the underrun
   // counter means what it should: "we were playing and starved", never
   // "we hadn't started yet".
   const primeTarget = targetFillSamples(sampleRate)
@@ -203,7 +203,7 @@ function startAudio(sampleRate: number, port: MessagePort): void {
     awaitAudioPrimed = null
 
     port.postMessage({ type: 'init', ...handshake })
-    // Debug/test hook aside (see `AudioTestTone.tsx`), this is the cue to
+    // Debug/test hook aside (see `AudioOutput.tsx`), this is the cue to
     // connect the node -- a `SharedArrayBuffer` is shared by structured
     // clone, never transferred, so this and the worklet's view are two
     // independent windows onto the exact same bytes, not copies.

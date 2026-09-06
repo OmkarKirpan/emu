@@ -11,7 +11,12 @@
 //! add state -- this is that first, deliberately narrow slice, not an
 //! oversight.
 //!
-//! **No APU section**: it doesn't exist yet (M6). **Mapper section is CHR-RAM
+//! **APU section (M6, ENG-71)**: `hashApu` covers each channel's timer/
+//! length-counter/envelope state, the triangle's linear counter, the noise
+//! LFSR, the DMC's playback position/output level, and the frame
+//! sequencer's mode/cycle/IRQ-flag -- the pieces a mid-stream resume would
+//! need to keep producing bit-identical audio, on the same "grows to cover
+//! more" basis as every other section here. **Mapper section is CHR-RAM
 //! only**: NROM has no bank-switch registers or IRQ counter, but per ENG-61
 //! ("CHR-RAM contents where the mapper provides writable CHR (mutable;
 //! CHR-ROM is not serialized -- static, reloadable from the ROM file)") its
@@ -36,6 +41,7 @@ const testing = std.testing;
 const bus_mod = @import("bus.zig");
 const cpu_mod = @import("cpu.zig");
 const ppu_mod = @import("ppu.zig");
+const apu_mod = @import("apu.zig");
 const mapper_mod = @import("mapper.zig");
 const controller_mod = @import("controller.zig");
 const Machine = @import("machine.zig").Machine;
@@ -71,6 +77,7 @@ fn hashState(cpu: *const cpu_mod.Cpu, bus: *const bus_mod.Bus) Digest {
     hashPpu(&hasher, &bus.ppu);
     hashMapper(&hasher, &bus.mapper);
     hashControllers(&hasher, &bus.controllers);
+    hashApu(&hasher, &bus.apu);
 
     var digest: Digest = undefined;
     hasher.final(&digest);
@@ -163,6 +170,47 @@ fn hashControllers(hasher: *Sha256, controllers: *const [2]controller_mod.Contro
     for (controllers) |c| {
         hasher.update(&[_]u8{ c.buttons, c.shift, @intFromBool(c.strobe) });
     }
+}
+
+/// ENG-71 (M6): APU channel/frame-sequencer state. See the module doc
+/// comment for scope.
+fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
+    hashPulse(hasher, &a.pulse1);
+    hashPulse(hasher, &a.pulse2);
+    hasher.update(&[_]u8{
+        a.triangle.length_counter,       a.triangle.linear_counter,
+        a.triangle.linear_reload_value,  @intFromBool(a.triangle.linear_reload_flag),
+        @intFromBool(a.triangle.control_flag), @as(u8, a.triangle.sequence_pos),
+    });
+    hasher.update(std.mem.asBytes(&a.triangle.timer_period));
+    hasher.update(std.mem.asBytes(&a.triangle.timer));
+    hasher.update(&[_]u8{
+        a.noise.length_counter, a.noise.envelope.decay,
+        @intFromBool(a.noise.mode), a.noise.period_index,
+    });
+    hasher.update(std.mem.asBytes(&a.noise.shift_register));
+    hasher.update(std.mem.asBytes(&a.noise.timer));
+    hasher.update(&[_]u8{
+        a.dmc.output_level, @intFromBool(a.dmc.silence),
+        a.dmc.bits_remaining, a.dmc.shift_register,
+        @intFromBool(a.dmc.irq_flag), @intFromBool(a.dmc.loop),
+    });
+    hasher.update(std.mem.asBytes(&a.dmc.current_address));
+    hasher.update(std.mem.asBytes(&a.dmc.bytes_remaining));
+    hasher.update(std.mem.asBytes(&a.dmc.timer));
+    hasher.update(&[_]u8{ @intFromBool(a.frame.irq_flag), a.frame.mode });
+    hasher.update(std.mem.asBytes(&a.frame.cycle));
+}
+
+fn hashPulse(hasher: *Sha256, p: *const apu_mod.Pulse) void {
+    hasher.update(&[_]u8{
+        p.length_counter,     p.envelope.decay,
+        p.envelope.volume_or_period, p.duty,
+        @as(u8, p.sequence_pos),     @intFromBool(p.envelope.start),
+        p.sweep_divider,
+    });
+    hasher.update(std.mem.asBytes(&p.timer_period));
+    hasher.update(std.mem.asBytes(&p.timer));
 }
 
 /// See the module doc comment: only CHR-RAM is mutable state worth hashing.
@@ -274,6 +322,20 @@ test "the hash changes if controller state (ENG-68) differs" {
     var b_machine: Machine = undefined;
     try b_machine.init(&buf);
     b_machine.bus.controllers[0].setButtons(0x01); // the only difference from a_machine
+
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "the hash changes if APU channel state (ENG-71) differs" {
+    const buf = minimalNromBuf();
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
+
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.apu.pulse1.envelope.volume_or_period = 5; // the only difference
 
     const a = hashState(&a_machine.cpu, &a_machine.bus);
     const b = hashState(&b_machine.cpu, &b_machine.bus);

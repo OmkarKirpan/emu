@@ -1,7 +1,7 @@
 import type { Page } from '@playwright/test'
 import { expect, test } from './fixtures'
 
-/** Mirrors `AudioTestTone.tsx`'s `Window.__audioDebug__` shape. Not shared
+/** Mirrors `AudioOutput.tsx`'s `Window.__audioDebug__` shape. Not shared
  * via import: `e2e/`'s own `tsconfig.e2e.json` project doesn't include
  * `src/`, so the ambient `declare global` there isn't visible here -- this
  * is a debug/test-only contract, not application logic, so a second,
@@ -40,10 +40,10 @@ async function waitForUnderrunsToSettle(page: Page): Promise<number> {
  * *further* underruns once already past startup is exactly ENG-70's "no
  * underrun/desync glitches" acceptance criterion, made machine-checkable.
  */
-test('the audio test tone reaches a stable ring fill with no steady-state underruns', async ({ page }) => {
-  const button = page.locator('.audio-test-tone button')
+test('audio output reaches a stable ring fill with no steady-state underruns', async ({ page }) => {
+  const button = page.locator('.audio-output button')
   await button.click() // a real Playwright click is a trusted gesture, satisfying the autoplay policy `AudioContext` needs
-  await expect(button).toHaveText('Test tone playing')
+  await expect(button).toHaveText('Audio playing')
 
   // The Worker only starts pushing stats once its wasm instance is up and
   // the handshake with the worklet has completed -- poll rather than a
