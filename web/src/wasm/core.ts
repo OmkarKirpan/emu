@@ -1,7 +1,8 @@
-// The JS side of ENG-60's wasm/JS ABI, wired up for ENG-69 (M4). One hidden
-// `Emulator` per instantiated module (per ENG-60's "implicit global
-// singleton" design) — `NesCore` just wraps that instance's raw exports in
-// a typed, memory-safety-aware surface.
+// The JS side of ENG-60's wasm/JS ABI, wired up for ENG-69 (M4) and extended
+// for ENG-62/M5's audio ring buffer. One hidden `Emulator` per instantiated
+// module (per ENG-60's "implicit global singleton" design) — `NesCore` just
+// wraps that instance's raw exports in a typed, memory-safety-aware
+// surface.
 import initCore from './nes_core.wasm?init'
 import { RomLoadError, RomStatus } from './errors'
 
@@ -12,7 +13,11 @@ export const FRAMEBUFFER_WIDTH = 256
 export const FRAMEBUFFER_HEIGHT = 240
 
 /** The exact free-function surface `wasm.zig` exports — see that file's own
- * doc comment for the full ABI contract this mirrors. */
+ * doc comment for the full ABI contract this mirrors. The `init`/
+ * `get_audio_ring_*`/`step_audio_frame` group is the ENG-62 audio ring
+ * buffer subsystem (see `audio_ring.zig`) -- independent of everything
+ * above it (loading a ROM, stepping video frames), and unconditionally
+ * present regardless of whether a caller ever touches it. */
 interface CoreExports {
   memory: WebAssembly.Memory
   alloc(size: number): number
@@ -23,6 +28,11 @@ interface CoreExports {
   get_framebuffer_ptr(): number
   set_input(controller: number, buttons: number): void
   get_last_error_context(): number
+  init(sampleRate: number): void
+  get_audio_ring_ptr(): number
+  get_audio_ring_control_ptr(): number
+  get_audio_ring_capacity(): number
+  step_audio_frame(): void
 }
 
 /**
@@ -91,17 +101,69 @@ export class NesCore {
     this.exports.set_input(controller, buttons)
   }
 
+  /** Resets the audio-ring subsystem and tells it the host's real
+   * `AudioContext` sample rate (ENG-62's handshake: the device rate is
+   * only known at runtime). Independent of `loadRom`/`reset` -- it
+   * doesn't touch the emulated machine at all, see `audio_ring.zig`'s
+   * module doc comment. Call once, before the first `stepAudioFrame`. */
+  initAudio(sampleRate: number): void {
+    this.exports.init(sampleRate)
+  }
+
+  /** Advances the test-tone generator by one nominal NES frame's worth of
+   * (DRC-adjusted) samples -- call once per tick, alongside `stepFrame`
+   * (see `emulator/emulatorWorker.ts`), after `initAudio`. */
+  stepAudioFrame(): void {
+    this.exports.step_audio_frame()
+  }
+
+  /** Ring buffer byte offset into `memory` -- call once, after `initAudio`,
+   * and build one `Float32Array` view over `[ptr, ptr +
+   * getAudioRingCapacity() * 4)`. Forwarded to the `AudioWorkletProcessor`
+   * (see `audio/testToneProcessor.js`) as part of ENG-62's handshake. */
+  getAudioRingPtr(): number {
+    return this.exports.get_audio_ring_ptr()
+  }
+
+  /** Control-block byte offset into `memory` -- see `audio_ring.zig`'s
+   * `ControlBlock` doc comment for the field layout this points at. */
+  getAudioRingControlPtr(): number {
+    return this.exports.get_audio_ring_control_ptr()
+  }
+
+  getAudioRingCapacity(): number {
+    return this.exports.get_audio_ring_capacity()
+  }
+
+  /** The framebuffer's byte offset into `memory` -- exposed for a
+   * shared-memory *debug* view only (see `emulator/emulatorWorker.ts`'s
+   * `'ready'` message and `e2e/helpers.ts`'s `readFramebuffer`);
+   * `stepFrame`'s returned copy is the one production code should use. */
+  getFramebufferPtr(): number {
+    return this.exports.get_framebuffer_ptr()
+  }
+
+  /** The wasm instance's own linear memory -- a `SharedArrayBuffer` as of
+   * ENG-56/ENG-62 (M5), since the module is built with `shared_memory =
+   * true` for the audio ring buffer's sake. Exposed so a host holding this
+   * `NesCore` (the Worker `emulatorWorker.ts` instantiates) can forward it
+   * to the worklet and to the main thread's debug views, without either of
+   * them needing their own copy of the wasm export surface. */
+  get memory(): WebAssembly.Memory {
+    return this.exports.memory
+  }
+
   /** A copy, not a live view, of the wasm-side framebuffer -- for two
    * independent reasons. First, the original one: a `memory.grow` (which
    * `alloc` can trigger, so every `loadRom` can) detaches every existing
    * typed-array view over that memory, so a cached view would eventually go
    * stale. Second, as of ENG-56/ENG-62 (M5): `memory.buffer` is now a
    * `SharedArrayBuffer` (the wasm module is built with `shared_memory =
-   * true` for the audio ring buffer's sake, even though this particular
-   * instance -- the main-thread one `EmulatorScreen` uses -- never shares
-   * its memory with anyone), and browsers refuse to construct `ImageData`
-   * from a shared-buffer-backed typed array ("must not be shared").
-   * `new Uint8ClampedArray(typedArray)` always allocates a fresh, plain
+   * true` for the audio ring buffer's sake, and as of the video-in-Worker
+   * migration this instance's memory genuinely is shared, with the audio
+   * worklet), and browsers refuse to construct `ImageData` from a
+   * shared-buffer-backed typed array ("must not be shared"). `new
+   * Uint8ClampedArray(typedArray)` always allocates a fresh, plain
    * `ArrayBuffer` for the copy regardless of the source's buffer type,
    * which fixes both problems in one call -- a plain copy can't be
    * detached either. 245,760 bytes at 60fps is nothing next to the frame
