@@ -201,9 +201,9 @@ export fn get_last_error_context() u32 {
 /// called once by the host right after instantiation, before the first
 /// `step_audio_frame` (ENG-62's handshake: the device's real `AudioContext`
 /// sample rate is only known at runtime, so the core has to be told it).
-/// Independent of `load_rom`/`g_loaded`: the audio ring produces its test
-/// tone whether or not a ROM is loaded, and calling this doesn't touch
-/// `g_machine` at all -- see `audio_ring.zig`'s module doc comment.
+/// Independent of `load_rom`/`g_loaded`: the audio ring is its own
+/// subsystem, and calling this doesn't touch `g_machine` at all -- see
+/// `audio_ring.zig`'s module doc comment.
 export fn init(sample_rate: f32) void {
     audio_ring.init(sample_rate);
 }
@@ -227,12 +227,13 @@ export fn get_audio_ring_capacity() u32 {
     return audio_ring.capacity;
 }
 
-/// Advances the test tone by one nominal NES frame's worth of samples and
-/// updates DRC -- see `audio_ring.zig`'s `stepFrame` for the full contract
-/// (in particular: always call this once per Worker tick, never batched as
-/// a multi-frame catch-up).
+/// Refreshes DRC (fill_ema/current_ratio) for the real APU-fed audio ring
+/// -- see `audio_ring.zig`'s `updateDrc` for the full contract (in
+/// particular: always call this once per Worker tick, never batched as a
+/// multi-frame catch-up). The actual samples are produced continuously by
+/// `Apu.tick` via `audio_ring.pushSample`, not by this call.
 export fn step_audio_frame() void {
-    audio_ring.stepFrame();
+    audio_ring.updateDrc();
 }
 
 /// Palette-to-color resolve: `Ppu.framebuffer` stores raw 6-bit NES palette
