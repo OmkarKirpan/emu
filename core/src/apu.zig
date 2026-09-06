@@ -660,3 +660,133 @@ test "Dmc sets the IRQ flag on sample completion only when not looping and IRQ i
     try testing.expect(!looped.irq_flag);
     try testing.expectEqual(@as(u16, 5), looped.bytes_remaining); // restarted
 }
+
+pub const FrameEvent = enum { none, quarter, half, quarter_and_half };
+
+/// https://www.nesdev.org/wiki/APU_Frame_Counter. `cycle` counts CPU cycles
+/// since the last reset, and `total_cycles` counts them since power-on
+/// (used only for the write-delay parity rule below) -- both are owned and
+/// incremented by `tick()` itself, called once per CPU cycle from
+/// `Apu.tick`.
+///
+/// **Where the last step's cycle number and the "reset" cycle number
+/// collapse into one.** nesdev describes mode 0 as firing its last
+/// (quarter+half+IRQ) step at cycle 29829 and resetting to 0 "at 29830" --
+/// two distinct cycle numbers. This implementation never actually visits a
+/// cycle numbered 29830: the moment `cycle` reaches the last step (29829
+/// mode 0 / 37281 mode 1), that same `tick()` call both fires the step's
+/// event *and* resets `cycle` to 0, so the very next call starts counting
+/// the new sequence from 1 again. This is behaviorally identical to
+/// visiting 29830 and treating it as 0 -- it just never materializes that
+/// intermediate value -- and it's what the length-counter/envelope timing
+/// this file's other tests already rely on (one event per cycle number,
+/// no cycle number silently skipped or double-counted).
+pub const FrameSequencer = struct {
+    mode: u1 = 0,
+    irq_inhibit: bool = false,
+    irq_flag: bool = false,
+    cycle: u32 = 0,
+    /// Nonzero while a delayed reset (from a $4017 write) is pending;
+    /// counts down to 0, at which point `cycle` resets to 0.
+    reset_delay: u32 = 0,
+    /// For the write-delay parity rule -- see `write`'s doc comment.
+    total_cycles: u64 = 0,
+
+    /// $4017: MI--.---- (mode, IRQ inhibit). Schedules a delayed sequencer
+    /// reset (3 or 4 CPU cycles out, per the parity rule below) and, for
+    /// mode 1, returns an immediate quarter+half clock as a side effect.
+    /// The parity->delay mapping here is this plan's best-effort reading of
+    /// https://www.nesdev.org/wiki/APU_Frame_Counter ("3 cycles if the
+    /// write occurs during an APU cycle, 4 if between") -- if the vendored
+    /// `4-jitter`/`6-irq_flag_timing` ROMs fail, flip the `% 2 == 0` branch
+    /// below rather than second-guess the rest of this file.
+    pub fn write(self: *FrameSequencer, value: u8) FrameEvent {
+        self.mode = @truncate(value >> 7);
+        self.irq_inhibit = (value & 0x40) != 0;
+        if (self.irq_inhibit) self.irq_flag = false;
+        self.reset_delay = if (self.total_cycles % 2 == 0) 4 else 3;
+        return if (self.mode == 1) FrameEvent.quarter_and_half else FrameEvent.none;
+    }
+
+    /// Called once per CPU cycle. See the type doc comment for the
+    /// last-step/reset collapse and why `cycle` is incremented (and
+    /// checked against thresholds) inside this function rather than by the
+    /// caller.
+    pub fn tick(self: *FrameSequencer) FrameEvent {
+        self.total_cycles +%= 1;
+
+        if (self.reset_delay > 0) {
+            self.reset_delay -= 1;
+            if (self.reset_delay == 0) self.cycle = 0;
+        }
+        self.cycle += 1;
+
+        const event: FrameEvent = switch (self.mode) {
+            0 => switch (self.cycle) {
+                7457 => .quarter,
+                14913 => .quarter_and_half,
+                22371 => .quarter,
+                29829 => blk: {
+                    if (!self.irq_inhibit) self.irq_flag = true;
+                    break :blk .quarter_and_half;
+                },
+                else => .none,
+            },
+            1 => switch (self.cycle) {
+                7457 => .quarter,
+                14913 => .quarter_and_half,
+                22371 => .quarter,
+                37281 => .quarter_and_half,
+                else => .none,
+            },
+        };
+
+        const last_cycle: u32 = if (self.mode == 0) 29829 else 37281;
+        if (self.cycle >= last_cycle) self.cycle = 0;
+
+        return event;
+    }
+};
+
+test "FrameSequencer mode 0: quarter at 7457, quarter+half at 14913, quarter at 22371, quarter+half+irq at 29829, reset at 29830" {
+    var fs = FrameSequencer{};
+    fs.cycle = 7456;
+    try testing.expectEqual(FrameEvent.quarter, fs.tick());
+    fs.cycle = 14912;
+    try testing.expectEqual(FrameEvent.quarter_and_half, fs.tick());
+    fs.cycle = 22370;
+    try testing.expectEqual(FrameEvent.quarter, fs.tick());
+    fs.cycle = 29828;
+    try testing.expectEqual(FrameEvent.quarter_and_half, fs.tick());
+    try testing.expect(fs.irq_flag);
+    try testing.expectEqual(@as(u32, 0), fs.cycle); // reset one cycle later
+}
+
+test "FrameSequencer mode 0 does not set the IRQ flag while inhibited" {
+    var fs = FrameSequencer{ .irq_inhibit = true };
+    fs.cycle = 29828;
+    _ = fs.tick();
+    try testing.expect(!fs.irq_flag);
+}
+
+test "FrameSequencer mode 1: step 4 (29829) clocks nothing; step 5 (37281) clocks quarter+half, no IRQ ever" {
+    var fs = FrameSequencer{ .mode = 1 };
+    fs.cycle = 29828;
+    try testing.expectEqual(FrameEvent.none, fs.tick());
+    fs.cycle = 37280;
+    try testing.expectEqual(FrameEvent.quarter_and_half, fs.tick());
+    try testing.expect(!fs.irq_flag);
+}
+
+test "writing $80 to $4017 immediately clocks quarter+half; writing $00 does not" {
+    var fs = FrameSequencer{};
+    try testing.expectEqual(FrameEvent.none, fs.write(0x00));
+    try testing.expectEqual(FrameEvent.quarter_and_half, fs.write(0x80));
+}
+
+test "writing $40 or $C0 to $4017 clears a pending IRQ flag immediately" {
+    var fs = FrameSequencer{};
+    fs.irq_flag = true;
+    _ = fs.write(0x40);
+    try testing.expect(!fs.irq_flag);
+}
