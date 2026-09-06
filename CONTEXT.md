@@ -44,12 +44,14 @@ A cycle-accurate NES emulator core written in Zig, compiled to
 
 ## Current state (see ENG-63's roadmap for what "M*" means)
 
-M0–M4 done: repo scaffolding, CPU, PPU (background + sprites), input, and
-a single-threaded wasm host (`EmulatorScreen.tsx`: plain `<canvas>`,
-`putImageData` on a wall-clock-paced `requestAnimationFrame` loop,
-keyboard input). M5 (ENG-70) — migrating to the full threaded pipeline —
-is in progress; see `docs/adr/0001-audio-playback-no-howler.md` for the
-first piece of it to reach code.
+M0–M6 done: repo scaffolding, CPU, PPU (background + sprites), input, the
+full threaded pipeline (Worker + SharedArrayBuffer + WebGPU/Canvas2D +
+AudioWorklet), and now the APU (all 5 channels, frame sequencer, mixer +
+RC filter cascade, real game audio replacing M5's test tone). M7 (staged
+mappers, MMC1 first) is next; see `docs/adr/0001-audio-playback-no-howler.md`
+for the threaded-audio pipeline decision and
+`docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter decisions
+and the deferred DMC-DMA-stealing gap.
 
 ## Conventions worth knowing before touching either side
 
