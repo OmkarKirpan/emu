@@ -62,4 +62,5 @@ test {
     _ = @import("ppu_background_test.zig");
     _ = @import("ppu_sprites_test.zig");
     _ = @import("nrom_sprite_input_test.zig");
+    _ = @import("apu_test.zig");
 }

@@ -420,7 +420,12 @@ test "Triangle.output reads the sequence table directly, ignoring the envelope (
     try testing.expectEqual(triangle_sequence[3], t.output());
 }
 
-/// https://www.nesdev.org/wiki/APU_Noise -- NTSC period table, CPU cycles.
+/// https://www.nesdev.org/wiki/APU_Noise -- NTSC period table. Documented
+/// in full CPU cycles between shift-register clocks ("these periods are
+/// all even numbers because there are 2 CPU cycles in an APU cycle"), but
+/// `Noise.tickTimer` runs once per APU cycle (see `Apu.tick`), so the
+/// reload in `tickTimer` below is this table's value **halved** -- same
+/// fix, same reasoning, as `dmc_rate_table`'s doc comment.
 pub const noise_period_table = [16]u12{
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 };
@@ -453,7 +458,14 @@ pub const Noise = struct {
     /// Called every APU cycle -- see `Apu.tick`.
     pub fn tickTimer(self: *Noise) void {
         if (self.timer == 0) {
-            self.timer = noise_period_table[self.period_index];
+            // Table is in CPU cycles (halved for the APU-cycle domain, see
+            // the table's doc comment); minus 1 for the same check-then-
+            // reload structural reason as `Dmc.tickTimer` -- see that
+            // method's comment (confirmed there against the vendored
+            // `8-dmc_rates` ROM; noise isn't exercised for frequency
+            // precision by any vendored ROM, but the code shape is
+            // identical so the same off-by-one applies).
+            self.timer = noise_period_table[self.period_index] / 2 - 1;
             const tap: u1 = if (self.mode) @truncate(self.shift_register >> 6) else @truncate(self.shift_register >> 1);
             const feedback = (self.shift_register & 1) ^ tap;
             self.shift_register = (self.shift_register >> 1) | (@as(u15, feedback) << 14);
@@ -494,8 +506,14 @@ test "Noise output is 0 (muted) when bit 0 of the shift register is set, or the 
     try testing.expectEqual(@as(u4, 0), n.output());
 }
 
-/// https://www.nesdev.org/wiki/APU_DMC -- NTSC rate table, CPU cycles per
-/// output-level step.
+/// https://www.nesdev.org/wiki/APU_DMC -- NTSC rate table. Documented in
+/// full CPU cycles per output-level step ("these periods are all even
+/// numbers because there are 2 CPU cycles in an APU cycle" -- e.g. a rate
+/// of 428 means the output level changes every 214 *APU* cycles), but
+/// `Dmc.tickTimer` runs once per APU cycle (see `Apu.tick`), so the reload
+/// below is this table's value **halved** -- using it unhalved doubles
+/// every DMC playback rate (caught by the vendored `8-dmc_rates` ROM:
+/// "Rate 0's period is too long").
 pub const dmc_rate_table = [16]u9{
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
 };
@@ -587,7 +605,14 @@ pub const Dmc = struct {
         }
 
         if (self.timer == 0) {
-            self.timer = dmc_rate_table[self.rate_index];
+            // Table is in CPU cycles (halved for the APU-cycle domain, see
+            // the table's doc comment); minus 1 because this
+            // check-then-reload structure burns one extra APU-cycle tick
+            // per period compared to a naive `period` ticks (the reload
+            // call itself, plus `period` decrement calls, would be
+            // `period + 1` ticks between actions without this -1) --
+            // confirmed empirically against the vendored `8-dmc_rates` ROM.
+            self.timer = dmc_rate_table[self.rate_index] / 2 - 1;
 
             if (self.bits_remaining == 0) {
                 self.bits_remaining = 8;
@@ -661,6 +686,36 @@ test "Dmc sets the IRQ flag on sample completion only when not looping and IRQ i
     try testing.expectEqual(@as(u16, 5), looped.bytes_remaining); // restarted
 }
 
+test "Dmc rate 0's output_level changes exactly every dmc_rate_table[0] CPU cycles" {
+    // Regression test for the vendored `8-dmc_rates` ROM's "Rate 0's period
+    // is too long" failure: `tickTimer` runs once per APU cycle (called
+    // here every other simulated CPU cycle, matching `Apu.tick`), so
+    // getting the real-time period right needs both the table-is-in-CPU-
+    // cycles halving *and* the check-then-reload structure's -1 -- see
+    // `tickTimer`'s comment.
+    var d = Dmc{ .output_level = 64, .bytes_remaining = 20 };
+    var buf = [_]u8{0xAA} ** 64; // alternating bits -> level oscillates, never clamps
+    const stub = mapper_mod.Mapper{ .test_stub = mapper_mod.TestStub.init(&buf) };
+
+    var even = false;
+    var cpu_cycles: u32 = 0;
+    var last_level = d.output_level;
+    var gaps_seen: u32 = 0;
+    var i: u32 = 0;
+    while (i < 20000 and gaps_seen < 5) : (i += 1) {
+        cpu_cycles += 1;
+        even = !even;
+        if (even) d.tickTimer(&stub);
+        if (d.output_level != last_level) {
+            if (gaps_seen > 0) try testing.expectEqual(@as(u32, dmc_rate_table[0]), cpu_cycles);
+            gaps_seen += 1;
+            last_level = d.output_level;
+            cpu_cycles = 0;
+        }
+    }
+    try testing.expect(gaps_seen >= 5);
+}
+
 pub const FrameEvent = enum { none, quarter, half, quarter_and_half };
 
 /// https://www.nesdev.org/wiki/APU_Frame_Counter. `cycle` counts CPU cycles
@@ -689,22 +744,57 @@ pub const FrameSequencer = struct {
     /// Nonzero while a delayed reset (from a $4017 write) is pending;
     /// counts down to 0, at which point `cycle` resets to 0.
     reset_delay: u32 = 0,
+    /// Mode 0's frame IRQ flag is asserted on *three* consecutive CPU
+    /// cycles around the sequencer's wraparound (29829 itself, then the
+    /// following two ticks), not just once -- confirmed against the
+    /// vendored `6-irq_flag_timing` ROM's `#4`/`#5` sub-tests: clearing the
+    /// flag by reading $4015 right after the first assertion sees it
+    /// re-armed on each of the next two cycles, but no further. Counts
+    /// down from 2 when the 29829 case fires below; each of the next 2
+    /// `tick` calls re-asserts `irq_flag` while this is nonzero.
+    irq_reassert_remaining: u2 = 0,
+    /// The last step of each mode's sequence splits its nominal "quarter +
+    /// half" combined clock across two consecutive CPU cycles on real
+    /// hardware -- confirmed against the vendored `5-len_timing` ROM: its
+    /// length-counter clock at the final step lands one CPU cycle later
+    /// than `6-irq_flag_timing`'s frame-IRQ-flag set at that same nominal
+    /// step, even though both are driven by the identical `cycle` reaching
+    /// its last-step threshold. The quarter part (envelope/linear-counter
+    /// clock) and the IRQ flag fire immediately, same cycle as before; this
+    /// flag defers the half part (length-counter/sweep clock) to the very
+    /// next `tick` call.
+    half_frame_pending: bool = false,
     /// For the write-delay parity rule -- see `write`'s doc comment.
     total_cycles: u64 = 0,
 
     /// $4017: MI--.---- (mode, IRQ inhibit). Schedules a delayed sequencer
     /// reset (3 or 4 CPU cycles out, per the parity rule below) and, for
     /// mode 1, returns an immediate quarter+half clock as a side effect.
-    /// The parity->delay mapping here is this plan's best-effort reading of
+    /// The parity->delay mapping matches this plan's original reading of
     /// https://www.nesdev.org/wiki/APU_Frame_Counter ("3 cycles if the
-    /// write occurs during an APU cycle, 4 if between") -- if the vendored
-    /// `4-jitter`/`6-irq_flag_timing` ROMs fail, flip the `% 2 == 0` branch
-    /// below rather than second-guess the rest of this file.
+    /// write occurs during an APU cycle, 4 if between") and is confirmed
+    /// against the vendored `3-irq_flag`/`4-jitter`/`6-irq_flag_timing`
+    /// ROMs for an isolated write.
+    ///
+    /// One extra wrinkle, confirmed against `5-len_timing`: its `test`
+    /// macro writes $4017 *twice*, 6 CPU cycles apart, changing the mode
+    /// both ways (1-then-0 and 0-then-1) -- and the *second* write's reset
+    /// lands one CPU cycle later than the plain parity rule alone predicts
+    /// whenever the mode actually flips between the two writes. Scoped to
+    /// an actual mode change (rather than "any two close writes") because
+    /// `sync_apu`'s own internal back-to-back $4017 writes never change
+    /// mode (both are mode 0) -- broadening this to any close pair breaks
+    /// `3-irq_flag`/`4-jitter`/`6-irq_flag_timing`, all of which call it.
+    /// Root cause not independently re-derived from the wiki; this is this
+    /// plan's "let the test decide" fallback for a corner nesdev itself
+    /// flags as one of the two likeliest trouble spots.
     pub fn write(self: *FrameSequencer, value: u8) FrameEvent {
+        const old_mode = self.mode;
         self.mode = @truncate(value >> 7);
         self.irq_inhibit = (value & 0x40) != 0;
         if (self.irq_inhibit) self.irq_flag = false;
         self.reset_delay = if (self.total_cycles % 2 == 0) 4 else 3;
+        if (old_mode != self.mode) self.reset_delay += 1;
         return if (self.mode == 1) FrameEvent.quarter_and_half else FrameEvent.none;
     }
 
@@ -719,6 +809,22 @@ pub const FrameSequencer = struct {
             self.reset_delay -= 1;
             if (self.reset_delay == 0) self.cycle = 0;
         }
+
+        if (self.irq_reassert_remaining > 0) {
+            self.irq_reassert_remaining -= 1;
+            if (!self.irq_inhibit) self.irq_flag = true;
+        }
+
+        // The deferred half-frame clock (see `half_frame_pending`'s doc
+        // comment) occupies this CPU cycle on its own -- `cycle` does not
+        // also advance this tick, exactly like the wrap-to-0 tick before it
+        // doesn't. Confirmed against `5-len_timing`'s later, multi-lap
+        // sub-tests (#6/#7): without this, the *next* lap's own thresholds
+        // all land one CPU cycle too soon.
+        if (self.half_frame_pending) {
+            self.half_frame_pending = false;
+            return .half;
+        }
         self.cycle += 1;
 
         const event: FrameEvent = switch (self.mode) {
@@ -728,7 +834,9 @@ pub const FrameSequencer = struct {
                 22371 => .quarter,
                 29829 => blk: {
                     if (!self.irq_inhibit) self.irq_flag = true;
-                    break :blk .quarter_and_half;
+                    self.irq_reassert_remaining = 2;
+                    self.half_frame_pending = true;
+                    break :blk .quarter;
                 },
                 else => .none,
             },
@@ -736,7 +844,10 @@ pub const FrameSequencer = struct {
                 7457 => .quarter,
                 14913 => .quarter_and_half,
                 22371 => .quarter,
-                37281 => .quarter_and_half,
+                37281 => blk: {
+                    self.half_frame_pending = true;
+                    break :blk .quarter;
+                },
                 else => .none,
             },
         };
@@ -748,7 +859,7 @@ pub const FrameSequencer = struct {
     }
 };
 
-test "FrameSequencer mode 0: quarter at 7457, quarter+half at 14913, quarter at 22371, quarter+half+irq at 29829, reset at 29830" {
+test "FrameSequencer mode 0: quarter at 7457, quarter+half at 14913, quarter at 22371, quarter+irq at 29829 (half deferred one cycle), reset at 29830" {
     var fs = FrameSequencer{};
     fs.cycle = 7456;
     try testing.expectEqual(FrameEvent.quarter, fs.tick());
@@ -757,9 +868,14 @@ test "FrameSequencer mode 0: quarter at 7457, quarter+half at 14913, quarter at 
     fs.cycle = 22370;
     try testing.expectEqual(FrameEvent.quarter, fs.tick());
     fs.cycle = 29828;
-    try testing.expectEqual(FrameEvent.quarter_and_half, fs.tick());
+    // The last step's half-frame clock (length counters/sweep) lands on
+    // real hardware one CPU cycle after its quarter-frame clock and the
+    // frame-IRQ flag -- confirmed against the vendored `5-len_timing` vs.
+    // `6-irq_flag_timing` ROMs (see `half_frame_pending`'s doc comment).
+    try testing.expectEqual(FrameEvent.quarter, fs.tick());
     try testing.expect(fs.irq_flag);
     try testing.expectEqual(@as(u32, 0), fs.cycle); // reset one cycle later
+    try testing.expectEqual(FrameEvent.half, fs.tick());
 }
 
 test "FrameSequencer mode 0 does not set the IRQ flag while inhibited" {
@@ -769,13 +885,14 @@ test "FrameSequencer mode 0 does not set the IRQ flag while inhibited" {
     try testing.expect(!fs.irq_flag);
 }
 
-test "FrameSequencer mode 1: step 4 (29829) clocks nothing; step 5 (37281) clocks quarter+half, no IRQ ever" {
+test "FrameSequencer mode 1: step 4 (29829) clocks nothing; step 5 (37281) clocks quarter (half deferred one cycle), no IRQ ever" {
     var fs = FrameSequencer{ .mode = 1 };
     fs.cycle = 29828;
     try testing.expectEqual(FrameEvent.none, fs.tick());
     fs.cycle = 37280;
-    try testing.expectEqual(FrameEvent.quarter_and_half, fs.tick());
+    try testing.expectEqual(FrameEvent.quarter, fs.tick());
     try testing.expect(!fs.irq_flag);
+    try testing.expectEqual(FrameEvent.half, fs.tick());
 }
 
 test "writing $80 to $4017 immediately clocks quarter+half; writing $00 does not" {
