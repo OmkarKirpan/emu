@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { KeyboardController } from './wasm/controller'
 import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH, NesCore } from './wasm/core'
+import { GamepadController } from './wasm/gamepad'
 // The one original, license-clean NROM ROM this repo vendors -- see
 // `core/tests/roms/nrom_demo/README.md` for why it stands in for a real
 // commercial game. Imported through Vite's asset graph (`?url`) rather than
@@ -8,15 +9,9 @@ import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH, NesCore } from './wasm/core'
 // 404ing at runtime, and the file gets content-hashed like every other asset.
 // `scripts/sync-core.mjs` copies it here from `core/`.
 import demoRomUrl from './roms/sprite_input_demo.nes?url'
+import { NTSC_FRAME_MS } from './timing'
 
 type Status = { kind: 'loading' } | { kind: 'running' } | { kind: 'error'; message: string }
-
-/**
- * NTSC's true frame rate: 1,789,773 CPU cycles/sec ÷ 29,780.5 cycles/frame.
- * Deliberately not a round 60 -- the core is cycle-accurate, so pacing it at
- * 60.0 would run it 0.16% slow against a wall clock.
- */
-const NTSC_FRAME_MS = 1000 / 60.0988
 
 /**
  * Ceiling on how many frames one animation frame may catch up. A backgrounded
@@ -29,9 +24,11 @@ const MAX_CATCHUP_FRAMES = 4
 
 /**
  * The M4 (ENG-69) wasm host: a plain `<canvas>`, `putImageData` on a
- * `requestAnimationFrame` loop, and keyboard input only -- deliberately no
- * Worker/SharedArrayBuffer/WebGPU yet (that's M5), so this proves the
- * wasm/JS ABI boundary (ENG-60) in isolation.
+ * `requestAnimationFrame` loop -- deliberately no Worker/SharedArrayBuffer/
+ * WebGPU for *this* pipeline yet (that's the rest of M5/ENG-70; the audio
+ * ring buffer's own Worker is separate, see `web/src/audio/`), so this still
+ * proves the wasm/JS ABI boundary (ENG-60) in isolation. Gamepad input
+ * (ENG-70) was added alongside the original keyboard-only input.
  */
 export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -58,6 +55,7 @@ export function EmulatorScreen() {
     let cancelled = false
     let rafHandle = 0
     const keyboard = new KeyboardController()
+    const gamepad = new GamepadController()
 
     // An arrow rather than a hoisted `function`: TypeScript won't carry the
     // `if (!ctx) return` narrowing above into a hoisted declaration's body
@@ -101,7 +99,11 @@ export function EmulatorScreen() {
         let framebuffer: Uint8ClampedArray<ArrayBuffer>
         do {
           pendingFrames -= 1
-          core.setInput(0, keyboard.read())
+          // Gamepad state is polled fresh (not event-driven, see
+          // `GamepadController`) and OR'd with the keyboard's -- both are
+          // controller 0, matching a NES's single canonical input per port
+          // rather than modeling keyboard and gamepad as separate ports.
+          core.setInput(0, keyboard.read() | gamepad.read())
           framebuffer = core.stepFrame()
         } while (pendingFrames >= 1)
 

@@ -78,3 +78,42 @@ kbd {
   background: var(--code-bg);
   padding: 2px 6px;
 }
+
+.audio-test-tone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+
+  button {
+    font-family: var(--mono);
+    font-size: 14px;
+    padding: 6px 16px;
+    border-radius: 6px;
+    color: var(--text-h);
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      border-color: var(--text);
+    }
+    &:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+  }
+}
+
+.audio-error {
+  color: #c0392b;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.audio-debug {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.75;
+}

@@ -45,6 +45,11 @@ test {
     _ = ppu;
     _ = controller;
     _ = palette;
+    // Wasm-only subsystem (ENG-62, M5), but its ring-buffer/DRC logic is
+    // plain Zig with no wasm-specific codegen -- reachable only from this
+    // test block (not the `pub const` graph above) so it's exercised
+    // natively without becoming part of this file's public library surface.
+    _ = @import("audio_ring.zig");
     // Native-only: pulls in the vendored nestest/ppu_vbl_nmi/sprite fixtures
     // via anonymous imports declared in build.zig. Deliberately reachable
     // only from this test block so `zig build wasm` never has to embed the

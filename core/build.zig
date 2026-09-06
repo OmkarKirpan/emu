@@ -124,7 +124,15 @@ pub fn build(b: *std.Build) void {
         "wasm-optimize",
         "Optimize mode for the wasm32 delivery build (default: ReleaseFast)",
     ) orelse .ReleaseFast;
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
+    // ENG-56 (M5): `atomics` + `bulk_memory` on top of the `generic` baseline
+    // -- Zig's default wasm CPU model doesn't include either, and the audio
+    // ring buffer's lock-free protocol (ENG-62) needs real wasm atomic
+    // instructions rather than LLVM silently lowering `@atomicLoad`/
+    // `@atomicStore` to plain non-atomic ops. Equivalent to
+    // `-mcpu=generic+atomics+bulk_memory`.
+    var wasm_target_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .freestanding };
+    wasm_target_query.cpu_features_add.addFeatureSet(std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory }));
+    const wasm_target = b.resolveTargetQuery(wasm_target_query);
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/wasm.zig"),
         .target = wasm_target,
@@ -133,6 +141,18 @@ pub fn build(b: *std.Build) void {
     const wasm_exe = b.addExecutable(.{ .name = "nes_core", .root_module = wasm_mod });
     wasm_exe.entry = .disabled;
     wasm_exe.rdynamic = true;
+    // ENG-56/ENG-62 (M5): growable *shared* linear memory, so `memory.buffer`
+    // is a `SharedArrayBuffer` on the JS side and can be handed to an
+    // `AudioWorkletProcessor` directly. The WebAssembly threads proposal
+    // requires a shared memory to declare a fixed max -- `max_memory` is
+    // mandatory the moment `shared_memory` is true, not just a tuning knob.
+    // 64 MiB (page-aligned: 1024 * 64KiB pages) is generous headroom over
+    // today's static footprint (the 512KiB ROM staging buffer, the 245,760-
+    // byte RGBA framebuffer, the 32KiB audio ring, `Machine`'s CPU/PPU/bus
+    // state, and the `wasm_allocator` heap for ROM-load staging) -- revisit
+    // if a future milestone's static data grows enough to approach it.
+    wasm_exe.shared_memory = true;
+    wasm_exe.max_memory = 64 * 1024 * 1024;
     const wasm_step = b.step("wasm", "Build the wasm32-freestanding module");
     wasm_step.dependOn(&b.addInstallArtifact(wasm_exe, .{}).step);
 }

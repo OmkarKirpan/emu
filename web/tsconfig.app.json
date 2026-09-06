@@ -22,5 +22,9 @@
     "erasableSyntaxOnly": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // `audioWorker.ts` runs in a worker global scope, not `Window` -- see
+  // `tsconfig.worker.json`'s own comment for why that's a separate project
+  // rather than this one's `DOM` lib.
+  "exclude": ["src/audio/audioWorker.ts"]
 }

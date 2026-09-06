@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worker.tsbuildinfo",
+    "target": "es2023",
+    // `WebWorker`, not `DOM`: this file runs in `DedicatedWorkerGlobalScope`,
+    // not `Window` -- the two libs declare conflicting globals (`self`,
+    // `postMessage`) and can't both be active in one TS project, which is
+    // exactly why this is a separate project rather than folded into
+    // `tsconfig.app.json`'s `["ES2023", "DOM"]` (same reasoning as
+    // `tsconfig.node.json` existing separately for the Node-context config
+    // files).
+    "lib": ["ES2023", "WebWorker"],
+    "types": ["vite/client"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src/audio/audioWorker.ts"]
+}

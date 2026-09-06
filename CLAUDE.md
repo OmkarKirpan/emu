@@ -12,8 +12,8 @@ Default vocabulary (needs-triage, needs-info, ready-for-agent, ready-for-human, 
 
 ### Domain docs
 
-Single-context (one `CONTEXT.md` + `docs/adr/` at the repo root, not yet created). See [docs/agents/domain.md](docs/agents/domain.md).
+Single-context (one `CONTEXT.md` + `docs/adr/` at the repo root). See [CONTEXT.md](CONTEXT.md) and [docs/agents/domain.md](docs/agents/domain.md).
 
 ## Planning status
 
-Planning is complete — see [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear for the full decision record. Execution is underway per the milestone roadmap in [Milestone roadmap & build sequencing](https://linear.app/okirpan/issue/ENG-63/milestone-roadmap-and-build-sequencing) (ENG-63): `core/` (Zig) and `web/` (React+TS+Vite) exist; M0 (repo scaffolding & mapper interface) is done.
+Planning is complete — see [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear for the full decision record. Execution is underway per the milestone roadmap in [Milestone roadmap & build sequencing](https://linear.app/okirpan/issue/ENG-63/milestone-roadmap-and-build-sequencing) (ENG-63): `core/` (Zig) and `web/` (React+TS+Vite) exist; M0-M4 (repo scaffolding through the single-threaded wasm host) are done, M5 ([ENG-70](https://linear.app/okirpan/issue/ENG-70/m5-migrate-to-full-threaded-pipeline-video-audio-plumbing)) is in progress.
