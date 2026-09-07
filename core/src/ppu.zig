@@ -402,7 +402,11 @@ pub const Ppu = struct {
         return (@as(u11, physical) << 10) | @as(u11, @intCast(offset & 0x03FF));
     }
 
-    fn vramRead(self: *const Ppu, addr: u16, mapper: *const Mapper) u8 {
+    // `mapper` is mutable (unlike a plain "read" elsewhere) because
+    // `Mapper.chrRead` is: MMC3 (M7d) tracks PPU address line A12 from
+    // every CHR access to clock its scanline IRQ. See
+    // `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`.
+    fn vramRead(self: *const Ppu, addr: u16, mapper: *Mapper) u8 {
         const a = addr & 0x3FFF;
         return switch (a) {
             0x0000...0x1FFF => mapper.chrRead(a),
@@ -600,7 +604,7 @@ pub const Ppu = struct {
         return table + tile * 16 + fine_y + (if (plane_hi) @as(u16, 8) else 0);
     }
 
-    fn fetchAttributeByte(self: *Ppu, mapper: *const Mapper) void {
+    fn fetchAttributeByte(self: *Ppu, mapper: *Mapper) void {
         const nt: u16 = 0x2000 | (@as(u16, self.v) & 0x0C00);
         const coarse_x: u16 = self.v & 0x001F;
         const coarse_y: u16 = (self.v >> 5) & 0x001F;
@@ -842,22 +846,38 @@ pub const Ppu = struct {
         }
     }
 
-    /// Fetch pattern bytes for the sprites `evaluateSprites` just found,
-    /// building `sprite_units[0..sprite_count]` for the *next* scanline --
-    /// hardware's dots 257-320 job, and the point at which the freshly
-    /// evaluated `secondary_count` becomes the live `sprite_count`. Running
-    /// here rather than at the next scanline's dot 1 is what lets both
-    /// counts coexist without double-buffering: dot 257 is past the last
-    /// pixel (`outputPixel` covers dots 1-256), so nothing is still reading
-    /// the outgoing units.
+    /// Fetch pattern bytes for the 8 sprite-evaluation slots -- always all
+    /// 8, see the note inside -- building `sprite_units[0..sprite_count]`
+    /// for the *next* scanline from however many of them `evaluateSprites`
+    /// actually found in range. Hardware's dots 257-320 job, and the point
+    /// at which the freshly evaluated `secondary_count` becomes the live
+    /// `sprite_count`. Running here rather than at the next scanline's dot 1
+    /// is what lets both counts coexist without double-buffering: dot 257 is
+    /// past the last pixel (`outputPixel` covers dots 1-256), so nothing is
+    /// still reading the outgoing units.
     fn fetchSpriteUnits(self: *Ppu, mapper: *Mapper) void {
         const height16 = self.ctrl.sprite_height16;
         const height: i32 = if (height16) 16 else 8;
         const target = self.targetScanline();
         self.sprite_count = self.secondary_count;
 
+        // **Always 8 fetch pairs, not `self.sprite_count`.** Real hardware
+        // fetches pattern bytes for all 8 sprite-evaluation slots every
+        // rendered scanline, regardless of how many `evaluateSprites` found
+        // in range -- the unused slots fetch from `secondary_oam`'s
+        // `$FF`-filled padding (see `evaluateSprites`) and the result is
+        // simply never stored into `sprite_units` or drawn. Skipping those
+        // fetches when `secondary_count < 8` is invisible to the picture
+        // (nothing reads the discarded bytes) but *not* to a cartridge
+        // watching PPU address line A12: MMC3's scanline IRQ (M7d) counts
+        // A12 rises, and the sprite-fetch phase (this function, dots
+        // 257-320) is what makes that alternate with the background phase
+        // once per scanline. A scanline with zero visible sprites -- the
+        // common case in most games -- used to skip this phase entirely,
+        // starving the counter. holy-mapperel's own MMC3 IRQ test (which
+        // enables only the background layer) caught exactly this.
         var i: u8 = 0;
-        while (i < self.sprite_count) : (i += 1) {
+        while (i < 8) : (i += 1) {
             const base = @as(usize, i) * 4;
             const y = self.secondary_oam[base];
             const tile = self.secondary_oam[base + 1];
@@ -867,9 +887,15 @@ pub const Ppu = struct {
             const flip_h = (attr & 0x40) != 0;
             const flip_v = (attr & 0x80) != 0;
 
-            // In range by construction (this sprite came straight out of
-            // `evaluateSprites`' own in-range check for this same scanline).
-            var row: u16 = @intCast(@as(i32, target) - @as(i32, y) - 1);
+            // `@mod`, not a bare subtraction: a real sprite is in range by
+            // construction (straight out of `evaluateSprites`' own in-range
+            // check for this scanline), so this is a no-op for it, but a
+            // padding slot's Y is $FF and is never in range -- `@mod` keeps
+            // that math safely inside `0..height` instead of underflowing
+            // the `u16` cast. The resulting pixels are discarded either way;
+            // only the bus address's pattern-table half (`table` below)
+            // matters for A12.
+            var row: u16 = @intCast(@mod(@as(i32, target) - @as(i32, y) - 1, height));
             if (flip_v) row = @as(u16, @intCast(height - 1)) - row;
 
             var table: u16 = undefined;
@@ -887,6 +913,8 @@ pub const Ppu = struct {
             const addr_lo = table + tile_id * 16 + fine_y;
             var lo = self.vramRead(addr_lo, mapper);
             var hi = self.vramRead(addr_lo + 8, mapper);
+            if (i >= self.sprite_count) continue; // padding: fetched for A12 only
+
             if (flip_h) {
                 lo = reverseBits(lo);
                 hi = reverseBits(hi);
