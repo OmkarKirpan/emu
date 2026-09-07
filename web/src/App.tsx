@@ -5,7 +5,7 @@ function App() {
   return (
     <main id="center">
       <h1>NES emulator</h1>
-      {/* Renders its own `AudioTestTone` control -- see `EmulatorScreen.tsx`'s
+      {/* Renders its own `AudioOutput` control -- see `EmulatorScreen.tsx`'s
           module doc comment: video and audio now share one Worker/wasm
           instance, so audio setup needs the same worker reference video
           does, not a sibling of its own. */}

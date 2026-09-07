@@ -11,7 +11,7 @@
 // `Int32Array` `Atomics`-published from the main thread (`InputBridge.ts`)
 // rather than message-passed, so a keypress reaches `set_input` with no
 // postMessage round trip. Audio starts later and separately (needs a user
-// gesture on the main thread -- see `AudioTestTone.tsx`), following the
+// gesture on the main thread -- see `AudioOutput.tsx`), following the
 // exact ENG-62 handshake the previous slice already built: the
 // `AudioWorkletNode`'s `MessagePort` is transferred here, and this Worker
 // forwards the wasm memory's `SharedArrayBuffer` plus the ring's byte
@@ -40,7 +40,7 @@ function post(message: EmulatorWorkerOutbound): void {
 const RESYNC_THRESHOLD_MS = 250
 
 /** How often to push `{ type: 'stats' }` to the main thread -- a debug/test
- * hook (see `AudioTestTone.tsx`), not anything the steady-state audio path
+ * hook (see `AudioOutput.tsx`), not anything the steady-state audio path
  * depends on, so this can be coarse. */
 const STATS_INTERVAL_MS = 200
 
@@ -191,7 +191,7 @@ function startAudio(sampleRate: number, port: MessagePort): void {
   // (~35ms) of them, and *deferring only the connect made it worse*, since
   // that lengthens the window. Withholding the handshake instead lands the
   // worklet in its own pre-init path, which outputs silence and counts
-  // nothing (see `testToneProcessor.js`'s `process`) -- so the underrun
+  // nothing (see `audioRingProcessor.js`'s `process`) -- so the underrun
   // counter means what it should: "we were playing and starved", never
   // "we hadn't started yet".
   const primeTarget = targetFillSamples(sampleRate)
@@ -203,28 +203,67 @@ function startAudio(sampleRate: number, port: MessagePort): void {
     awaitAudioPrimed = null
 
     port.postMessage({ type: 'init', ...handshake })
-    // Debug/test hook aside (see `AudioTestTone.tsx`), this is the cue to
+    // Debug/test hook aside (see `AudioOutput.tsx`), this is the cue to
     // connect the node -- a `SharedArrayBuffer` is shared by structured
     // clone, never transferred, so this and the worklet's view are two
     // independent windows onto the exact same bytes, not copies.
     post({ type: 'audio-ready', ...handshake })
   }
 
-  scheduleStats(control) // no stop handle kept -- see `start`'s matching comment
+  // A second view over the same shared bytes the worklet reads from --
+  // see the handshake above; `SharedArrayBuffer`s are shared, not moved.
+  const ring = new Float32Array(nesCore.memory.buffer, handshake.ringByteOffset, handshake.capacity)
+  scheduleStats(control, ring) // no stop handle kept -- see `start`'s matching comment
 }
 
 /** Periodically reads the shared control block and pushes a summary to the
  * main thread -- see `STATS_INTERVAL_MS`'s comment. No stop handle: see
  * `start`'s comment on why nothing here manages subsystem lifecycles
  * independently of the whole Worker's. */
-function scheduleStats(control: Int32Array): void {
+function scheduleStats(control: Int32Array, ring: Float32Array): void {
   setInterval(() => {
     const write = Atomics.load(control, WRITE_INDEX)
     const read = Atomics.load(control, READ_INDEX)
     const fill = (write - read) >>> 0
     const underrunCount = Atomics.load(control, UNDERRUN_COUNT)
-    post({ type: 'stats', fill, underrunCount })
+    const { peak, rms } = measureRing(ring, write, fill)
+    post({ type: 'stats', fill, underrunCount, peak, rms })
   }, STATS_INTERVAL_MS)
+}
+
+/** How many of the most recently written samples `measureRing` summarizes
+ * -- ~21ms at 48kHz, comfortably more than one period of anything in the
+ * audible band, and small enough to stay cheap at `STATS_INTERVAL_MS`. */
+const CONTENT_WINDOW_SAMPLES = 1024
+
+/**
+ * Peak and RMS of the samples most recently published to the ring.
+ *
+ * Fill and underrun counts (the only things this Worker used to report)
+ * describe the *plumbing*: they look identical whether the ring is
+ * carrying a game's audio or a steady stream of zeroes. Through M5 that
+ * was the whole story, because the producer was a test tone that could
+ * not be silent. Now that real APU output crosses this ring (ENG-71), the
+ * difference between "working" and "silently shipping nothing" is exactly
+ * what a test needs to see -- hence measuring content, not just flow.
+ *
+ * Reads without `Atomics`: these are plain sample slots, not the control
+ * block, and a torn read of one f32 slot cannot meaningfully skew a
+ * 1024-sample summary. Debug/test hook only -- no production path reads it.
+ */
+function measureRing(ring: Float32Array, write: number, fill: number): { peak: number; rms: number } {
+  const count = Math.min(CONTENT_WINDOW_SAMPLES, fill)
+  if (count === 0) return { peak: 0, rms: 0 }
+  const mask = ring.length - 1
+  let peak = 0
+  let sumSquares = 0
+  for (let i = 0; i < count; i++) {
+    const sample = ring[(write - count + i) & mask]
+    const magnitude = Math.abs(sample)
+    if (magnitude > peak) peak = magnitude
+    sumSquares += sample * sample
+  }
+  return { peak, rms: Math.sqrt(sumSquares / count) }
 }
 
 /**

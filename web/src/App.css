@@ -79,7 +79,7 @@ kbd {
   padding: 2px 6px;
 }
 
-.audio-test-tone {
+.audio-output {
   display: flex;
   flex-direction: column;
   align-items: center;

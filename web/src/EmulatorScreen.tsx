@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AudioTestTone } from './audio/AudioTestTone'
+import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
@@ -15,6 +15,18 @@ type Status =
   | { kind: 'loading' }
   | { kind: 'running'; renderer: RendererKind }
   | { kind: 'error'; message: string }
+
+/** Everything that can only be built once per `<canvas>` element, kept
+ * together so a remount can reuse it wholesale. `offscreen` is transferred
+ * to the Worker on the first `'start'` message and is detached afterwards
+ * -- it is retained only so the shape stays honest about what was built. */
+interface EmulatorSession {
+  worker: Worker
+  offscreen: OffscreenCanvas
+  inputSab: SharedArrayBuffer
+  inputBridge: InputBridge
+  romStarted: boolean
+}
 
 /** Reads `?renderer=webgpu|canvas2d`, the manual override that makes
  * ENG-70's "force Canvas2D fallback and confirm it still works" something
@@ -42,7 +54,7 @@ declare global {
 /**
  * The M5 (ENG-70) wasm host: transfers its `<canvas>` to a dedicated Worker
  * (`emulator/emulatorWorker.ts`) via `OffscreenCanvas`, which owns the one
- * wasm instance for the whole pipeline -- video, and (once `AudioTestTone`
+ * wasm instance for the whole pipeline -- video, and (once `AudioOutput`
  * enables it) audio -- and paints via `putImageData` on its own ~60Hz timer.
  * No more `requestAnimationFrame`-driven stepping on this thread; see
  * `emulatorWorker.ts`'s `scheduleLoop` for why that's not a loss. Keyboard
@@ -54,6 +66,12 @@ export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
   const [worker, setWorker] = useState<Worker | null>(null)
+  /** The one emulator session for this canvas, held across remounts --
+   * see the effect below for why it cannot simply be rebuilt. */
+  const sessionRef = useRef<EmulatorSession | null>(null)
+  /** Pending deferred teardown, if a cleanup has run and no remount has
+   * cancelled it yet. */
+  const teardownTimerRef = useRef<number | null>(null)
 
   /** Drives the ABI's `reset` export -- the emulated console's RESET line,
    * not a reload: WRAM, VRAM and palette survive it exactly as they do on
@@ -67,14 +85,48 @@ export function EmulatorScreen() {
     const canvas = canvasRef.current
     if (!canvas) return
 
-    let cancelled = false
-    // One-shot and irreversible per canvas (ENG-57): after this, the
-    // `<canvas>` element left in the DOM is an inert placeholder -- CSS
-    // sizing still applies to it, but its own `getContext` is gone for good.
-    const offscreen = canvas.transferControlToOffscreen()
-    const emulatorWorker = new Worker(new URL('./emulator/emulatorWorker.ts', import.meta.url), { type: 'module' })
-    const inputSab = new SharedArrayBuffer(4)
-    const inputBridge = new InputBridge(new Int32Array(inputSab))
+    // A teardown scheduled by the cleanup below, still pending. Its
+    // presence means this run is a *remount of the same canvas*, not a
+    // fresh mount -- cancel the teardown and reuse what it was about to
+    // destroy. See `scheduleTeardown` for why teardown is deferred at all.
+    if (teardownTimerRef.current !== null) {
+      clearTimeout(teardownTimerRef.current)
+      teardownTimerRef.current = null
+    }
+
+    // **Why this is cached across mounts rather than built per-effect.**
+    // `transferControlToOffscreen` is one-shot and irreversible *per
+    // canvas element* (ENG-57): after it, the `<canvas>` left in the DOM
+    // is an inert placeholder -- CSS sizing still applies, but its own
+    // `getContext` is gone for good, and a second transfer call on it
+    // throws `InvalidStateError`.
+    //
+    // React's StrictMode deliberately mounts, unmounts and remounts every
+    // component once in development, reusing the same DOM node -- so the
+    // second mount hit exactly that throw and the app died before painting
+    // a frame. Production builds don't double-invoke, and the e2e suite
+    // runs against `vite preview` (a production build), so nothing in CI
+    // could see it; it only appeared in `npm run dev`.
+    //
+    // Caching the session fixes the immediate crash and makes the
+    // component genuinely remount-safe, which StrictMode was right to be
+    // probing for: any future conditional render or Fast Refresh of this
+    // component would have broken it the same way.
+    let session = sessionRef.current
+    if (session === null) {
+      const offscreen = canvas.transferControlToOffscreen()
+      const worker = new Worker(new URL('./emulator/emulatorWorker.ts', import.meta.url), { type: 'module' })
+      const sab = new SharedArrayBuffer(4)
+      session = {
+        worker,
+        offscreen,
+        inputSab: sab,
+        inputBridge: new InputBridge(new Int32Array(sab)),
+        romStarted: false,
+      }
+      sessionRef.current = session
+    }
+    const { worker: emulatorWorker, offscreen, inputSab } = session
 
     const handleMessage = (event: MessageEvent<EmulatorWorkerOutbound>) => {
       const message = event.data
@@ -102,25 +154,36 @@ export function EmulatorScreen() {
     }
 
     // Set eagerly (not once `'status'` confirms the ROM booted): `worker`
-    // only needs to exist for `AudioTestTone`'s button to work, and
+    // only needs to exist for `AudioOutput`'s button to work, and
     // `startAudio`'s message queue on the Worker side (see
     // `emulatorWorker.ts`) already covers a click racing the boot sequence.
     setWorker(emulatorWorker)
 
-    void (async () => {
+    // Guarded because a StrictMode remount re-runs this effect against a
+    // Worker that already has the ROM: sending `'start'` twice would
+    // transfer an already-detached `OffscreenCanvas` and throw.
+    if (!session.romStarted) {
+      session.romStarted = true
+      void (async () => {
       try {
         const romResponse = await fetch(demoRomUrl)
         if (!romResponse.ok) {
           throw new Error(`Failed to fetch demo ROM: HTTP ${romResponse.status}`)
         }
         const romBytes = await romResponse.arrayBuffer()
-        if (cancelled) return
+        // Not an effect-scoped `cancelled` flag: a StrictMode unmount runs
+        // this effect's cleanup while the session it started deliberately
+        // survives, and aborting here would leave that surviving session
+        // with a Worker that never receives its ROM. The question that
+        // actually matters is whether *this session* is still the live
+        // one, which only a real teardown changes.
+        if (sessionRef.current !== session) return
         emulatorWorker.postMessage(
           { type: 'start', canvas: offscreen, romBytes, inputSab, preferredRenderer: preferredRendererFromQuery() },
           [offscreen, romBytes],
         )
       } catch (err: unknown) {
-        if (cancelled) return
+        if (sessionRef.current !== session) return
         // `RomLoadError` can't actually reach here (loading now happens
         // inside the Worker, which reports it as a plain `'status'`
         // message), but a fetch failure is exactly as much "the emulator
@@ -128,14 +191,25 @@ export function EmulatorScreen() {
         const message = err instanceof Error ? err.message : String(err)
         setStatus({ kind: 'error', message })
       }
-    })()
+      })()
+    }
 
     return () => {
-      cancelled = true
-      delete window.__frameDebug__
       emulatorWorker.removeEventListener('message', handleMessage)
-      inputBridge.dispose()
-      emulatorWorker.terminate()
+      // Deferred, not immediate. StrictMode's unmount/remount pair runs
+      // synchronously within one tick, so a timeout scheduled here is
+      // cancelled by the remount above before it can fire -- while a real
+      // unmount lets it through and tears the session down for good. The
+      // Worker, the transferred canvas and the keyboard listeners all
+      // survive the fake unmount, which is precisely what makes the
+      // remount able to reuse them.
+      teardownTimerRef.current = window.setTimeout(() => {
+        teardownTimerRef.current = null
+        sessionRef.current = null
+        delete window.__frameDebug__
+        session.inputBridge.dispose()
+        session.worker.terminate()
+      }, 0)
     }
   }, [])
 
@@ -163,7 +237,7 @@ export function EmulatorScreen() {
           renderer: {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
         </p>
       )}
-      <AudioTestTone worker={worker} />
+      <AudioOutput worker={worker} />
     </>
   )
 }

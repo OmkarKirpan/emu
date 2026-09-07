@@ -5,6 +5,12 @@ type Status = { kind: 'idle' } | { kind: 'starting' } | { kind: 'running' } | { 
 interface DebugInfo {
   fill: number
   underrunCount: number
+  /** Peak magnitude of the samples most recently written to the ring, and
+   * their RMS -- how `e2e/audio.spec.ts` tells real audio from a pipeline
+   * that is dutifully moving silence. See `emulatorWorker.ts`'s
+   * `measureRing`. */
+  peak: number
+  rms: number
 }
 
 /** Debug/test hook only: `web/e2e/audio.spec.ts` reads this to assert the
@@ -17,7 +23,7 @@ declare global {
   }
 }
 
-interface AudioTestToneProps {
+interface AudioOutputProps {
   /** The already-running `emulatorWorker.ts` instance (or `null` before
    * `EmulatorScreen` has finished spawning it) -- shared with the video
    * path, not a worker of this component's own. See that worker's module
@@ -33,9 +39,10 @@ interface AudioTestToneProps {
  * autoplay-gesture requirement -- audio, unlike `EmulatorScreen`'s video,
  * cannot just start playing on mount), the worklet module, and the
  * handshake that connects them to the shared Worker's wasm instance -- and
- * plays the resulting test tone.
+ * plays the real APU audio (ENG-71, M6) the emulated game itself produces,
+ * not a test tone.
  */
-export function AudioTestTone({ worker }: AudioTestToneProps) {
+export function AudioOutput({ worker }: AudioOutputProps) {
   const [status, setStatus] = useState<Status>({ kind: 'idle' })
   const [debugInfo, setDebugInfo] = useState<DebugInfo | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -74,8 +81,8 @@ export function AudioTestTone({ worker }: AudioTestToneProps) {
         pendingNodeRef.current = null
         if (node && audioContext) node.connect(audioContext.destination)
       } else if (data.type === 'stats') {
-        const { fill, underrunCount } = data as DebugInfo & { type: 'stats' }
-        debugInfoRef.current = { fill, underrunCount }
+        const { fill, underrunCount, peak, rms } = data as DebugInfo & { type: 'stats' }
+        debugInfoRef.current = { fill, underrunCount, peak, rms }
         setDebugInfo(debugInfoRef.current)
       }
     }
@@ -91,10 +98,10 @@ export function AudioTestTone({ worker }: AudioTestToneProps) {
       try {
         const audioContext = new AudioContext()
         audioContextRef.current = audioContext
-        await audioContext.audioWorklet.addModule(new URL('./testToneProcessor.js', import.meta.url))
+        await audioContext.audioWorklet.addModule(new URL('./audioRingProcessor.js', import.meta.url))
         await audioContext.resume()
 
-        const node = new AudioWorkletNode(audioContext, 'test-tone-processor', {
+        const node = new AudioWorkletNode(audioContext, 'audio-ring-processor', {
           numberOfInputs: 0,
           numberOfOutputs: 1,
           outputChannelCount: [1],
@@ -130,14 +137,15 @@ export function AudioTestTone({ worker }: AudioTestToneProps) {
   }, [worker, status.kind])
 
   return (
-    <div className="audio-test-tone">
+    <div className="audio-output">
       <button type="button" onClick={start} disabled={!worker || status.kind === 'starting' || status.kind === 'running'}>
-        {status.kind === 'running' ? 'Test tone playing' : 'Enable test tone'}
+        {status.kind === 'running' ? 'Audio playing' : 'Enable audio'}
       </button>
       {status.kind === 'error' && <p className="audio-error">{status.message}</p>}
       {status.kind === 'running' && debugInfo && (
         <p className="audio-debug">
-          ring fill: {debugInfo.fill} samples · underruns: {debugInfo.underrunCount}
+          ring fill: {debugInfo.fill} samples · underruns: {debugInfo.underrunCount} · peak:{' '}
+          {debugInfo.peak.toFixed(3)}
         </p>
       )}
     </div>

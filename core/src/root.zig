@@ -3,6 +3,7 @@ pub const mapper = @import("mapper.zig");
 pub const bus = @import("bus.zig");
 pub const cpu = @import("cpu.zig");
 pub const ppu = @import("ppu.zig");
+pub const apu = @import("apu.zig");
 pub const controller = @import("controller.zig");
 pub const palette = @import("palette.zig");
 pub const machine = @import("machine.zig");
@@ -21,6 +22,7 @@ pub const Ppu = ppu.Ppu;
 pub const Ctrl = ppu.Ctrl;
 pub const Mask = ppu.Mask;
 pub const Status = ppu.Status;
+pub const Apu = apu.Apu;
 pub const Controller = controller.Controller;
 pub const Machine = machine.Machine;
 
@@ -43,20 +45,24 @@ test {
     _ = bus;
     _ = cpu;
     _ = ppu;
+    _ = apu;
     _ = controller;
     _ = palette;
-    // Wasm-only subsystem (ENG-62, M5), but its ring-buffer/DRC logic is
-    // plain Zig with no wasm-specific codegen -- reachable only from this
-    // test block (not the `pub const` graph above) so it's exercised
-    // natively without becoming part of this file's public library surface.
-    _ = @import("audio_ring.zig");
+    // `audio_ring.zig` is deliberately absent here: it was reachable only
+    // from this block while it was a wasm-only subsystem (ENG-62, M5), but
+    // as of M6 `apu` imports it directly (every `Apu.tick` pushes a sample
+    // into the ring), so it now arrives through the `pub const` graph above
+    // like any other shared module. See
+    // `docs/adr/0002-apu-mixing-and-filtering.md`.
     // Native-only: pulls in the vendored nestest/ppu_vbl_nmi/sprite fixtures
     // via anonymous imports declared in build.zig. Deliberately reachable
     // only from this test block so `zig build wasm` never has to embed the
     // vendored test-ROM data.
+    _ = @import("apu_mixer_test.zig");
     _ = @import("nestest_test.zig");
     _ = @import("ppu_vbl_nmi_test.zig");
     _ = @import("ppu_background_test.zig");
     _ = @import("ppu_sprites_test.zig");
     _ = @import("nrom_sprite_input_test.zig");
+    _ = @import("apu_test.zig");
 }

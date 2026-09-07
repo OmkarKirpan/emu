@@ -324,6 +324,7 @@ pub const Cpu = struct {
         self.pollNmi();
         self.bus.ppu.tick(&self.bus.mapper);
         self.bus.ppu.tick(&self.bus.mapper);
+        self.bus.apu.tick(&self.bus.mapper);
     }
 
     /// Re-latch the CPU's edge-triggered NMI input from the PPU's current
@@ -468,11 +469,11 @@ pub const Cpu = struct {
     }
 
     /// The IRQ line as the CPU sees it: the wire-OR of every IRQ source on the
-    /// bus. Today that is the CPU's own input plus the cartridge's — NROM
-    /// never asserts, but MMC3's scanline IRQ (M7) will, and this is the only
-    /// place that needs to change.
+    /// bus. That's the CPU's own input, the cartridge's (NROM never asserts,
+    /// but MMC3's scanline IRQ (M7) will), and the APU's frame/DMC IRQs
+    /// (M6, ENG-71).
     fn irqAsserted(self: *const Cpu) bool {
-        return self.irq_line or self.bus.mapper.irqPending();
+        return self.irq_line or self.bus.mapper.irqPending() or self.bus.apu.irqPending();
     }
 
     const InterruptKind = enum { nmi, irq };

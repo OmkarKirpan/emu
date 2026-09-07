@@ -18,6 +18,16 @@ OAMDMA    = $4014
 JOY1      = $4016
 JOY2      = $4017
 
+; APU (ENG-71, M6). $4017 is the frame counter on write and controller
+; port 2 on read -- the JOY2 equate above names the same address for its
+; read side; this one names the write side, which is what the APU sees.
+APUPULSE1 = $4000
+APUSWEEP1 = $4001
+APUTIMER1 = $4002
+APULEN1   = $4003
+APUSTATUS = $4015
+APUFRAME  = $4017
+
 SPRITE_X = $10
 SPRITE_Y = $11
 
@@ -79,6 +89,25 @@ reset:
   sta PPUADDR
   lda #$21
   sta PPUDATA
+
+  ; --- APU: a continuous pulse-1 tone (ENG-71, M6) ---------------------
+  ; M6 needs a ROM that actually makes sound: this fixture drove the PPU
+  ; and controllers but never wrote an APU register, so the whole audio
+  ; pipeline (mixer -> filters -> ring -> worklet) carried nothing but
+  ; silence end to end and no test downstream of the core could tell
+  ; correct audio from none at all.
+  lda #$01
+  sta APUSTATUS   ; enable pulse 1 (only)
+  lda #$40
+  sta APUFRAME    ; 4-step sequence, frame IRQ inhibited
+  lda #$BF        ; duty 2 (50%), length halted, constant volume, volume 15
+  sta APUPULSE1
+  lda #$00
+  sta APUSWEEP1   ; sweep disabled -- the period below must stay put
+  lda #$FD
+  sta APUTIMER1   ; timer low
+  lda #$09        ; timer high = 1 (period $1FD, ~219Hz), length index 1
+  sta APULEN1     ; length is loaded but halted above, so the tone holds
 
 @vwait2:
   bit PPUSTATUS
@@ -148,6 +177,14 @@ notright:
   sta $0203
   lda SPRITE_Y
   sta $0200
+
+  ; Pitch tracks the sprite's Y position, so up/down is audible as well as
+  ; visible. Only the timer's low byte is rewritten: touching $4003 would
+  ; restart the duty sequencer every frame and buzz. The high bits stay 1,
+  ; so the period stays in $100-$1FF -- never below the 8 that would mute
+  ; the channel, and never high enough to leave the audible band.
+  lda SPRITE_Y
+  sta APUTIMER1
 
   pla
   tay

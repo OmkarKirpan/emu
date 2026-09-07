@@ -25,10 +25,17 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   artifact (`zig build wasm`) — exporting a small, explicit ABI (an
   implicit global-singleton `Machine`, free functions, `i32` status codes
   in place of exceptions). Wasm-only concerns (the `alloc`/`free` staging
-  surface, the palette→RGBA8 resolve, the audio ring buffer) live in
-  `wasm.zig` and must never leak into `root.zig`; native-only concerns
-  (`Cpu.trace`, the vendored-ROM test suite) must never leak into
-  `wasm.zig`. Both share one implementation, not one entry point.
+  surface, the palette→RGBA8 resolve) live in `wasm.zig` and must never
+  leak into `root.zig`; native-only concerns (`Cpu.trace`, the
+  vendored-ROM test suite) must never leak into `wasm.zig`. Both share one
+  implementation, not one entry point. **The audio ring buffer
+  (`audio_ring.zig`) used to sit on the wasm-only side of that line; as of
+  M6 it does not.** `Apu` is a shared subsystem ticked from `Cpu.tick`
+  like `Ppu`, and it writes finished samples into the ring every CPU
+  cycle, so the ring is part of the shared graph and runs during native
+  tests too (where nothing drains it). Only its pointer-exposing exports
+  (`get_audio_ring_ptr` and friends) stay wasm-only. See
+  `docs/adr/0002-apu-mixing-and-filtering.md`.
 - **`web/`** — the host app. `src/wasm/core.ts` wraps `wasm.zig`'s raw
   exports in a typed, memory-safety-aware `NesCore` class (framebuffer
   views go stale across `memory.grow`; every fallible call maps its
@@ -44,12 +51,14 @@ A cycle-accurate NES emulator core written in Zig, compiled to
 
 ## Current state (see ENG-63's roadmap for what "M*" means)
 
-M0–M4 done: repo scaffolding, CPU, PPU (background + sprites), input, and
-a single-threaded wasm host (`EmulatorScreen.tsx`: plain `<canvas>`,
-`putImageData` on a wall-clock-paced `requestAnimationFrame` loop,
-keyboard input). M5 (ENG-70) — migrating to the full threaded pipeline —
-is in progress; see `docs/adr/0001-audio-playback-no-howler.md` for the
-first piece of it to reach code.
+M0–M6 done: repo scaffolding, CPU, PPU (background + sprites), input, the
+full threaded pipeline (Worker + SharedArrayBuffer + WebGPU/Canvas2D +
+AudioWorklet), and now the APU (all 5 channels, frame sequencer, mixer +
+RC filter cascade, real game audio replacing M5's test tone). M7 (staged
+mappers, MMC1 first) is next; see `docs/adr/0001-audio-playback-no-howler.md`
+for the threaded-audio pipeline decision and
+`docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter decisions
+and the deferred DMC-DMA-stealing gap.
 
 ## Conventions worth knowing before touching either side
 

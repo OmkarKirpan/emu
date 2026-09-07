@@ -5,7 +5,7 @@
  * `i32` fields, each pinned to its own `CACHE_LINE_BYTES`-byte line so the
  * producer's and consumer's writes never false-share a cache line.
  *
- * `testToneProcessor.js` -- the actual consumer -- can't import this: it
+ * `audioRingProcessor.js` -- the actual consumer -- can't import this: it
  * runs as an `AudioWorkletProcessor` module with no bundler transform
  * applied (see that file's own module comment for why it's plain JS), so it
  * hardcodes its own literal copy instead, cross-referenced by comment back
@@ -28,7 +28,7 @@ export const CONTROL_INT32_LENGTH = INT32S_PER_LINE * 3
  * decided on.
  *
  * The third copy of this formula, unavoidably: `audio_ring.zig`'s
- * `targetFill` is the producer's, `testToneProcessor.js` has the
+ * `targetFill` is the producer's, `audioRingProcessor.js` has the
  * consumer's (it can't import, see above), and this is for the JS-side
  * code that *can* import it.
  */
