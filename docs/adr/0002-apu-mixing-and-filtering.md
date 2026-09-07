@@ -32,9 +32,26 @@ CPU rate (1,789,773 Hz) before `audio_ring.zig`'s decimation -- high-pass
 90 Hz, high-pass 440 Hz, low-pass 14 kHz. This is the documented NTSC NES
 hardware filter chain (the Famicom's differs -- a single 37 Hz high-pass --
 but this project targets NTSC throughout, matching every timing constant
-already in `cpu.zig`/`ppu.zig`). The 14 kHz low-pass doubles as anti-
-aliasing ahead of decimation to a ~44.1-48 kHz device rate, which is well
-above its cutoff.
+already in `cpu.zig`/`ppu.zig`). Its job is *tone*: reproducing what the
+console's own analog output stage does to the signal.
+
+The 90 Hz and 440 Hz high-passes also do real structural work, not just
+tonal shaping. The mixer's output is unipolar (0.0-1.0), and the triangle
+channel's DAC holds its last sequencer level whenever its counters stop it
+-- so a ROM that never touches the triangle still parks a constant ~0.246
+on the mixer forever. The high-passes are what turn that into the centred,
++-1.0-normalized signal ENG-62 specifies the ring carries.
+
+**Anti-aliasing is a separate mechanism from that cascade**, and an earlier
+draft of this ADR wrongly claimed the 14 kHz low-pass "doubles as"
+anti-aliasing. It does not: one pole is only ~6 dB down at 24 kHz, so
+picking one raw sample in ~37 after it would fold the square waves'
+harmonics straight back into the audible band. `audio_ring.pushSample`
+therefore emits the **mean of every raw sample an output sample spans**
+(integrate-and-dump) rather than the one that happened to land on the
+boundary. At ~37 CPU cycles per output sample that is a 37-tap box filter
+whose nulls sit on multiples of the output rate -- cheap, and the actual
+reason the decimation does not alias.
 
 **DMC DMA stealing: not modeled.** Real hardware stalls the CPU 1-4 cycles
 per DMC sample fetch -- `Apu`'s `Dmc.tickTimer` instead reads straight
