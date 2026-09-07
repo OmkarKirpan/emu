@@ -63,7 +63,10 @@ pub const Nrom = struct {
         _ = value;
     }
 
-    pub fn chrRead(self: *const Nrom, addr: u16) u8 {
+    // `self` is `*Nrom`, not `*const Nrom`, even though this variant never
+    // mutates anything -- see `Mapper.chrRead`'s doc comment for why the
+    // interface-wide signature had to widen for M7d's MMC3.
+    pub fn chrRead(self: *Nrom, addr: u16) u8 {
         return self.chr[addr];
     }
 
@@ -139,7 +142,7 @@ pub const TestStub = struct {
         self.write_count += 1;
     }
 
-    pub fn chrRead(self: *const TestStub, addr: u16) u8 {
+    pub fn chrRead(self: *TestStub, addr: u16) u8 {
         _ = self;
         _ = addr;
         return 0;
@@ -399,7 +402,7 @@ pub const Mmc1 = struct {
         return raw % total;
     }
 
-    pub fn chrRead(self: *const Mmc1, addr: u16) u8 {
+    pub fn chrRead(self: *Mmc1, addr: u16) u8 {
         if (self.chrIsRam()) return self.chr_ram[self.chrOffset(addr)];
         return self.chr_rom[self.chrOffset(addr)];
     }
@@ -640,12 +643,476 @@ test "Mmc1 ignores the second write of a read-modify-write" {
     try testing.expectEqual(plain.prgRead(0x8000), rmw.prgRead(0x8000));
 }
 
-
 test "Mmc1 reports no IRQ" {
     var prg = taggedPrg(2);
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
     try testing.expect(!m.irqPending());
     m.irqAcknowledge(); // must not panic
+}
+
+/// MMC3 (mapper 4): the first cartridge here with an IRQ that actually
+/// fires, and the reason `Mapper.chrRead` had to become mutable. See
+/// `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`.
+///
+/// **Registers**, selected by address parity rather than MMC1's serial
+/// shift protocol -- every write here lands immediately, so unlike `Mmc1`
+/// there is no read-modify-write rule to drop and no cycle-spacing
+/// requirement on the register writes themselves (the IRQ counter's A12
+/// clocking is a different matter -- see below):
+///
+///     $8000, even  bank select  [7] CHR A12 invert  [6] PRG mode  [2:0] target register
+///     $8001, odd   bank data    -> `bank_data[target register]`
+///     $A000, even  mirroring    [0] 0=vertical 1=horizontal -- **opposite polarity from MMC1**
+///     $A001, odd   PRG-RAM protect -- **not implemented, see below**
+///     $C000, even  IRQ latch    reload value for the scanline counter
+///     $C001, odd   IRQ reload   force a reload at the next qualifying A12 rise
+///     $E000, even  IRQ disable  + acknowledges any pending IRQ
+///     $E001, odd   IRQ enable
+///
+/// **Bank data** (`R0`-`R7`, `bank_data[0..8]`) means different things by
+/// index: `R0`/`R1` are 2KB CHR banks (their low bit is ignored -- the
+/// register can only select an even 1KB unit), `R2`-`R5` are 1KB CHR banks,
+/// `R6`/`R7` are 8KB PRG banks. Which 8KB PRG window and which CHR range
+/// each register drives depends on the bank-select mode/invert bits — see
+/// `prgOffset`/`chrOffset`.
+///
+/// **PRG-RAM protect ($A001) is deliberately not implemented**, on the same
+/// footing as MMC1's PRG-RAM disable bit (ENG-79): `Bus` maps $6000-$7FFF as
+/// unconditional WRAM, and honoring per-cartridge write protection means
+/// routing that window through `Mapper`, which is out of scope here. The
+/// write itself is accepted and otherwise ignored rather than causing a
+/// crash; holy-mapperel's WRAM digit reports this the same way it reports
+/// MMC1's gap. See `core/tests/roms/holy_mapperel/ATTRIBUTION.md`.
+///
+/// **The scanline IRQ counts qualifying rises of PPU address line A12**
+/// (bit 12 of the CHR address, i.e. whether the fetch targets $0000-$0FFF or
+/// $1000-$1FFF), not scanlines directly -- background and sprite pattern
+/// fetches alternate which half of pattern space they read roughly once per
+/// scanline, which is what makes that alternation a usable scanline clock at
+/// all. `observeA12`, called from both `chrRead` and `chrWrite`, is the
+/// entire mechanism: no separate per-PPU-cycle hook was added (see the ADR).
+pub const Mmc3 = struct {
+    prg_rom: []const u8,
+    /// Empty on a CHR-RAM board, in which case `chr_ram` is live instead --
+    /// same convention as `Mmc1`.
+    chr_rom: []const u8,
+    chr_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
+
+    /// R0-R7. Raw as written; `prgOffset`/`chrOffset` apply the low-bit mask
+    /// for R0/R1 and the modulo-by-bank-count wrap.
+    bank_data: [8]u8 = [_]u8{0} ** 8,
+    /// The last value written to $8000: bit 7 CHR A12 invert, bit 6 PRG
+    /// mode, bits 2:0 select which `bank_data` slot $8001 writes to.
+    bank_select: u8 = 0,
+    /// $A000 bit 0. Power-on state is unspecified on real hardware; `false`
+    /// (vertical) is an arbitrary but harmless choice -- every game sets
+    /// this before turning rendering on, and the vendored conformance ROMs
+    /// (`mmc3_test.zig`) set it explicitly as part of mapper detection.
+    mirror_horizontal: bool = false,
+
+    /// Reload value for the scanline counter, written through $C000.
+    irq_latch: u8 = 0,
+    /// The scanline counter itself.
+    irq_counter: u8 = 0,
+    /// Set by a $C001 write; forces a reload (regardless of the counter's
+    /// current value) on the next qualifying A12 rise, then clears itself.
+    irq_reload_pending: bool = false,
+    irq_enabled: bool = false,
+    /// The cartridge IRQ line, wire-ORed into the CPU's /IRQ input by
+    /// `Cpu.irqAsserted` -- same protocol `TestStub` exists to exercise.
+    irq_pending: bool = false,
+
+    /// The PPU address line this cartridge actually watches. Reflects the
+    /// most recent CHR address's bit 12, updated by `observeA12` from both
+    /// `chrRead` and `chrWrite` -- real hardware doesn't care whether the
+    /// PPU is reading or writing, only what address it drove.
+    a12: bool = false,
+    /// How many `tick()` calls (the CPU/M2-cycle chokepoint ADR 0003 added
+    /// for MMC1's RMW rule) have elapsed since A12 was last observed to go
+    /// low. See `observeA12` for how this implements the real filter.
+    a12_low_ticks: u32 = 0,
+
+    /// Real hardware requires A12 to have been low for roughly 3 PPU cycles
+    /// (an M2-based filter -- "M2" is the 2A03's own clock, one CPU cycle,
+    /// which is 3 PPU dots at NTSC's fixed ratio) before a rise counts, so
+    /// that a handful of closely-spaced pattern fetches that all land on the
+    /// same half of CHR space don't each look like their own scanline.
+    /// `tick()` only gives this mapper CPU-cycle resolution -- coarser than
+    /// the spec's ~3-PPU-cycle number, but it is the finest clock the
+    /// interface exposes today, and 1 is the smallest interval it can even
+    /// represent: requiring "held low across at least one `tick()`" rejects
+    /// exactly the case the real filter targets in this emulator's own
+    /// fetch model -- multiple pattern reads issued within a single
+    /// `Ppu.tick`/`Cpu.tick` call (e.g. `fetchSpriteUnits` fetching several
+    /// 8x16 sprites from alternating pattern tables in one pass) with no
+    /// `tick()` call between them.
+    const a12_filter_min_ticks: u32 = 1;
+
+    pub fn init(prg_rom: []const u8, chr_rom: []const u8) Mmc3 {
+        return .{ .prg_rom = prg_rom, .chr_rom = chr_rom };
+    }
+
+    fn chrIsRam(self: *const Mmc3) bool {
+        return self.chr_rom.len == 0;
+    }
+
+    fn chrInvert(self: *const Mmc3) bool {
+        return (self.bank_select & 0x80) != 0;
+    }
+
+    fn prgModeB(self: *const Mmc3) bool {
+        return (self.bank_select & 0x40) != 0;
+    }
+
+    fn prgBankCount(self: *const Mmc3) usize {
+        return @max(self.prg_rom.len / 0x2000, 1);
+    }
+
+    /// Which 8KB PRG bank shows at each of the four $8000-$FFFF windows.
+    /// `window`: 0 = $8000, 1 = $A000, 2 = $C000, 3 = $E000.
+    fn prgBank(self: *const Mmc3, window: u2) usize {
+        const total = self.prgBankCount();
+        const second_last = if (total >= 2) total - 2 else 0;
+        const last = total - 1;
+        const r6 = self.bank_data[6] % total;
+        const r7 = self.bank_data[7] % total;
+        return switch (window) {
+            // $A000 is always R7, and $E000 is always the last bank,
+            // regardless of PRG mode -- only $8000 and $C000 trade places.
+            0 => if (self.prgModeB()) second_last else r6,
+            1 => r7,
+            2 => if (self.prgModeB()) r6 else second_last,
+            3 => last,
+        };
+    }
+
+    pub fn prgRead(self: *const Mmc3, addr: u16) u8 {
+        const window: u2 = @intCast((addr >> 13) & 0x03);
+        const bank = self.prgBank(window);
+        const offset = bank * 0x2000 + (addr & 0x1FFF);
+        return self.prg_rom[offset % self.prg_rom.len];
+    }
+
+    pub fn prgWrite(self: *Mmc3, addr: u16, value: u8) void {
+        const even = (addr & 1) == 0;
+        switch (addr) {
+            0x8000...0x9FFF => if (even) {
+                self.bank_select = value;
+            } else {
+                self.bank_data[self.bank_select & 0x07] = value;
+            },
+            0xA000...0xBFFF => if (even) {
+                self.mirror_horizontal = (value & 0x01) != 0;
+            } else {
+                // $A001, PRG-RAM protect: accepted and otherwise ignored.
+                // See the type doc comment -- write protection for
+                // $6000-$7FFF is out of scope (ENG-79's MMC1 gap, same
+                // shape here).
+            },
+            0xC000...0xDFFF => if (even) {
+                self.irq_latch = value;
+            } else {
+                self.irq_reload_pending = true;
+            },
+            else => if (even) {
+                self.irq_enabled = false;
+                self.irq_pending = false; // $E000 also acknowledges
+            } else {
+                self.irq_enabled = true;
+            },
+        }
+    }
+
+    fn chrBankCount1k(self: *const Mmc3) usize {
+        const bytes = if (self.chrIsRam()) self.chr_ram.len else self.chr_rom.len;
+        return @max(bytes / 0x400, 1);
+    }
+
+    /// Offset of `addr` (0x0000-0x1FFF) within CHR memory, after banking.
+    ///
+    /// Non-inverted, the 8KB window is six independent 1KB slots: $0000 and
+    /// $0800 are each the base of a 2KB bank (`R0`, `R1` -- their register's
+    /// low bit is forced off, since a 2KB bank can only start on an even 1KB
+    /// unit), and $1000/$1400/$1800/$1C00 are 1KB banks `R2`-`R5`. CHR A12
+    /// invert (bank-select bit 7) swaps which half holds the 2KB pair and
+    /// which holds the four 1KB banks -- implemented by flipping address bit
+    /// 12 before classifying it, since that bit is exactly the half select.
+    fn chrOffset(self: *const Mmc3, addr: u16) usize {
+        const total1k = self.chrBankCount1k();
+        const a: u16 = if (self.chrInvert()) addr ^ 0x1000 else addr;
+        const slot: struct { reg: u8, within: u16 } = switch ((a >> 10) & 0x7) {
+            0, 1 => .{ .reg = self.bank_data[0] & 0xFE, .within = a & 0x7FF },
+            2, 3 => .{ .reg = self.bank_data[1] & 0xFE, .within = a & 0x7FF },
+            4 => .{ .reg = self.bank_data[2], .within = a & 0x3FF },
+            5 => .{ .reg = self.bank_data[3], .within = a & 0x3FF },
+            6 => .{ .reg = self.bank_data[4], .within = a & 0x3FF },
+            else => .{ .reg = self.bank_data[5], .within = a & 0x3FF },
+        };
+        return (@as(usize, slot.reg) * 0x400 + slot.within) % (total1k * 0x400);
+    }
+
+    pub fn chrRead(self: *Mmc3, addr: u16) u8 {
+        self.observeA12(addr);
+        if (self.chrIsRam()) return self.chr_ram[self.chrOffset(addr)];
+        return self.chr_rom[self.chrOffset(addr)];
+    }
+
+    pub fn chrWrite(self: *Mmc3, addr: u16, value: u8) void {
+        self.observeA12(addr);
+        if (self.chrIsRam()) self.chr_ram[self.chrOffset(addr)] = value;
+    }
+
+    /// Update the A12 edge/filter state from a CHR address, clocking the
+    /// scanline counter on a qualifying rise. See the type doc comment and
+    /// `a12_filter_min_ticks` for the filter itself.
+    fn observeA12(self: *Mmc3, addr: u16) void {
+        const level = (addr & 0x1000) != 0;
+        if (level and !self.a12 and self.a12_low_ticks >= a12_filter_min_ticks) {
+            self.clockIrqCounter();
+        }
+        if (!level and self.a12) self.a12_low_ticks = 0; // just went low: (re)start the timer
+        self.a12 = level;
+    }
+
+    /// One qualifying A12 rise. Mainstream MMC3 behavior (matched here, and
+    /// by most emulators and games): the IRQ fires whenever the counter
+    /// value *after* this clock -- whether it got there by reload or by
+    /// decrement -- is zero and IRQs are enabled, including a reload whose
+    /// latch value is itself zero. A documented minority of early MMC3
+    /// silicon only fires on decrement, never on a reload landing on zero;
+    /// that revision is not modeled.
+    fn clockIrqCounter(self: *Mmc3) void {
+        if (self.irq_counter == 0 or self.irq_reload_pending) {
+            self.irq_counter = self.irq_latch;
+            self.irq_reload_pending = false;
+        } else {
+            self.irq_counter -= 1;
+        }
+        if (self.irq_counter == 0 and self.irq_enabled) self.irq_pending = true;
+    }
+
+    pub fn irqPending(self: *const Mmc3) bool {
+        return self.irq_pending;
+    }
+
+    pub fn irqAcknowledge(self: *Mmc3) void {
+        self.irq_pending = false;
+    }
+
+    pub fn mirroring(self: *const Mmc3) Mirroring {
+        // Four-screen boards wire mirroring in hardware and ignore this bit
+        // entirely; not modeled here (no vendored four-screen MMC3 ROM).
+        return if (self.mirror_horizontal) .horizontal else .vertical;
+    }
+
+    pub fn tick(self: *Mmc3) void {
+        if (!self.a12) self.a12_low_ticks +|= 1;
+    }
+};
+
+// ------------------------------------------------------------ MMC3 tests
+
+/// PRG where byte 0 of each 8KB bank is that bank's own number -- MMC3's
+/// banking granularity, distinct from `taggedPrg`'s 16KB (MMC1's).
+fn taggedPrg8k(comptime banks: usize) [banks * 0x2000]u8 {
+    var prg = [_]u8{0} ** (banks * 0x2000);
+    for (0..banks) |b| prg[b * 0x2000] = @intCast(b);
+    return prg;
+}
+
+/// CHR where byte 0 of each 1KB bank is that bank's own number -- MMC3's
+/// finest CHR banking granularity.
+fn taggedChr1k(comptime banks: usize) [banks * 0x400]u8 {
+    var chr = [_]u8{0} ** (banks * 0x400);
+    for (0..banks) |b| chr[b * 0x400] = @intCast(b);
+    return chr;
+}
+
+/// Drive one qualifying A12 rise the way `Ppu` actually does: a CHR read
+/// below $1000 (A12 low), held low across at least one `tick()` (the
+/// interval `observeA12`'s filter measures), then a CHR read at/above $1000
+/// (A12 rises already having been low long enough).
+fn mmc3ClockA12(m: *Mapper) void {
+    _ = m.chrRead(0x0000);
+    m.tick();
+    m.tick();
+    _ = m.chrRead(0x1000);
+}
+
+test "Mmc3 bank-data writes route to whichever register bank-select last chose, for all 8 registers" {
+    var prg = taggedPrg8k(8);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    for (0..8) |r| {
+        m.prgWrite(0x8000, @intCast(r)); // select register r
+        m.prgWrite(0x8001, @intCast(0x10 + r)); // a distinct value per register
+    }
+    for (0..8) |r| {
+        try testing.expectEqual(@as(u8, @intCast(0x10 + r)), m.mmc3.bank_data[r]);
+    }
+}
+
+test "Mmc3 PRG mode 0: $8000 switches via R6, $C000 fixed to the second-to-last bank, $E000 always the last" {
+    var prg = taggedPrg8k(8); // banks 0-7; second-to-last = 6, last = 7
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0x8000, 0x06); // select R6, mode bit (6) clear
+    m.prgWrite(0x8001, 3);
+    try testing.expectEqual(@as(u8, 3), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 6), m.prgRead(0xC000));
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0xE000));
+}
+
+test "Mmc3 PRG mode 1 (bank-select bit 6) swaps the fixed and switchable halves" {
+    var prg = taggedPrg8k(8);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0x8000, 0x46); // select R6, mode bit 6 set
+    m.prgWrite(0x8001, 3);
+    try testing.expectEqual(@as(u8, 6), m.prgRead(0x8000)); // now fixed second-to-last
+    try testing.expectEqual(@as(u8, 3), m.prgRead(0xC000)); // now switchable via R6
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0xE000)); // unaffected by PRG mode
+}
+
+test "Mmc3 $A000 (R7) is always the switchable window regardless of PRG mode" {
+    var prg = taggedPrg8k(8);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0x8000, 0x07);
+    m.prgWrite(0x8001, 5);
+    try testing.expectEqual(@as(u8, 5), m.prgRead(0xA000));
+    m.prgWrite(0x8000, 0x47); // flip PRG mode: R7/$A000 is unaffected either way
+    try testing.expectEqual(@as(u8, 5), m.prgRead(0xA000));
+}
+
+test "Mmc3 CHR mode 0 (bank-select bit 7 clear): 2KB banks at $0000, 1KB banks at $1000" {
+    var chr = taggedChr1k(16);
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &chr) };
+    m.prgWrite(0x8000, 0);
+    m.prgWrite(0x8001, 4); // R0 = 4 -> 2KB @ $0000
+    m.prgWrite(0x8000, 1);
+    m.prgWrite(0x8001, 6); // R1 = 6 -> 2KB @ $0800
+    m.prgWrite(0x8000, 2);
+    m.prgWrite(0x8001, 10); // R2 = 10 -> 1KB @ $1000
+    m.prgWrite(0x8000, 5);
+    m.prgWrite(0x8001, 15); // R5 = 15 -> 1KB @ $1C00
+    try testing.expectEqual(@as(u8, 4), m.chrRead(0x0000));
+    try testing.expectEqual(@as(u8, 6), m.chrRead(0x0800));
+    try testing.expectEqual(@as(u8, 10), m.chrRead(0x1000));
+    try testing.expectEqual(@as(u8, 15), m.chrRead(0x1C00));
+}
+
+test "Mmc3 CHR mode 1 (bank-select bit 7 set) swaps the 2KB/1KB halves" {
+    var chr = taggedChr1k(16);
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &chr) };
+    m.prgWrite(0x8000, 0x80); // select R0, CHR invert set
+    m.prgWrite(0x8001, 4); // R0 = 4, now 2KB @ $1000
+    m.prgWrite(0x8000, 0x82); // select R2, CHR invert set
+    m.prgWrite(0x8001, 10); // R2 = 10, now 1KB @ $0000
+    try testing.expectEqual(@as(u8, 10), m.chrRead(0x0000));
+    try testing.expectEqual(@as(u8, 4), m.chrRead(0x1000));
+}
+
+test "Mmc3 2KB CHR banks (R0/R1) ignore the register's low bit" {
+    var chr = taggedChr1k(8);
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &chr) };
+    m.prgWrite(0x8000, 0);
+    m.prgWrite(0x8001, 5); // odd: the low bit is forced off, selecting bank 4
+    try testing.expectEqual(@as(u8, 4), m.chrRead(0x0000));
+}
+
+test "Mmc3 $A000 bit 0 selects vertical/horizontal mirroring (opposite polarity from MMC1)" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xA000, 0);
+    try testing.expectEqual(Mirroring.vertical, m.mirroring());
+    m.prgWrite(0xA000, 1);
+    try testing.expectEqual(Mirroring.horizontal, m.mirroring());
+}
+
+test "Mmc3 does not count an A12 rise unless the line was held low across a full tick" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 1);
+    m.prgWrite(0xC001, 0);
+    // No `tick()` between the low and high reads -- the filter this is meant
+    // to model (see `Mmc3.a12_filter_min_ticks`) must reject it.
+    _ = m.chrRead(0x0000);
+    _ = m.chrRead(0x1000);
+    try testing.expectEqual(@as(u8, 0), m.mmc3.irq_counter); // never reloaded
+    try testing.expect(!m.irqPending());
+}
+
+test "Mmc3 IRQ counter reloads from the latch on a forced reload, then decrements on each further rise" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 4); // latch = 4
+    m.prgWrite(0xC001, 0); // force reload on the next qualifying rise
+    mmc3ClockA12(&m);
+    try testing.expectEqual(@as(u8, 4), m.mmc3.irq_counter);
+    mmc3ClockA12(&m);
+    try testing.expectEqual(@as(u8, 3), m.mmc3.irq_counter);
+    mmc3ClockA12(&m);
+    mmc3ClockA12(&m);
+    mmc3ClockA12(&m);
+    try testing.expectEqual(@as(u8, 0), m.mmc3.irq_counter);
+}
+
+test "Mmc3 asserts the cartridge IRQ line when the counter reaches zero and IRQs are enabled" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 1); // latch = 1
+    m.prgWrite(0xC001, 0);
+    m.prgWrite(0xE001, 0); // enable
+    mmc3ClockA12(&m); // reload to 1
+    try testing.expect(!m.irqPending());
+    mmc3ClockA12(&m); // decrement to 0
+    try testing.expect(m.irqPending());
+}
+
+test "Mmc3 does not assert the IRQ line while IRQs are disabled, even when the counter reaches zero" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 0); // latch = 0: the reload itself lands on zero
+    m.prgWrite(0xC001, 0);
+    mmc3ClockA12(&m); // would fire immediately if enabled
+    try testing.expect(!m.irqPending());
+}
+
+test "Mmc3 $E000 disables IRQs and acknowledges a pending one; $E001 re-enables" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 0);
+    m.prgWrite(0xC001, 0);
+    m.prgWrite(0xE001, 0); // enable
+    mmc3ClockA12(&m); // reload to latch 0 -> fires immediately
+    try testing.expect(m.irqPending());
+
+    m.prgWrite(0xE000, 0); // disable + acknowledge
+    try testing.expect(!m.irqPending());
+
+    mmc3ClockA12(&m); // reload to 0 again, but disabled: no IRQ
+    try testing.expect(!m.irqPending());
+
+    m.prgWrite(0xE001, 0); // re-enable
+    mmc3ClockA12(&m); // reload to 0 again, now enabled: fires
+    try testing.expect(m.irqPending());
+}
+
+test "Mmc3.irqAcknowledge clears a pending IRQ without touching the enable state" {
+    var prg = taggedPrg8k(2);
+    var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    m.prgWrite(0xC000, 0);
+    m.prgWrite(0xC001, 0);
+    m.prgWrite(0xE001, 0);
+    mmc3ClockA12(&m);
+    try testing.expect(m.irqPending());
+    m.irqAcknowledge();
+    try testing.expect(!m.irqPending());
+    // Not re-enabled or re-armed by acknowledge alone: another rise reloads
+    // (latch is still 0) and fires again, exactly as real $E000 behaves
+    // differently from a plain acknowledge-without-disable would.
+    mmc3ClockA12(&m);
+    try testing.expect(m.irqPending());
 }
 
 /// Closed set of NES mappers (see the map's "Out of scope": coverage is
@@ -666,6 +1133,7 @@ test "Mmc1 reports no IRQ" {
 pub const Mapper = union(enum) {
     nrom: Nrom,
     mmc1: Mmc1,
+    mmc3: Mmc3,
     /// Not a cartridge — a test double for the parts of this interface NROM
     /// cannot reach. See `TestStub`.
     test_stub: TestStub,
@@ -682,7 +1150,15 @@ pub const Mapper = union(enum) {
         }
     }
 
-    pub fn chrRead(self: *const Mapper, addr: u16) u8 {
+    /// **`self` is mutable, unlike every other read-side method here.** Every
+    /// CHR fetch already crosses this boundary carrying its address (`Ppu`'s
+    /// nametable/pattern fetches, all of them), which is also the only signal
+    /// MMC3 (M7d) has for PPU address line A12 -- see
+    /// `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`. Counting A12
+    /// rises for the scanline IRQ is unavoidably stateful, so the interface
+    /// widened from `*const Mapper` rather than adding a parallel method.
+    /// `Nrom`/`Mmc1`/`TestStub` take the same wider `self` and ignore it.
+    pub fn chrRead(self: *Mapper, addr: u16) u8 {
         switch (self.*) {
             inline else => |*m| return m.chrRead(addr),
         }

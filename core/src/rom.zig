@@ -5,6 +5,7 @@ const mapper_mod = @import("mapper.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mmc1 = mapper_mod.Mmc1;
+const Mmc3 = mapper_mod.Mmc3;
 
 /// Re-exported from `mapper.zig`, which owns it: the cartridge decides
 /// mirroring at runtime, and this header field is only the power-on value.
@@ -94,6 +95,20 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
             if (rom.chr_rom.len > 0x20000 or rom.chr_rom.len % 0x2000 != 0)
                 return MapperError.InvalidRomGeometry;
             break :blk Mapper{ .mmc1 = Mmc1.init(rom.prg_rom, rom.chr_rom) };
+        },
+        4 => blk: {
+            // MMC3: PRG-ROM in 8KB units (its banking granularity), 16KB to
+            // 512KB. CHR is either CHR-RAM (no CHR-ROM) or CHR-ROM in
+            // 8KB-header-unit multiples up to 256KB -- the largest vendored
+            // holy-mapperel MMC3 ROM. The header's mirroring is ignored, same
+            // as MMC1: MMC3 drives it from its own $A000 register from the
+            // moment the game writes it, and the register's power-on state
+            // is unspecified (see `Mmc3`'s doc comment).
+            if (rom.prg_rom.len < 0x4000 or rom.prg_rom.len > 0x80000 or rom.prg_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len > 0x40000 or rom.chr_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .mmc3 = Mmc3.init(rom.prg_rom, rom.chr_rom) };
         },
         else => MapperError.UnsupportedMapper,
     };
@@ -214,6 +229,44 @@ test "createMapper rejects a ROM with 3 PRG banks (48KB, neither 16 nor 32KB)" {
     const buf = buildMinimalNrom(3, 1);
     const rom = try Rom.load(&buf);
     try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper builds an MMC3 for mapper 4" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x40; // mapper number 4 (MMC3)
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .mmc3);
+}
+
+test "createMapper rejects MMC3 geometry it cannot map" {
+    var too_big = buildMinimalNrom(2, 1);
+    too_big[5] = 33; // 264KB CHR-ROM: past MMC3's 256KB ceiling
+    var padded = [_]u8{0} ** (16 + 2 * 16384 + 33 * 8192);
+    @memcpy(padded[0..16], too_big[0..16]);
+    padded[6] = 0x40;
+    const rom = try Rom.load(&padded);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects an MMC3 ROM with 0 PRG banks" {
+    var buf = buildMinimalNrom(0, 1);
+    buf[6] = 0x40;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper wires an MMC3 ROM's bytes through to the Mapper interface" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x40;
+    buf[16] = 0x11; // first PRG byte
+    buf[16 + 32768] = 0x22; // first CHR byte
+    const rom = try Rom.load(&buf);
+    var m = try createMapper(rom);
+    // Power-on state: PRG mode 0, R6=R7=0 -> $8000 and $A000 both show bank
+    // 0, the first byte of PRG.
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
 }
 
 test "createMapper rejects a ROM with 2 CHR banks (16KB, not 0 or 8KB)" {
