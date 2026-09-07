@@ -2,17 +2,19 @@
 
 ## What these are
 
-Three MMC1 ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing
-test by Damian Yerrick (tepples):
+Four ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing test by
+Damian Yerrick (tepples):
 [`pinobatch/holy-mapperel`](https://github.com/pinobatch/holy-mapperel),
 release **v0.02** (2018-09-29), extracted unmodified from that release's
-`holy-mapperel-bin-0.02.7z` archive.
+`holy-mapperel-bin-0.02.7z` archive — three MMC1 ROMs vendored for M7a
+(ENG-72), one CNROM ROM added for M7c (ENG-74).
 
 | File | Size | Board | What it reaches here |
 |---|---|---|---|
 | `M1_P128K_CR8K.nes` | 131,088 | SNROM | 128KB PRG, 8KB CHR-**RAM** — the common MMC1 shape |
 | `M1_P128K_C128K.nes` | 262,160 | SKROM | 128KB PRG, 128KB CHR-**ROM** — CHR bank switching at maximum size |
 | `M1_P512K_CR8K_S8K.nes` | 524,304 | SUROM | 512KB PRG — the PRG-A18 path, plus 8KB battery-backed WRAM |
+| `M3_P32K_C32K_H.nes` | 65,552 | CNROM | 32KB PRG (fixed), 32KB CHR-**ROM** (switchable, all 4 banks), horizontal mirroring |
 
 ## License: zlib — an actual grant
 
@@ -59,10 +61,10 @@ a conformance suite in the Blargg sense.
 
 ## How they are used
 
-`core/src/mmc1_test.zig` embeds each ROM at build time (anonymous imports
-declared in `core/build.zig`) and runs it through
-`core/src/mapperel_harness.zig`, which differs from the two existing
-harnesses in three ways:
+`core/src/mmc1_test.zig` (MMC1) and `core/src/cnrom_test.zig` (CNROM) each
+embed their ROMs at build time (anonymous imports declared in
+`core/build.zig`) and run them through `core/src/mapperel_harness.zig`,
+which differs from the two existing harnesses in three ways:
 
 - there is no `$6000` status protocol to poll, so it runs to a result screen
   under a cycle ceiling;
@@ -72,10 +74,12 @@ harnesses in three ways:
   `Mapper.mirroring()` rather than assumed to be bank 0 — MMC1 can select
   one-screen-upper, and this ROM writes to mirroring ports on purpose.
 
-Each test asserts the **exact** four-digit code, including the WRAM digit
-that is nonzero because MMC1's PRG-RAM disable bit is deliberately deferred
-(ENG-79). See `mmc1_test.zig` for the per-ROM values and why each is what it
-is.
+Each test asserts the **exact** four-digit code. The MMC1 ROMs' WRAM digit
+is nonzero because MMC1's PRG-RAM disable bit is deliberately deferred
+(ENG-79); the CNROM ROM's full code is `0000` — see `mmc1_test.zig` and
+`cnrom_test.zig` respectively for the per-ROM values and why each is what it
+is, including why CNROM's result stays clean despite the same underlying
+`$6000-$7FFF` WRAM gap the MMC1 ROMs surface.
 
 Native test binary only — `zig build wasm` never sees this data, exactly like
 every other vendored ROM here.
@@ -87,11 +91,11 @@ gh release download v0.02 --repo pinobatch/holy-mapperel
 ```
 
 ```bash
-7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes
+7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes testroms/M3_P32K_C32K_H.nes
 ```
 
-The archive also contains ROMs for mappers 2, 3, and 4 (M7b, M7c, M7d) plus
-many out-of-scope mappers. Each milestone vendors only what it gates on.
+The archive also contains ROMs for mappers 2 and 4 (M7b, M7d) plus many
+out-of-scope mappers. Each milestone vendors only what it gates on.
 
 ## A note on headers
 
