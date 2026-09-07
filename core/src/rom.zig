@@ -5,6 +5,7 @@ const mapper_mod = @import("mapper.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mmc1 = mapper_mod.Mmc1;
+const Cnrom = mapper_mod.Cnrom;
 
 /// Re-exported from `mapper.zig`, which owns it: the cartridge decides
 /// mirroring at runtime, and this header field is only the power-on value.
@@ -94,6 +95,19 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
             if (rom.chr_rom.len > 0x20000 or rom.chr_rom.len % 0x2000 != 0)
                 return MapperError.InvalidRomGeometry;
             break :blk Mapper{ .mmc1 = Mmc1.init(rom.prg_rom, rom.chr_rom) };
+        },
+        3 => blk: {
+            // CNROM: 16KB or 32KB PRG (fixed, exactly like NROM), and 8KB-
+            // 32KB switchable CHR-ROM in 8KB units. CNROM has no CHR-RAM
+            // variant -- switching between CHR-ROM banks is the entire
+            // point of the board -- so unlike NROM's `chr_rom.len == 0`
+            // case, empty CHR is invalid geometry here rather than "use
+            // CHR-RAM".
+            if (rom.prg_rom.len != 0x4000 and rom.prg_rom.len != 0x8000)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len == 0 or rom.chr_rom.len > 0x8000 or rom.chr_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .cnrom = Cnrom.init(rom.prg_rom, rom.chr_rom, rom.header.mirroring) };
         },
         else => MapperError.UnsupportedMapper,
     };
@@ -229,5 +243,49 @@ test "createMapper wires an NROM ROM's bytes through to the Mapper interface" {
     const rom = try Rom.load(&buf);
     var m = try createMapper(rom);
     try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
+}
+
+test "createMapper builds a CNROM for mapper 3" {
+    var buf = buildMinimalNrom(2, 4); // 32KB PRG, 32KB CHR-ROM
+    buf[6] = 0x30; // mapper number 3 (CNROM), implemented as of M7c
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .cnrom);
+}
+
+test "createMapper rejects CNROM geometry with no CHR-ROM at all" {
+    // Unlike NROM, CNROM has no CHR-RAM fallback: switching CHR-ROM banks
+    // is the whole point of the board, so 0 CHR banks is invalid, not "use
+    // CHR-RAM".
+    var buf = buildMinimalNrom(2, 0);
+    buf[6] = 0x30;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects CNROM geometry past the 32KB CHR ceiling" {
+    var too_big = buildMinimalNrom(2, 5); // 40KB CHR-ROM: past CNROM's 32KB (4-bank) ceiling
+    too_big[6] = 0x30;
+    const rom = try Rom.load(&too_big);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a CNROM ROM with 3 PRG banks (48KB, neither 16 nor 32KB)" {
+    var buf = buildMinimalNrom(3, 1);
+    buf[6] = 0x30;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper wires a CNROM ROM's bytes through to the Mapper interface" {
+    var buf = buildMinimalNrom(1, 2); // 16KB PRG, 16KB CHR-ROM (2 banks)
+    buf[6] = 0x30;
+    buf[16] = 0x11; // first PRG byte
+    buf[16 + 16384 + 0x2000] = 0x22; // first byte of CHR bank 1
+    const rom = try Rom.load(&buf);
+    var m = try createMapper(rom);
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    m.prgWrite(0x8000, 1); // select CHR bank 1
     try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
 }
