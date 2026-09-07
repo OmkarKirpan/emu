@@ -433,12 +433,24 @@ pub const Mmc1 = struct {
 
 // ------------------------------------------------------------ MMC1 tests
 
+/// Advance two CPU cycles -- the minimum spacing between two writes the
+/// mapper will both accept, since writes exactly one cycle apart are the
+/// read-modify-write pattern it drops.
+fn m_tick2(m: *Mapper) void {
+    m.tick();
+    m.tick();
+}
+
 /// Write `value` into an MMC1 register the way a real program does: five
 /// writes, LSB first, to any address in the target register's range.
 fn mmc1Write(m: *Mapper, addr: u16, value: u5) void {
     for (0..5) |i| {
-        // Each write is a separate CPU cycle. Without advancing the clock,
-        // the consecutive-write rule would swallow four of the five.
+        // *Two* cycles between writes, not one. A real program stores these
+        // bits with separate instructions, which are at least four cycles
+        // apart; writes exactly one cycle apart are the read-modify-write
+        // pattern the mapper is required to drop, so ticking once here would
+        // make the helper test the opposite of what it means to.
+        m.tick();
         m.tick();
         m.prgWrite(addr, @intCast((value >> @intCast(i)) & 1));
     }
@@ -467,9 +479,11 @@ test "Mmc1 commits a register only on the fifth write" {
     // Four writes of bank 3 (00011): nothing should move yet.
     for (0..4) |i| {
         m.tick();
+        m.tick();
         m.prgWrite(0xE000, @intCast((@as(u8, 3) >> @intCast(i)) & 1));
     }
     try testing.expectEqual(@as(u8, 0), m.prgRead(0x8000));
+    m.tick();
     m.tick();
     m.prgWrite(0xE000, 0);
     try testing.expectEqual(@as(u8, 3), m.prgRead(0x8000));
@@ -481,7 +495,7 @@ test "Mmc1 bit 7 resets the shift register and restores PRG mode 3" {
     mmc1Write(&m, 0x8000, 0b0_00_00); // 32KB PRG mode, single-screen lower
     try testing.expectEqual(Mirroring.single_screen_lower, m.mirroring());
 
-    m.tick();
+    m_tick2(&m); // two cycles on, or the reset write is itself dropped as an RMW
     m.prgWrite(0x8000, 0x80); // reset: control |= $0C
     try testing.expectEqual(@as(u8, 7), m.prgRead(0xC000)); // mode 3 again
     // Mirroring bits are not touched by the reset: only $0C is ORed in.
@@ -601,24 +615,31 @@ test "Mmc1 ignores the second write of a read-modify-write" {
     // The behavior `TestStub`'s doc comment anticipated: an NMOS RMW emits
     // the unmodified value and then the modified one on consecutive cycles,
     // and the hardware latches only the first. Without this, a game that
-    // INCs a mapper register shifts in twice the bits it means to.
+    // INCs a mapper register (Bill & Ted's is the usual example) shifts in
+    // twice the bits it means to.
+    //
+    // Stated as an equivalence, which is what the rule actually claims: five
+    // RMW *pairs* must leave the register exactly where five plain writes
+    // would. If the second write of each pair were taken, ten bits would go
+    // in and the register would commit on the wrong one.
     var prg = taggedPrg(8);
-    var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
 
-    m.tick();
-    m.prgWrite(0xE000, 1); // accepted: one bit in
-    m.prgWrite(0xE000, 1); // same cycle, no tick(): dropped
-    m.tick();
-    m.prgWrite(0xE000, 1); // exactly one cycle later: dropped, as on hardware
-
-    // Four more accepted writes, each two cycles apart, commit bank 7.
-    for (0..4) |_| {
-        m.tick();
-        m.tick();
-        m.prgWrite(0xE000, 1);
+    var rmw = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
+    for (0..5) |_| {
+        m_tick2(&rmw);
+        rmw.prgWrite(0xE000, 1); // the dummy write hardware latches
+        rmw.tick();
+        rmw.prgWrite(0xE000, 0); // one cycle later: the modified value, dropped
     }
-    try testing.expectEqual(@as(u8, 7), m.prgRead(0x8000));
+
+    var plain = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
+    mmc1Write(&plain, 0xE000, 0b11111);
+
+    // Bank $1F, masked to 4 bits and wrapped into an 8-bank ROM: bank 7.
+    try testing.expectEqual(@as(u8, 7), plain.prgRead(0x8000));
+    try testing.expectEqual(plain.prgRead(0x8000), rmw.prgRead(0x8000));
 }
+
 
 test "Mmc1 reports no IRQ" {
     var prg = taggedPrg(2);
