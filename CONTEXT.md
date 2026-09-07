@@ -70,7 +70,11 @@ AudioWorklet), and the APU (all 5 channels, frame sequencer, mixer + RC
 filter cascade, real game audio replacing M5's test tone). M7a (MMC1) is
 done too: the first cartridge here with registers, which is why mirroring
 now lives on the mapper rather than the PPU and why `Mapper` has a
-per-cycle `tick`. M7b (UxROM) is next. See
+per-cycle `tick`. M7b (UxROM, mapper 2) is done as well — one PRG register,
+CHR always 8KB RAM, header-fixed mirroring, empty `tick`, no bus-conflict
+emulation (see `Uxrom`'s doc comment in `core/src/mapper.zig`): the
+milestone confirmed the `Mapper` interface MMC1 shaped generalizes to a
+much simpler cartridge without further changes. See
 `docs/adr/0001-audio-playback-no-howler.md` for the threaded-audio pipeline
 decision, `docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter
 decisions and the deferred DMC-DMA-stealing gap, and
