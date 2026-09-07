@@ -6,6 +6,7 @@ const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mmc1 = mapper_mod.Mmc1;
 const Mmc3 = mapper_mod.Mmc3;
+const Uxrom = mapper_mod.Uxrom;
 
 /// Re-exported from `mapper.zig`, which owns it: the cartridge decides
 /// mirroring at runtime, and this header field is only the power-on value.
@@ -109,6 +110,18 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
             if (rom.chr_rom.len > 0x40000 or rom.chr_rom.len % 0x2000 != 0)
                 return MapperError.InvalidRomGeometry;
             break :blk Mapper{ .mmc3 = Mmc3.init(rom.prg_rom, rom.chr_rom) };
+        },
+        2 => blk: {
+            // UxROM: 32KB-512KB PRG in 16KB units, always CHR-RAM (no
+            // CHR-ROM at all -- unlike NROM and MMC1, UxROM boards never
+            // carry CHR-ROM, so anything other than 0 is a malformed ROM
+            // rather than a variant this mapper supports). The header's
+            // mirroring is used as-is: UxROM has no mirroring register.
+            if (rom.prg_rom.len < 0x8000 or rom.prg_rom.len > 0x80000 or rom.prg_rom.len % 0x4000 != 0)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .uxrom = Uxrom.init(rom.prg_rom, rom.header.mirroring) };
         },
         else => MapperError.UnsupportedMapper,
     };
@@ -216,6 +229,28 @@ test "createMapper rejects MMC1 geometry it cannot map" {
     @memcpy(padded[0..16], too_big[0..16]);
     padded[6] = 0x10;
     const rom = try Rom.load(&padded);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper builds a Uxrom for mapper 2" {
+    var buf = buildMinimalNrom(2, 0); // 32KB PRG, CHR-RAM
+    buf[6] = 0x20; // mapper number 2 (UxROM)
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .uxrom);
+}
+
+test "createMapper rejects UxROM CHR-ROM -- the board never carries any" {
+    var buf = buildMinimalNrom(2, 1); // 8KB CHR-ROM: not a shape UxROM has
+    buf[6] = 0x20;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a UxROM PRG size below the 32KB floor" {
+    var buf = buildMinimalNrom(1, 0); // 16KB PRG: below UxROM's 32KB minimum
+    buf[6] = 0x20;
+    const rom = try Rom.load(&buf);
     try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
 }
 

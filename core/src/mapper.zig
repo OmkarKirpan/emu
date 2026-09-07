@@ -1115,6 +1115,150 @@ test "Mmc3.irqAcknowledge clears a pending IRQ without touching the enable state
     try testing.expect(m.irqPending());
 }
 
+/// UxROM (mapper 2): 16KB switchable bank at $8000-$BFFF, 16KB **fixed
+/// last bank** at $C000-$FFFF, always 8KB CHR-RAM (unbanked), no IRQ. This
+/// is M7b, the "does the `Mapper` interface generalize?" milestone rather
+/// than a hard one -- one register, no shift sequence, mirroring fixed from
+/// the header exactly like `Nrom`. `tick` is empty for the same reason
+/// `Nrom`'s is: nothing here needs to tell cycles apart.
+///
+/// **Bus conflicts are deliberately not modeled.** Real UNROM boards (bare
+/// pull-down resistors, no bus-isolating logic between the CPU data bus and
+/// the ROM's output during a write) AND the written value with whatever byte
+/// the ROM itself is driving at that address; UOROM boards add a 74HC32 OR
+/// gate that removes the conflict entirely, and holy-mapperel's own README
+/// lists mapper 2 as covering both ("UNROM, UOROM (7432)") under one printed
+/// board name ("U*ROM") with no separate detailed-result digit for which
+/// variant is attached. The vendored ROM's PRG digit reads 0 without
+/// conflict emulation (see `uxrom_test.zig`), so modeling it would add state
+/// that nothing here exercises -- if a future ROM (a real UNROM game
+/// depending on the conflict, rather than the more common UOROM-safe
+/// convention of writing a byte matching what's already in ROM there) needs
+/// it, `prgWrite` is the one place to add the AND.
+pub const Uxrom = struct {
+    prg_rom: []const u8,
+    chr_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
+    /// Selects the 16KB bank shown at $8000-$BFFF. Written by a store to
+    /// *any* address in $8000-$FFFF -- there is only one register, and real
+    /// boards don't decode the address further. $C000-$FFFF never consults
+    /// this: see `prgRead`.
+    prg_bank: u8 = 0,
+    /// Fixed for the life of the cartridge, exactly like `Nrom`'s: mapper 2
+    /// has no mirroring control of its own, so this is the iNES header
+    /// value and nothing here ever changes it.
+    mirroring_mode: Mirroring,
+
+    pub fn init(prg_rom: []const u8, header_mirroring: Mirroring) Uxrom {
+        return .{ .prg_rom = prg_rom, .mirroring_mode = header_mirroring };
+    }
+
+    fn bankCount(self: *const Uxrom) usize {
+        return @max(self.prg_rom.len / 0x4000, 1);
+    }
+
+    /// $8000-$BFFF shows `prg_bank` (masked to the ROM's actual bank count,
+    /// the same "wrap rather than trust an out-of-range register" approach
+    /// `Mmc1.prgBanks` uses); $C000-$FFFF always shows the last bank,
+    /// unconditionally, in every PRG mode there is -- UxROM has only the one
+    /// mode, unlike MMC1's four.
+    pub fn prgRead(self: *const Uxrom, addr: u16) u8 {
+        const banks = self.bankCount();
+        const bank = if (addr < 0xC000) @as(usize, self.prg_bank) % banks else banks - 1;
+        const offset = bank * 0x4000 + (addr & 0x3FFF);
+        return self.prg_rom[offset];
+    }
+
+    pub fn prgWrite(self: *Uxrom, addr: u16, value: u8) void {
+        _ = addr; // one register, mapped across the whole $8000-$FFFF window
+        self.prg_bank = value;
+    }
+
+    pub fn chrRead(self: *const Uxrom, addr: u16) u8 {
+        return self.chr_ram[addr];
+    }
+
+    /// Unconditional, unlike `Nrom.chrWrite`: UxROM is always CHR-RAM, never
+    /// CHR-ROM, so there is no `chr_is_ram` branch to take.
+    pub fn chrWrite(self: *Uxrom, addr: u16, value: u8) void {
+        self.chr_ram[addr] = value;
+    }
+
+    pub fn irqPending(self: *const Uxrom) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn irqAcknowledge(self: *Uxrom) void {
+        _ = self;
+    }
+
+    pub fn mirroring(self: *const Uxrom) Mirroring {
+        return self.mirroring_mode;
+    }
+
+    pub fn tick(self: *Uxrom) void {
+        _ = self;
+    }
+};
+
+// ------------------------------------------------------------ UxROM tests
+
+test "Uxrom powers on with bank 0 at $8000 and the last bank fixed at $C000" {
+    var prg = taggedPrg(8);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    try testing.expectEqual(@as(u8, 0), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0xC000));
+}
+
+test "Uxrom.prgWrite selects the $8000-$BFFF bank, from any address in range" {
+    // taggedPrg tags only byte 0 of each 16KB bank, so the check must land
+    // on a bank boundary -- $8000, not $BFFF (offset $3FFF into the bank).
+    var prg = taggedPrg(8);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    m.prgWrite(0xC123, 5); // not $8000 itself -- the register spans the window
+    try testing.expectEqual(@as(u8, 5), m.prgRead(0x8000));
+}
+
+test "Uxrom fixes the last bank at $C000-$FFFF regardless of what's selected" {
+    var prg = taggedPrg(8);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    m.prgWrite(0x8000, 3);
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0xC000));
+    m.prgWrite(0x8000, 7); // even selecting the last bank into the low window...
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0xC000)); // ...doesn't move the fixed one
+}
+
+test "Uxrom wraps a bank number past the ROM's actual bank count" {
+    var prg = taggedPrg(8); // 8 banks: 0-7
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    m.prgWrite(0x8000, 0xFF); // 255 % 8 = 7
+    try testing.expectEqual(@as(u8, 7), m.prgRead(0x8000));
+}
+
+test "Uxrom.chrWrite is always honored -- CHR is always RAM" {
+    var prg = taggedPrg(2);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    m.chrWrite(0x0100, 0xAB);
+    try testing.expectEqual(@as(u8, 0xAB), m.chrRead(0x0100));
+}
+
+test "Uxrom.mirroring returns the header value and never changes" {
+    var prg = taggedPrg(2);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .vertical) };
+    try testing.expectEqual(Mirroring.vertical, m.mirroring());
+    m.prgWrite(0x8000, 1); // banking activity must not perturb it
+    m.chrWrite(0, 0xFF);
+    try testing.expectEqual(Mirroring.vertical, m.mirroring());
+}
+
+test "Uxrom reports no IRQ" {
+    var prg = taggedPrg(2);
+    var m = Mapper{ .uxrom = Uxrom.init(&prg, .horizontal) };
+    try testing.expect(!m.irqPending());
+    m.irqAcknowledge(); // must not panic
+}
+
 /// Closed set of NES mappers (see the map's "Out of scope": coverage is
 /// capped at NROM/MMC1/UxROM/CNROM/MMC3), plus one test double (`TestStub`).
 /// A tagged union dispatched via
@@ -1134,6 +1278,7 @@ pub const Mapper = union(enum) {
     nrom: Nrom,
     mmc1: Mmc1,
     mmc3: Mmc3,
+    uxrom: Uxrom,
     /// Not a cartridge — a test double for the parts of this interface NROM
     /// cannot reach. See `TestStub`.
     test_stub: TestStub,

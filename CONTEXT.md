@@ -74,10 +74,14 @@ AudioWorklet), and the APU (all 5 channels, frame sequencer, mixer + RC
 filter cascade, real game audio replacing M5's test tone). M7a (MMC1) is
 done too: the first cartridge here with registers, which is why mirroring
 now lives on the mapper rather than the PPU and why `Mapper` has a
-per-cycle `tick`. M7d (MMC3 + scanline IRQ) is also done, landed in
-parallel with M7b/M7c: the first cartridge here with a working IRQ, and the
-first mapper that actually watches PPU bus activity (address line A12)
-rather than only reacting to reads/writes aimed at it — which is why
+per-cycle `tick`. M7b (UxROM) and M7d (MMC3 + scanline IRQ) followed, built
+in parallel. M7b is the quiet result: one PRG register, CHR always 8KB RAM,
+header-fixed mirroring, empty `tick`, no bus-conflict emulation (see
+`Uxrom`'s doc comment) — it needed no interface changes at all, which is the
+evidence that the shape MMC1 forced generalizes rather than being
+MMC1-specific. M7d is the loud one: the first cartridge here with a working
+IRQ, and the first mapper that watches PPU bus activity (address line A12)
+rather than only reacting to accesses aimed at it — which is why
 `Mapper.chrRead` is now mutable, and which caught a real, pre-existing PPU
 gap (`Ppu.fetchSpriteUnits` skipping sprite pattern fetches on scanlines
 with no sprites in range — invisible until a mapper depended on the bus

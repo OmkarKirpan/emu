@@ -296,6 +296,13 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
             });
             hasher.update(std.mem.asBytes(&m.a12_low_ticks));
         },
+        // UxROM's CHR is always RAM (unlike NROM/MMC1, which can be either),
+        // and `prg_bank` is its one register -- both are emulation state two
+        // otherwise-identical runs could diverge in.
+        .uxrom => |*u| {
+            hasher.update(&u.chr_ram);
+            hasher.update(&[_]u8{u.prg_bank});
+        },
         .test_stub => {},
     }
 }

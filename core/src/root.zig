@@ -67,4 +67,5 @@ test {
     _ = @import("apu_test.zig");
     _ = @import("mmc1_test.zig");
     _ = @import("mmc3_test.zig");
+    _ = @import("uxrom_test.zig");
 }
