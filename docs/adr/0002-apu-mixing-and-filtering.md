@@ -50,7 +50,7 @@ milestone vendors a DMC-DMA-timing conformance ROM.
 ## Frame-sequencer and channel-timer corner cases found via the conformance ROMs
 
 Task 13's native conformance stage (all 8 vendored `apu_test/rom_singles`
-ROMs, `core/src/apu_test.zig`) surfaced four genuine timing bugs beyond
+ROMs, `core/src/apu_test.zig`) surfaced five genuine timing bugs beyond
 what this plan anticipated, all fixed in `apu.zig` and left with inline
 doc comments at their fix sites:
 

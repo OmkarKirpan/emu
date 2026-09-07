@@ -67,11 +67,23 @@ pub const Envelope = struct {
     }
 };
 
-test "length_table has the documented 32 entries" {
-    try testing.expectEqual(@as(u8, 10), length_table[0]);
+test "length_table follows the documented structure a transcription slip would break" {
+    try testing.expectEqual(@as(usize, 32), length_table.len);
+    // https://www.nesdev.org/wiki/APU_Length_Counter: the odd-indexed half
+    // is a plain linear ramp -- entry i is i-1 for every odd i except
+    // index 1, the lone $FE outlier. Transposing two entries, or dropping
+    // one and shifting the rest, breaks this shape; re-typing the table
+    // verbatim into the test (what this used to do) would catch neither.
     try testing.expectEqual(@as(u8, 254), length_table[1]);
+    var i: usize = 3;
+    while (i < 32) : (i += 2) {
+        try testing.expectEqual(@as(u8, @intCast(i - 1)), length_table[i]);
+    }
+    // Spot-check the even half against the wiki's own first column.
+    try testing.expectEqual(@as(u8, 10), length_table[0]);
     try testing.expectEqual(@as(u8, 20), length_table[2]);
-    try testing.expectEqual(@as(u8, 30), length_table[31]);
+    try testing.expectEqual(@as(u8, 160), length_table[8]);
+    try testing.expectEqual(@as(u8, 192), length_table[24]);
 }
 
 test "Envelope: start flag loads decay=15 and reloads the divider, one clock later than the write" {
@@ -246,11 +258,21 @@ pub const Pulse = struct {
     }
 };
 
-test "Pulse duty sequences match the documented 8-step waveforms" {
-    try testing.expectEqualSlices(u1, &[_]u1{ 0, 1, 0, 0, 0, 0, 0, 0 }, &duty_sequences[0]);
-    try testing.expectEqualSlices(u1, &[_]u1{ 0, 1, 1, 0, 0, 0, 0, 0 }, &duty_sequences[1]);
-    try testing.expectEqualSlices(u1, &[_]u1{ 0, 1, 1, 1, 1, 0, 0, 0 }, &duty_sequences[2]);
-    try testing.expectEqualSlices(u1, &[_]u1{ 1, 0, 0, 1, 1, 1, 1, 1 }, &duty_sequences[3]);
+test "duty sequences carry the 12.5/25/50/75% duty ratios their register values name" {
+    // The point of a duty table is the *ratio* of high steps; asserting
+    // that (rather than re-typing each row) is what catches a bit landing
+    // in the wrong column.
+    const expected_high = [4]u32{ 1, 2, 4, 6 }; // 12.5%, 25%, 50%, 75% of 8
+    for (duty_sequences, expected_high) |seq, want| {
+        var high: u32 = 0;
+        for (seq) |step| high += step;
+        try testing.expectEqual(want, high);
+    }
+    // Duty 3 is documented as duty 1 negated -- a relationship *between*
+    // two rows, which verbatim copies of each row separately cannot check.
+    for (duty_sequences[1], duty_sequences[3]) |d1, d3| {
+        try testing.expectEqual(d1, ~d3);
+    }
 }
 
 test "Pulse.writeReg3 restarts the sequencer phase and envelope, reloads length if enabled, leaves the timer divider untouched" {
@@ -280,12 +302,17 @@ test "Pulse.tickTimer advances the duty sequencer on timer reload, walking backw
     try testing.expectEqual(@as(u3, 7), p.sequence_pos);
 }
 
-test "Pulse sweep: pulse1 uses ones'-complement negate, pulse2 uses twos-complement" {
-    var p1 = Pulse{ .is_pulse1 = true, .timer_period = 20, .sweep_negate = true, .sweep_shift = 0 };
-    try testing.expectEqual(@as(u12, 20 -% 21 & 0xFFF), p1.targetPeriod() & 0xFFF);
+test "Pulse sweep: pulse1 negates with the ones' complement, pulse2 with the twos'" {
+    // Period 100 shifted right 2 gives a change amount of 25: pulse 1
+    // subtracts 26 (-c-1), pulse 2 subtracts 25 (-c). That one-unit gap
+    // *is* the hardware difference, so both targets are pinned exactly.
+    // (The old values here -- period 20, shift 0 -- drove both channels to
+    // 0 and so proved nothing about which complement was used.)
+    const p1 = Pulse{ .is_pulse1 = true, .timer_period = 100, .sweep_negate = true, .sweep_shift = 2 };
+    try testing.expectEqual(@as(u12, 74), p1.targetPeriod());
 
-    var p2 = Pulse{ .is_pulse1 = false, .timer_period = 20, .sweep_negate = true, .sweep_shift = 0 };
-    try testing.expect(@as(i32, p2.targetPeriod()) < 20); // twos-complement: change = -20, target clamps to 0
+    const p2 = Pulse{ .is_pulse1 = false, .timer_period = 100, .sweep_negate = true, .sweep_shift = 2 };
+    try testing.expectEqual(@as(u12, 75), p2.targetPeriod());
 }
 
 test "Pulse.muted is true when the current period is below 8, or the target period exceeds 0x7FF" {
@@ -378,11 +405,23 @@ pub const Triangle = struct {
     }
 };
 
-test "triangle_sequence is the documented 32-step descend-then-ascend ramp" {
+test "triangle_sequence descends 15->0 then mirrors back up, one level at a time" {
+    try testing.expectEqual(@as(usize, 32), triangle_sequence.len);
+    // Every adjacent pair differs by exactly 1 except at the held bottom,
+    // and the second half is the first half reversed. A ramp that skipped
+    // or repeated a level breaks one or the other.
+    var i: usize = 0;
+    while (i < 15) : (i += 1) {
+        try testing.expectEqual(triangle_sequence[i] - 1, triangle_sequence[i + 1]);
+    }
+    try testing.expectEqual(triangle_sequence[15], triangle_sequence[16]); // bottom held two steps
+    i = 16;
+    while (i < 31) : (i += 1) {
+        try testing.expectEqual(triangle_sequence[i] + 1, triangle_sequence[i + 1]);
+    }
+    for (0..32) |j| try testing.expectEqual(triangle_sequence[j], triangle_sequence[31 - j]);
     try testing.expectEqual(@as(u4, 15), triangle_sequence[0]);
     try testing.expectEqual(@as(u4, 0), triangle_sequence[15]);
-    try testing.expectEqual(@as(u4, 0), triangle_sequence[16]);
-    try testing.expectEqual(@as(u4, 15), triangle_sequence[31]);
 }
 
 test "Triangle.tickTimer only advances the sequence when both counters are nonzero" {
@@ -403,7 +442,7 @@ test "Triangle linear counter: reload flag forces a reload, clears only when con
     try testing.expect(t.linear_reload_flag); // control_flag held it set
 
     t.control_flag = false;
-    t.clockLinearCounter(); // reload flag still true from before? no -- only cleared when control_flag false AND this clock runs
+    t.clockLinearCounter(); // control_flag is clear now, so this clock reloads *and* clears the flag
     try testing.expectEqual(@as(u7, 10), t.linear_counter);
     try testing.expect(!t.linear_reload_flag);
 }
@@ -440,6 +479,14 @@ pub const Noise = struct {
     /// Power-on state must be nonzero -- an all-zero LFSR would lock up
     /// (XOR of two zero bits is always zero, so it can never leave 0).
     shift_register: u15 = 1,
+
+    /// $400C: --LC.VVVV -- the same envelope/halt byte the pulse channels
+    /// take, minus the duty bits (noise has no duty cycle).
+    pub fn writeReg0(self: *Noise, value: u8) void {
+        self.envelope.loop_flag = (value & 0x20) != 0;
+        self.envelope.constant_volume = (value & 0x10) != 0;
+        self.envelope.volume_or_period = @truncate(value & 0x0F);
+    }
 
     /// $400E: M---.PPPP
     pub fn writeReg2(self: *Noise, value: u8) void {
@@ -480,15 +527,22 @@ pub const Noise = struct {
     }
 };
 
-test "noise_period_table has the documented 16 NTSC entries" {
+test "noise_period_table is 16 strictly-increasing, even CPU-cycle periods" {
+    try testing.expectEqual(@as(usize, 16), noise_period_table.len);
+    for (noise_period_table, 0..) |p, i| {
+        // "These periods are all even numbers because there are 2 CPU
+        // cycles in an APU cycle" -- https://www.nesdev.org/wiki/APU_Noise.
+        // That evenness is exactly what makes the /2 at the use site exact.
+        try testing.expectEqual(@as(u12, 0), p % 2);
+        if (i > 0) try testing.expect(p > noise_period_table[i - 1]);
+    }
     try testing.expectEqual(@as(u12, 4), noise_period_table[0]);
-    try testing.expectEqual(@as(u12, 202), noise_period_table[8]);
     try testing.expectEqual(@as(u12, 4068), noise_period_table[15]);
 }
 
 test "Noise LFSR mode 0 taps bit 1; feedback loads into bit 14, register shifts right" {
     var n = Noise{ .shift_register = 0b000_0000_0000_0001, .mode = false };
-    n.tickTimer(); // forces one shift regardless of the timer via period 0 fast-path below
+    n.tickTimer(); // `timer` starts at 0, so this tick takes the reload-and-shift branch
     // bit0=1, bit1=0 -> feedback = 1^0 = 1 -> new bit14 = 1
     try testing.expectEqual(@as(u15, 0b100_0000_0000_0000), n.shift_register);
 }
@@ -521,9 +575,9 @@ pub const dmc_rate_table = [16]u9{
 /// **Known gap**: no CPU-cycle-stealing DMA is modeled for sample fetches
 /// (real hardware stalls the CPU 1-4 cycles per fetch). `tickTimer` reads
 /// the sample byte straight through the mapper with no CPU-side stall --
-/// see this plan's Global Constraints / `docs/adr/0002-apu-mixing-and-
-/// filtering.md` for why that's an acceptable, explicitly-flagged
-/// simplification for this milestone's conformance ROMs.
+/// see `docs/adr/0002-apu-mixing-and-filtering.md` for why that's an
+/// acceptable, explicitly-flagged simplification for this milestone's
+/// conformance ROMs.
 pub const Dmc = struct {
     enabled: bool = false,
     irq_enabled: bool = false,
@@ -638,7 +692,12 @@ pub const Dmc = struct {
     }
 };
 
-test "dmc_rate_table has the documented 16 NTSC entries" {
+test "dmc_rate_table is 16 strictly-decreasing, even CPU-cycle periods" {
+    try testing.expectEqual(@as(usize, 16), dmc_rate_table.len);
+    for (dmc_rate_table, 0..) |r, i| {
+        try testing.expectEqual(@as(u9, 0), r % 2); // even, for the same reason as noise
+        if (i > 0) try testing.expect(r < dmc_rate_table[i - 1]); // higher index = shorter period
+    }
     try testing.expectEqual(@as(u9, 428), dmc_rate_table[0]);
     try testing.expectEqual(@as(u9, 54), dmc_rate_table[15]);
 }
@@ -770,7 +829,7 @@ pub const FrameSequencer = struct {
     /// $4017: MI--.---- (mode, IRQ inhibit). Schedules a delayed sequencer
     /// reset (3 or 4 CPU cycles out, per the parity rule below) and, for
     /// mode 1, returns an immediate quarter+half clock as a side effect.
-    /// The parity->delay mapping matches this plan's original reading of
+    /// The parity->delay mapping follows
     /// https://www.nesdev.org/wiki/APU_Frame_Counter ("3 cycles if the
     /// write occurs during an APU cycle, 4 if between") and is confirmed
     /// against the vendored `3-irq_flag`/`4-jitter`/`6-irq_flag_timing`
@@ -971,9 +1030,12 @@ pub const Apu = struct {
 
     even_cycle: bool = false,
 
-    pub fn init() Apu {
-        return .{};
-    }
+    /// The most recent fully mixed-and-filtered sample -- exactly the value
+    /// `tick` hands to `audio_ring.pushSample`. Kept as a field so the
+    /// audio path is observable without reaching into `audio_ring`'s
+    /// private ring storage (and so a test can assert what actually leaves
+    /// the APU, rather than re-deriving it from the channel outputs).
+    output_sample: f32 = 0,
 
     pub fn writeRegister(self: *Apu, addr: u16, value: u8) void {
         switch (addr) {
@@ -988,13 +1050,7 @@ pub const Apu = struct {
             0x4008 => self.triangle.writeReg0(value),
             0x400A => self.triangle.writeReg2(value),
             0x400B => self.triangle.writeReg3(value),
-            0x400C => {
-                // --LC.VVVV -- same shape as pulse's byte 0, minus the duty
-                // bits (noise has no duty cycle).
-                self.noise.envelope.loop_flag = (value & 0x20) != 0;
-                self.noise.envelope.constant_volume = (value & 0x10) != 0;
-                self.noise.envelope.volume_or_period = @truncate(value & 0x0F);
-            },
+            0x400C => self.noise.writeReg0(value),
             0x400E => self.noise.writeReg2(value),
             0x400F => self.noise.writeReg3(value),
             0x4010 => self.dmc.writeReg0(value),
@@ -1090,13 +1146,13 @@ pub const Apu = struct {
         }
 
         const raw = mixOutput(self.pulse1.output(), self.pulse2.output(), self.triangle.output(), self.noise.output(), self.dmc.output());
-        const filtered = self.lpf.process(self.hpf2.process(self.hpf1.process(raw)));
-        audio_ring.pushSample(filtered);
+        self.output_sample = self.lpf.process(self.hpf2.process(self.hpf1.process(raw)));
+        audio_ring.pushSample(self.output_sample);
     }
 };
 
 test "Apu.writeRegister routes $4000-$4013 to the right channel" {
-    var apu = Apu.init();
+    var apu = Apu{};
     apu.writeRegister(0x4000, 0b00_0_1_0101); // pulse1 duty0, constant vol 5
     try testing.expectEqual(@as(u4, 5), apu.pulse1.envelope.volume_or_period);
     apu.writeRegister(0x4008, 0x80); // triangle control flag (bit 7, per CRRR.RRRR)
@@ -1108,7 +1164,7 @@ test "Apu.writeRegister routes $4000-$4013 to the right channel" {
 }
 
 test "Apu.writeRegister($4015) enables/disables channels and clears their length counters when disabled" {
-    var apu = Apu.init();
+    var apu = Apu{};
     apu.pulse1.length_counter = 10;
     apu.writeRegister(0x4015, 0b0000_0000); // disable everything
     try testing.expect(!apu.pulse1.enabled);
@@ -1120,7 +1176,7 @@ test "Apu.writeRegister($4015) enables/disables channels and clears their length
 }
 
 test "Apu.writeRegister($4015) restarts the DMC only when bytes_remaining is already 0" {
-    var apu = Apu.init();
+    var apu = Apu{};
     apu.dmc.bytes_remaining = 3;
     apu.writeRegister(0x4015, 0x10); // DMC enable bit
     try testing.expectEqual(@as(u16, 3), apu.dmc.bytes_remaining); // unaffected: already playing
@@ -1131,7 +1187,7 @@ test "Apu.writeRegister($4015) restarts the DMC only when bytes_remaining is alr
 }
 
 test "Apu.readStatus reports length-counter-nonzero bits, DMC active, and both IRQ flags, then clears only the frame IRQ" {
-    var apu = Apu.init();
+    var apu = Apu{};
     apu.pulse1.length_counter = 1;
     apu.dmc.bytes_remaining = 1;
     apu.frame.irq_flag = true;
@@ -1143,7 +1199,7 @@ test "Apu.readStatus reports length-counter-nonzero bits, DMC active, and both I
 }
 
 test "Apu.irqPending is the OR of the frame IRQ and DMC IRQ flags" {
-    var apu = Apu.init();
+    var apu = Apu{};
     try testing.expect(!apu.irqPending());
     apu.frame.irq_flag = true;
     try testing.expect(apu.irqPending());
@@ -1152,10 +1208,62 @@ test "Apu.irqPending is the OR of the frame IRQ and DMC IRQ flags" {
     try testing.expect(apu.irqPending());
 }
 
-test "mixOutput is 0 when every channel is silent, and nonzero once one contributes" {
+test "mixOutput spans exactly the documented 0.0-1.0 range" {
     try testing.expectEqual(@as(f32, 0), mixOutput(0, 0, 0, 0, 0));
+    // "calculates the approximate audio output level within the range of
+    // 0.0 to 1.0" -- https://www.nesdev.org/wiki/APU_Mixer. Every channel
+    // at maximum lands on exactly 1.0, which pins the two numerators
+    // (95.88 / 159.79) against each other: get either wrong and the sum
+    // stops touching full scale.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), mixOutput(15, 15, 15, 15, 127), 1e-4);
     try testing.expect(mixOutput(15, 0, 0, 0, 0) > 0);
     try testing.expect(mixOutput(0, 0, 15, 0, 0) > 0);
+}
+
+test "mixOutput agrees with nesdev's independently-published lookup-table formula" {
+    // The wiki gives two derivations of the same mixer: the exact rational
+    // form `mixOutput` implements, and a lookup-table approximation
+    // (`pulse_table[n] = 95.52 / (8128/n + 100)`, `tnd_table[n] = 163.67 /
+    // (24329/n + 100)`) built from *different* constants. They agree to
+    // within ~3.8% across the whole input space, so cross-checking against
+    // the second catches a mistyped constant in the first -- which no
+    // amount of re-reading the formula back to itself would.
+    var p1: u4 = 0;
+    while (true) : (p1 += 1) {
+        var t: u4 = 0;
+        while (true) : (t += 1) {
+            const d: u7 = if (t > 7) 127 else 0;
+            const mine = mixOutput(p1, p1 / 2, t, t / 2, d);
+
+            const pulse_sum: f32 = @floatFromInt(@as(u32, p1) + @as(u32, p1 / 2));
+            const pulse_ref: f32 = if (pulse_sum == 0) 0 else 95.52 / (8128.0 / pulse_sum + 100.0);
+            const tnd_idx: f32 = @floatFromInt(3 * @as(u32, t) + 2 * @as(u32, t / 2) + @as(u32, d));
+            const tnd_ref: f32 = if (tnd_idx == 0) 0 else 163.67 / (24329.0 / tnd_idx + 100.0);
+            const reference = pulse_ref + tnd_ref;
+
+            if (reference > 0.001) {
+                const relative_error = @abs(mine - reference) / reference;
+                testing.expect(relative_error < 0.05) catch |err| {
+                    std.debug.print(
+                        "p1={d} t={d} d={d}: mixOutput={d:.5} table-form={d:.5} ({d:.2}% apart)\n",
+                        .{ p1, t, d, mine, reference, relative_error * 100 },
+                    );
+                    return err;
+                };
+            }
+            if (t == 15) break;
+        }
+        if (p1 == 15) break;
+    }
+}
+
+test "mixOutput mixes non-linearly: two pulses at full volume are not twice one" {
+    // The whole reason this isn't a plain sum. If the formula ever
+    // degenerated into a linear mix, this is what would catch it.
+    const one = mixOutput(15, 0, 0, 0, 0);
+    const two = mixOutput(15, 15, 0, 0, 0);
+    try testing.expect(two > one); // still monotonic...
+    try testing.expect(two < 2 * one); // ...but compressed, not doubled
 }
 
 test "OnePoleFilter high-pass blocks DC after settling; low-pass passes DC unchanged" {
@@ -1168,4 +1276,91 @@ test "OnePoleFilter high-pass blocks DC after settling; low-pass passes DC uncha
     i = 0;
     while (i < 10000) : (i += 1) _ = lpf.process(1.0);
     try testing.expect(@abs(lpf.process(1.0) - 1.0) < 0.01);
+}
+
+test "a pulse channel driven through its real registers emits the period and duty its registers ask for" {
+    // The conformance ROMs only ever observe the APU through $4015 and the
+    // IRQ line -- none of them looks at a channel's actual output level.
+    // This drives pulse 1 the way a game would (register writes, then
+    // whole CPU cycles through `tick`) and measures the waveform that
+    // comes out the other side.
+    var prg = [_]u8{0} ** 0x8000;
+    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}) };
+
+    var apu = Apu{};
+    apu.writeRegister(0x4015, 0x01); // enable pulse 1
+    apu.writeRegister(0x4000, 0b10_1_1_1001); // duty 2 (50%), halt, constant volume 9
+    apu.writeRegister(0x4002, 100); // timer low: period 100
+    apu.writeRegister(0x4003, 0b00001_000); // length index 1 ($FE), timer high 0
+
+    // The timer divides the APU clock (itself CPU/2) by period+1, and the
+    // duty sequence is 8 steps long: 2 * (100 + 1) * 8 = 1616 CPU cycles
+    // per full waveform period.
+    const cycles_per_waveform: u32 = 2 * (100 + 1) * 8;
+
+    var i: u32 = 0;
+    while (i < cycles_per_waveform) : (i += 1) apu.tick(&m); // settle onto a step boundary
+
+    var high_cycles: u32 = 0;
+    var levels_seen_high: u4 = 0;
+    i = 0;
+    while (i < cycles_per_waveform) : (i += 1) {
+        apu.tick(&m);
+        const out = apu.pulse1.output();
+        if (out != 0) {
+            high_cycles += 1;
+            levels_seen_high = out;
+        }
+    }
+
+    // Duty 2 is 50%: exactly half of one full waveform period is high.
+    try testing.expectEqual(cycles_per_waveform / 2, high_cycles);
+    // ...and while high it sits at the constant volume asked for, not the
+    // envelope decay level (C=1 was set above).
+    try testing.expectEqual(@as(u4, 9), levels_seen_high);
+}
+
+test "the filtered sample leaving the APU is DC-free when silent and swings when a channel plays" {
+    // End-to-end over the real audio path: registers -> channels -> mixer
+    // -> RC filter cascade -> `output_sample` (the exact value handed to
+    // `audio_ring.pushSample`).
+    //
+    // A "silent" APU is *not* a zero-valued mixer input. The triangle's
+    // DAC holds its sequencer level whenever the length/linear counters
+    // stop it (https://www.nesdev.org/wiki/APU_Triangle), and at power-on
+    // that level is 15 -- so a ROM that never touches the triangle still
+    // parks a constant ~0.246 on the mixer forever. That constant is
+    // exactly what the 90Hz/440Hz high-passes exist to remove, which is
+    // what makes the ring's samples the centred, +-1.0-normalized signal
+    // ENG-62 specifies. This test is the proof that the DC actually gets
+    // blocked rather than being shipped to the worklet as a fixed offset.
+    var prg = [_]u8{0} ** 0x8000;
+    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}) };
+
+    var quiet = Apu{};
+    var i: u32 = 0;
+    while (i < 100_000) : (i += 1) quiet.tick(&m); // ~56ms: several time constants of the 90Hz pole
+    try testing.expect(@abs(quiet.output_sample) < 0.01);
+
+    var loud = Apu{};
+    loud.writeRegister(0x4015, 0x01);
+    loud.writeRegister(0x4000, 0b10_1_1_1111); // duty 2 (50%), halt, constant volume 15
+    loud.writeRegister(0x4002, 100); // ~4.4kHz, comfortably inside the 14kHz low-pass
+    loud.writeRegister(0x4003, 0b00001_000);
+
+    i = 0;
+    while (i < 100_000) : (i += 1) loud.tick(&m); // let the same DC settle out first
+    var min_sample: f32 = 1.0;
+    var max_sample: f32 = -1.0;
+    i = 0;
+    while (i < 1616) : (i += 1) { // one full waveform period
+        loud.tick(&m);
+        min_sample = @min(min_sample, loud.output_sample);
+        max_sample = @max(max_sample, loud.output_sample);
+    }
+    // One pulse at full volume is ~0.13 peak-to-peak out of the mixer;
+    // the filters pass essentially all of it at 4.4kHz.
+    try testing.expect(max_sample - min_sample > 0.05);
+    // ...and it swings about zero rather than riding an offset.
+    try testing.expect(min_sample < 0 and max_sample > 0);
 }

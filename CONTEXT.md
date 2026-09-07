@@ -25,10 +25,17 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   artifact (`zig build wasm`) — exporting a small, explicit ABI (an
   implicit global-singleton `Machine`, free functions, `i32` status codes
   in place of exceptions). Wasm-only concerns (the `alloc`/`free` staging
-  surface, the palette→RGBA8 resolve, the audio ring buffer) live in
-  `wasm.zig` and must never leak into `root.zig`; native-only concerns
-  (`Cpu.trace`, the vendored-ROM test suite) must never leak into
-  `wasm.zig`. Both share one implementation, not one entry point.
+  surface, the palette→RGBA8 resolve) live in `wasm.zig` and must never
+  leak into `root.zig`; native-only concerns (`Cpu.trace`, the
+  vendored-ROM test suite) must never leak into `wasm.zig`. Both share one
+  implementation, not one entry point. **The audio ring buffer
+  (`audio_ring.zig`) used to sit on the wasm-only side of that line; as of
+  M6 it does not.** `Apu` is a shared subsystem ticked from `Cpu.tick`
+  like `Ppu`, and it writes finished samples into the ring every CPU
+  cycle, so the ring is part of the shared graph and runs during native
+  tests too (where nothing drains it). Only its pointer-exposing exports
+  (`get_audio_ring_ptr` and friends) stay wasm-only. See
+  `docs/adr/0002-apu-mixing-and-filtering.md`.
 - **`web/`** — the host app. `src/wasm/core.ts` wraps `wasm.zig`'s raw
   exports in a typed, memory-safety-aware `NesCore` class (framebuffer
   views go stale across `memory.grow`; every fallible call maps its

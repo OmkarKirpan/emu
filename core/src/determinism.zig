@@ -11,12 +11,25 @@
 //! add state -- this is that first, deliberately narrow slice, not an
 //! oversight.
 //!
-//! **APU section (M6, ENG-71)**: `hashApu` covers each channel's timer/
-//! length-counter/envelope state, the triangle's linear counter, the noise
-//! LFSR, the DMC's playback position/output level, and the frame
-//! sequencer's mode/cycle/IRQ-flag -- the pieces a mid-stream resume would
-//! need to keep producing bit-identical audio, on the same "grows to cover
-//! more" basis as every other section here. **Mapper section is CHR-RAM
+//! **APU section (M6, ENG-71)**: `hashApu` covers every field of every
+//! channel and of the frame sequencer that a mid-stream resume would have
+//! to restore to keep producing bit-identical audio -- each channel's
+//! enable bit, timer/period, length counter and full envelope state; both
+//! pulses' complete sweep configuration; the triangle's linear counter and
+//! reload latch; the noise LFSR and mode; the DMC's playback position,
+//! output level, sample buffer and IRQ configuration; and the frame
+//! sequencer's mode, cycle, pending-reset/deferred-half-frame latches and
+//! IRQ state.
+//!
+//! Two deliberate omissions, both named rather than silent. **The RC
+//! filter cascade's state** (`Apu.hpf1`/`hpf2`/`lpf`, and `output_sample`)
+//! is not hashed: it is a pure function of the mixed channel outputs this
+//! section already covers, so two runs that agree here cannot disagree
+//! there, and hashing three `f32` pairs would make the digest sensitive to
+//! floating-point rounding across targets for no gain in what it proves.
+//! **`FrameSequencer.total_cycles`** is likewise skipped -- it only ever
+//! feeds the even/odd parity of the next `$4017` write, and `cycle`
+//! (hashed) already moves in lockstep with it. **Mapper section is CHR-RAM
 //! only**: NROM has no bank-switch registers or IRQ counter, but per ENG-61
 //! ("CHR-RAM contents where the mapper provides writable CHR (mutable;
 //! CHR-ROM is not serialized -- static, reloadable from the ROM file)") its
@@ -173,41 +186,78 @@ fn hashControllers(hasher: *Sha256, controllers: *const [2]controller_mod.Contro
 }
 
 /// ENG-71 (M6): APU channel/frame-sequencer state. See the module doc
-/// comment for scope.
+/// comment for the two deliberate omissions (filter state, `total_cycles`).
 fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
     hashPulse(hasher, &a.pulse1);
     hashPulse(hasher, &a.pulse2);
+
     hasher.update(&[_]u8{
-        a.triangle.length_counter,       a.triangle.linear_counter,
-        a.triangle.linear_reload_value,  @intFromBool(a.triangle.linear_reload_flag),
-        @intFromBool(a.triangle.control_flag), @as(u8, a.triangle.sequence_pos),
+        @intFromBool(a.triangle.enabled),       a.triangle.length_counter,
+        a.triangle.linear_counter,              a.triangle.linear_reload_value,
+        @intFromBool(a.triangle.linear_reload_flag), @intFromBool(a.triangle.control_flag),
+        @as(u8, a.triangle.sequence_pos),
     });
     hasher.update(std.mem.asBytes(&a.triangle.timer_period));
     hasher.update(std.mem.asBytes(&a.triangle.timer));
-    hasher.update(&[_]u8{
-        a.noise.length_counter, a.noise.envelope.decay,
-        @intFromBool(a.noise.mode), a.noise.period_index,
-    });
+
+    hasher.update(&[_]u8{ @intFromBool(a.noise.enabled), a.noise.length_counter });
+    hashEnvelope(hasher, &a.noise.envelope);
+    hasher.update(&[_]u8{ @intFromBool(a.noise.mode), a.noise.period_index });
     hasher.update(std.mem.asBytes(&a.noise.shift_register));
     hasher.update(std.mem.asBytes(&a.noise.timer));
+
     hasher.update(&[_]u8{
-        a.dmc.output_level, @intFromBool(a.dmc.silence),
-        a.dmc.bits_remaining, a.dmc.shift_register,
-        @intFromBool(a.dmc.irq_flag), @intFromBool(a.dmc.loop),
+        @intFromBool(a.dmc.enabled),     @intFromBool(a.dmc.irq_enabled),
+        @intFromBool(a.dmc.loop),        a.dmc.rate_index,
+        a.dmc.output_level,              @intFromBool(a.dmc.silence),
+        a.dmc.bits_remaining,            a.dmc.shift_register,
+        @intFromBool(a.dmc.irq_flag),
+        // `?u8`: a byte waiting in the 1-byte sample buffer is real
+        // resume-critical state, and "empty" has to hash differently from
+        // "holding $00" -- hence the presence flag alongside the value.
+        @intFromBool(a.dmc.sample_buffer != null), a.dmc.sample_buffer orelse 0,
     });
+    hasher.update(std.mem.asBytes(&a.dmc.sample_address));
+    hasher.update(std.mem.asBytes(&a.dmc.sample_length));
     hasher.update(std.mem.asBytes(&a.dmc.current_address));
     hasher.update(std.mem.asBytes(&a.dmc.bytes_remaining));
     hasher.update(std.mem.asBytes(&a.dmc.timer));
-    hasher.update(&[_]u8{ @intFromBool(a.frame.irq_flag), a.frame.mode });
+
+    hasher.update(&[_]u8{
+        a.frame.mode,                              @intFromBool(a.frame.irq_inhibit),
+        @intFromBool(a.frame.irq_flag),            @intFromBool(a.frame.half_frame_pending),
+        @intFromBool(a.even_cycle),
+    });
     hasher.update(std.mem.asBytes(&a.frame.cycle));
+    hasher.update(std.mem.asBytes(&a.frame.reset_delay));
+    hasher.update(std.mem.asBytes(&a.frame.irq_reassert_remaining));
+}
+
+/// Shared by the two pulses and the noise channel -- all three carry the
+/// identical envelope unit (`apu.zig`'s `Envelope`), and a resume that
+/// restored only its decay level would resume at the wrong point in the
+/// decay ramp.
+fn hashEnvelope(hasher: *Sha256, e: *const apu_mod.Envelope) void {
+    hasher.update(&[_]u8{
+        @intFromBool(e.start),           @intFromBool(e.loop_flag),
+        @intFromBool(e.constant_volume), e.volume_or_period,
+        e.divider,                       e.decay,
+    });
 }
 
 fn hashPulse(hasher: *Sha256, p: *const apu_mod.Pulse) void {
     hasher.update(&[_]u8{
-        p.length_counter,     p.envelope.decay,
-        p.envelope.volume_or_period, p.duty,
-        @as(u8, p.sequence_pos),     @intFromBool(p.envelope.start),
-        p.sweep_divider,
+        @intFromBool(p.enabled), p.length_counter,
+        p.duty,                  @as(u8, p.sequence_pos),
+    });
+    hashEnvelope(hasher, &p.envelope);
+    // The whole sweep unit, not just its divider: the shift/negate/period
+    // fields decide the next target period, so a resume missing them
+    // resumes onto a different pitch slide.
+    hasher.update(&[_]u8{
+        @intFromBool(p.sweep_enabled), p.sweep_period,
+        @intFromBool(p.sweep_negate),  p.sweep_shift,
+        p.sweep_divider,               @intFromBool(p.sweep_reload),
     });
     hasher.update(std.mem.asBytes(&p.timer_period));
     hasher.update(std.mem.asBytes(&p.timer));
@@ -340,4 +390,52 @@ test "the hash changes if APU channel state (ENG-71) differs" {
     const a = hashState(&a_machine.cpu, &a_machine.bus);
     const b = hashState(&b_machine.cpu, &b_machine.bus);
     try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "the APU hash covers sweep configuration, not just the sweep divider (ENG-71)" {
+    const buf = minimalNromBuf();
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
+
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.apu.pulse1.sweep_shift = 3; // decides the next target period
+
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "the APU hash distinguishes an empty DMC sample buffer from one holding 0x00" {
+    const buf = minimalNromBuf();
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
+
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.apu.dmc.sample_buffer = 0x00; // was null
+
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+}
+
+test "the APU hash covers the frame sequencer's pending-reset and deferred-half-frame latches" {
+    const buf = minimalNromBuf();
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
+
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    b_machine.bus.apu.frame.half_frame_pending = true;
+
+    const a = hashState(&a_machine.cpu, &a_machine.bus);
+    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+
+    var c_machine: Machine = undefined;
+    try c_machine.init(&buf);
+    c_machine.bus.apu.frame.reset_delay = 3;
+    const c = hashState(&c_machine.cpu, &c_machine.bus);
+    try testing.expect(!std.mem.eql(u8, &a, &c));
 }

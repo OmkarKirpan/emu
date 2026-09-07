@@ -74,12 +74,6 @@ var device_sample_rate: f32 = 48000.0;
 var nominal_per_cycle: f32 = 0;
 var current_ratio: f32 = 1.0;
 
-/// Re-derives `nominal_per_cycle` for the (possibly just-changed) device
-/// sample rate -- called by `init`.
-fn recomputeNominal() void {
-    nominal_per_cycle = device_sample_rate / cpu_hz;
-}
-
 /// Fractional accumulator for "samples per CPU cycle" -- mirrors
 /// `EmulatorScreen.tsx`'s `pendingFrames` pattern for the same reason: the
 /// nominal rate isn't an integer, and truncating it every cycle instead of
@@ -128,9 +122,11 @@ fn drcRatio() f32 {
 /// whatever ROM is or isn't loaded, per this file's module doc comment.
 pub fn init(sample_rate: f32) void {
     device_sample_rate = sample_rate;
-    recomputeNominal();
+    nominal_per_cycle = device_sample_rate / cpu_hz;
     current_ratio = 1.0;
     sample_accumulator = 0.0;
+    decimation_sum = 0.0;
+    decimation_count = 0;
     fill_ema = targetFill();
     control = .{};
     ring = [_]f32{0} ** capacity;
@@ -144,22 +140,46 @@ pub fn controlPtr() *ControlBlock {
     return &control;
 }
 
+/// Running mean of the raw samples seen since the last emitted output
+/// sample -- the "integrate" half of integrate-and-dump decimation. See
+/// `pushSample`.
+var decimation_sum: f32 = 0.0;
+var decimation_count: u32 = 0;
+
 /// Called once per CPU cycle from `Apu.tick`, with that cycle's fully
-/// mixed-and-filtered sample. Decimates via a fractional-accumulator
-/// technique (mirroring the old per-frame sine generator, just at
-/// per-cycle granularity now) -- `current_ratio` (refreshed once per video
-/// frame by `updateDrc`, not recomputed here) is what DRC actually adjusts.
+/// mixed-and-filtered sample. `current_ratio` (refreshed once per video
+/// frame by `updateDrc`, not recomputed here) is what DRC actually
+/// adjusts; the fractional accumulator decides *when* an output sample is
+/// due, exactly as the old per-frame sine generator did.
+///
+/// **What is emitted is the mean of every raw sample since the last one**
+/// (integrate-and-dump), not the single sample that happened to land on
+/// the boundary. At ~37 CPU cycles per output sample this is a 37-tap box
+/// filter, whose nulls sit on multiples of the output rate -- which is
+/// what actually keeps the ~37:1 decimation below from aliasing the
+/// square waves' harmonics down into the audible band. `Apu`'s 14kHz
+/// one-pole low-pass shapes tone the way the hardware's RC network does,
+/// but a single pole is ~6dB down at 24kHz and cannot do this job on its
+/// own -- picking one sample in 37 after it would fold harmonics straight
+/// back into the passband.
 pub fn pushSample(raw: f32) void {
+    decimation_sum += raw;
+    decimation_count += 1;
+
     sample_accumulator += nominal_per_cycle * current_ratio;
     if (sample_accumulator < 1.0) return;
     sample_accumulator -= 1.0;
+
+    const mean = decimation_sum / @as(f32, @floatFromInt(decimation_count));
+    decimation_sum = 0.0;
+    decimation_count = 0;
 
     const read = @atomicLoad(i32, &control.read_index, .acquire);
     const write = control.write_index; // producer-owned; plain load is fine (see module doc comment)
     const filled: u32 = @bitCast(write -% read);
     if (filled >= capacity) return; // defensive belt, same as before
 
-    ring[@as(u32, @bitCast(write)) & (capacity - 1)] = raw;
+    ring[@as(u32, @bitCast(write)) & (capacity - 1)] = mean;
     @atomicStore(i32, &control.write_index, write +% 1, .release);
 }
 
@@ -227,7 +247,7 @@ test "pushSample saturates at capacity rather than overwriting unread data" {
     try testing.expectEqual(capacity, filled);
 }
 
-test "pushSample produces roughly nominal_per_frame samples per simulated video frame" {
+test "pushSample produces roughly one video frame's worth of samples per frame of CPU cycles" {
     init(48000.0);
     const cpu_cycles_per_frame = 29781; // ~1,789,773 / 60.0988
     var i: u32 = 0;
@@ -237,10 +257,23 @@ test "pushSample produces roughly nominal_per_frame samples per simulated video 
     try testing.expect(filled > 780 and filled < 820);
 }
 
-test "updateDrc's fill_ema/ratio still keeps a continuously-produced ring stable near target" {
+test "updateDrc holds a continuously-produced ring at target fill against a consumer running slightly fast" {
     init(48000.0);
     const cpu_cycles_per_frame = 29781;
+    // Deliberately not nominal (48000/60.0988 = ~798.7): a consumer drifting
+    // ~0.7 samples/frame slow is exactly the drift DRC exists to absorb.
     const drain: i32 = 798;
+    const target: i32 = 3072; // targetFill() at 48kHz
+
+    // Start *at* target rather than empty. From empty this loop needs ~1200
+    // frames just to climb to target (DRC's correction is clamped to
+    // +-0.5%, so it fills at only a few samples/frame), and a test that
+    // stopped at 500 frames mid-climb could asserts nothing tighter than
+    // "somewhere between empty and full" -- which passes with DRC disabled.
+    // Pinning the start at target instead makes the assertion below a real
+    // statement about *holding* it.
+    control.write_index = target;
+
     var frame: u32 = 0;
     while (frame < 500) : (frame += 1) {
         updateDrc();
@@ -251,6 +284,33 @@ test "updateDrc's fill_ema/ratio still keeps a continuously-produced ring stable
         const d = @min(drain, @as(i32, @bitCast(filled_before_drain)));
         simulateConsumerRead(@bitCast(d));
     }
-    const settled: u32 = @bitCast(control.write_index -% control.read_index);
-    try testing.expect(settled > 0 and settled < capacity);
+
+    // +-64 samples (~1.3ms) after 500 frames (~8.3s). With DRC defeated
+    // (ratio pinned to 1.0) the 0.7 samples/frame surplus alone lands at
+    // ~3412 -- well outside this band, so this fails if the loop stops
+    // correcting rather than merely drifting slowly.
+    const settled: i32 = @bitCast(control.write_index -% control.read_index);
+    try testing.expect(@abs(settled - target) <= 64);
+}
+
+test "pushSample emits the mean of the cycles it spans, not the one that landed on the boundary" {
+    init(48000.0);
+    // A full-scale signal alternating every CPU cycle -- i.e. energy at
+    // ~894kHz, far above the 24kHz Nyquist of the 48kHz output. Nearest-
+    // sample decimation would alias this straight through as a train of
+    // +-1 output samples; integrate-and-dump averages each ~37-cycle span
+    // to (near) zero, which is what an anti-aliased decimator must do.
+    var i: u32 = 0;
+    var sign: f32 = 1.0;
+    while (i < 29781) : (i += 1) {
+        pushSample(sign);
+        sign = -sign;
+    }
+    const produced: u32 = @bitCast(control.write_index -% control.read_index);
+    try testing.expect(produced > 700); // a frame's worth actually came out
+    var slot: u32 = 0;
+    while (slot < produced) : (slot += 1) {
+        // Worst case is one unpaired sample out of ~37, so |mean| <= ~0.03.
+        try testing.expect(@abs(ring[slot]) < 0.05);
+    }
 }
