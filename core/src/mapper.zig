@@ -1259,6 +1259,187 @@ test "Uxrom reports no IRQ" {
     m.irqAcknowledge(); // must not panic
 }
 
+/// CNROM (mapper 3): the mirror image of UxROM (M7b) -- fixed PRG exactly
+/// like `Nrom`, switchable CHR instead of fixed. A write to *anywhere* in
+/// $8000-$FFFF selects the whole 8KB CHR-ROM bank; real CNROM boards decode
+/// no address lines in that range at all, only the data bus, so `prgWrite`
+/// ignores `addr` entirely.
+///
+/// **Only the low 2 bits of the written value are decoded.** Real CNROM
+/// boards route just two data-bus lines into the bank-select latch (2 bits
+/// = 4 banks = 32KB CHR-ROM, the largest a CNROM board ever shipped), so
+/// `chr_bank` is a `u2` and assigning into it truncates for free. The
+/// vendored ROM (`M3_P32K_C32K_H.nes`, exactly 32KB CHR-ROM = 4 banks)
+/// never asks for a bank past 3, so a 2-bit mask is both what real hardware
+/// does and everything this gate exercises -- see `cnrom_test.zig`.
+///
+/// **No bus-conflict modeling.** Real CNROM ties the bank register's input
+/// to the raw CPU data bus with no gating logic, so a `STA` whose operand
+/// byte disagrees with the ROM byte already sitting at that PRG address can
+/// corrupt the write (the two outputs fight on the bus; the winner is
+/// board- and byte-dependent, not architecturally defined). holy-mapperel's
+/// CNROM bank-select routine, like every well-behaved CNROM game, writes
+/// through a table whose bytes are chosen to avoid this, so nothing in
+/// scope here distinguishes "modeled" from "not modeled" -- there is no
+/// vendored ROM to validate a bus-conflict model against. Deferred rather
+/// than guessed at.
+///
+/// **PRG is fixed** -- identical banking to `Nrom`: 16KB mirrored across
+/// $8000-$FFFF, or 32KB unmirrored, no PRG bank-switch register at all.
+///
+/// **CHR-ROM is borrowed, not copied**, like `Mmc1.chr_rom` and unlike
+/// `Nrom.chr`'s inline 8KB array. CNROM allows up to 32KB CHR; inlining
+/// that would put 32KB in *every* `Mapper` value, `Nrom`'s and `TestStub`'s
+/// included, since a union is as large as its largest variant -- see
+/// `Mmc1`'s doc comment for the same argument in more detail. CNROM has no
+/// CHR-RAM board variant (switching between CHR-ROM banks is the entire
+/// point of the design), so there is no inline-RAM fallback field to
+/// mirror `Mmc1.chr_ram` either.
+///
+/// **No IRQ.** `tick()` is empty, like `Nrom`'s.
+pub const Cnrom = struct {
+    prg_rom: []const u8,
+    chr_rom: []const u8,
+    chr_bank: u2 = 0,
+    /// Fixed for the life of the cartridge -- CNROM has no mirroring
+    /// control, exactly like `Nrom`: this is exactly what the iNES header
+    /// said and never changes.
+    mirroring_mode: Mirroring,
+
+    /// See the type doc comment for why `prg_rom`/`chr_rom` are borrowed
+    /// slices rather than copied, unlike `Nrom.chr`.
+    pub fn init(prg_rom: []const u8, chr_rom: []const u8, header_mirroring: Mirroring) Cnrom {
+        return .{ .prg_rom = prg_rom, .chr_rom = chr_rom, .mirroring_mode = header_mirroring };
+    }
+
+    pub fn prgRead(self: *const Cnrom, addr: u16) u8 {
+        const offset = (addr - 0x8000) % @as(u16, @intCast(self.prg_rom.len));
+        return self.prg_rom[offset];
+    }
+
+    pub fn prgWrite(self: *Cnrom, addr: u16, value: u8) void {
+        // No PRG bank-switch register exists: any write anywhere in
+        // $8000-$FFFF selects the CHR bank instead. `addr` genuinely
+        // doesn't matter here -- see the type doc comment.
+        _ = addr;
+        self.chr_bank = @truncate(value);
+    }
+
+    pub fn chrRead(self: *const Cnrom, addr: u16) u8 {
+        const offset = @as(usize, self.chr_bank) * 0x2000 + addr;
+        return self.chr_rom[offset % self.chr_rom.len];
+    }
+
+    pub fn chrWrite(self: *Cnrom, addr: u16, value: u8) void {
+        // CHR-ROM: writes are no-ops, same as Nrom's CHR-ROM path.
+        _ = self;
+        _ = addr;
+        _ = value;
+    }
+
+    pub fn irqPending(self: *const Cnrom) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn irqAcknowledge(self: *Cnrom) void {
+        _ = self;
+    }
+
+    pub fn mirroring(self: *const Cnrom) Mirroring {
+        return self.mirroring_mode;
+    }
+
+    pub fn tick(self: *Cnrom) void {
+        _ = self;
+    }
+};
+
+// ------------------------------------------------------------ CNROM tests
+
+/// CHR where byte 0 of each 8KB bank is that bank's own number, so a read
+/// at the start of the CHR window names whichever bank is mapped there.
+fn taggedChr(comptime banks: usize) [banks * 0x2000]u8 {
+    var chr = [_]u8{0} ** (banks * 0x2000);
+    for (0..banks) |b| chr[b * 0x2000] = @intCast(b);
+    return chr;
+}
+
+test "Cnrom.prgRead mirrors a 16KB bank across the full $8000-$FFFF window" {
+    var prg = [_]u8{0xAA} ** 0x4000;
+    prg[0] = 0x11;
+    var chr = taggedChr(1);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0xC000)); // mirrored copy
+}
+
+test "Cnrom.prgRead does not mirror a full 32KB bank" {
+    var prg = [_]u8{0xAA} ** 0x8000;
+    prg[0] = 0x11;
+    prg[0x4000] = 0x33;
+    var chr = taggedChr(1);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x33), m.prgRead(0xC000));
+}
+
+test "Cnrom.prgWrite selects a CHR bank rather than writing PRG" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(4);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    m.prgWrite(0x8000, 2);
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000)); // PRG untouched
+    try testing.expectEqual(@as(u8, 2), m.chrRead(0)); // CHR bank 2 now mapped
+}
+
+test "Cnrom selects every one of the 4 CHR banks a 32KB board can address" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(4);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    for (0..4) |b| {
+        m.prgWrite(0x8000, @intCast(b));
+        try testing.expectEqual(@as(u8, @intCast(b)), m.chrRead(0));
+        try testing.expectEqual(@as(u8, 0), m.chrRead(0x1FFF)); // whole bank swings, not just byte 0
+    }
+}
+
+test "Cnrom.prgWrite masks the bank number to its low 2 bits" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(4);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    m.prgWrite(0x8000, 0xFD); // 0b1111_1101 -> low 2 bits = 01 = bank 1
+    try testing.expectEqual(@as(u8, 1), m.chrRead(0));
+}
+
+test "Cnrom.chrWrite is a no-op: CHR-ROM only, no CHR-RAM variant" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(1);
+    chr[0] = 0x42;
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    m.chrWrite(0, 0xFF);
+    try testing.expectEqual(@as(u8, 0x42), m.chrRead(0));
+}
+
+test "Cnrom.mirroring passes the header value through unchanged, like Nrom" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(1);
+    var m_h = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    try testing.expectEqual(Mirroring.horizontal, m_h.mirroring());
+    var m_v = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .vertical) };
+    try testing.expectEqual(Mirroring.vertical, m_v.mirroring());
+    m_v.prgWrite(0x8000, 3); // banking activity must not disturb mirroring
+    try testing.expectEqual(Mirroring.vertical, m_v.mirroring());
+}
+
+test "Cnrom never raises an IRQ" {
+    var prg = [_]u8{0x11} ** 0x4000;
+    var chr = taggedChr(1);
+    var m = Mapper{ .cnrom = Cnrom.init(&prg, &chr, .horizontal) };
+    try testing.expect(!m.irqPending());
+    m.irqAcknowledge(); // must not panic
+}
+
 /// Closed set of NES mappers (see the map's "Out of scope": coverage is
 /// capped at NROM/MMC1/UxROM/CNROM/MMC3), plus one test double (`TestStub`).
 /// A tagged union dispatched via
@@ -1279,6 +1460,7 @@ pub const Mapper = union(enum) {
     mmc1: Mmc1,
     mmc3: Mmc3,
     uxrom: Uxrom,
+    cnrom: Cnrom,
     /// Not a cartridge — a test double for the parts of this interface NROM
     /// cannot reach. See `TestStub`.
     test_stub: TestStub,

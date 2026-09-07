@@ -303,6 +303,12 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
             hasher.update(&u.chr_ram);
             hasher.update(&[_]u8{u.prg_bank});
         },
+        // CNROM has exactly one register (which CHR-ROM bank is selected)
+        // and no CHR-RAM to speak of -- see `mapper.zig`'s `Cnrom` doc
+        // comment. Two runs differing only in the selected bank would
+        // otherwise hash identically, same reasoning as MMC1's registers
+        // above.
+        .cnrom => |*c| hasher.update(&[_]u8{c.chr_bank}),
         .test_stub => {},
     }
 }
