@@ -34,8 +34,12 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   can select single-screen modes the iNES header cannot express; the header
   now supplies only a power-on value. `Mapper.tick()` runs every CPU cycle
   from `Cpu.tick` for the same reason MMC1 needs it (telling a
-  read-modify-write's two writes apart) and MMC3 will (its scanline IRQ).
-  See `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md`.
+  read-modify-write's two writes apart) and MMC3 (M7d) needs it too, as the
+  clock for its scanline IRQ's A12 low-time filter. `Mapper.chrRead` is
+  mutable (not `*const`) as of M7d, since MMC3 tracks PPU address line A12
+  from every CHR access; see
+  `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md` and
+  `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`.
   **The audio ring buffer
   (`audio_ring.zig`) used to sit on the wasm-only side of that line; as of
   M6 it does not.** `Apu` is a shared subsystem ticked from `Cpu.tick`
@@ -70,12 +74,21 @@ AudioWorklet), and the APU (all 5 channels, frame sequencer, mixer + RC
 filter cascade, real game audio replacing M5's test tone). M7a (MMC1) is
 done too: the first cartridge here with registers, which is why mirroring
 now lives on the mapper rather than the PPU and why `Mapper` has a
-per-cycle `tick`. M7b (UxROM) is next. See
+per-cycle `tick`. M7d (MMC3 + scanline IRQ) is also done, landed in
+parallel with M7b/M7c: the first cartridge here with a working IRQ, and the
+first mapper that actually watches PPU bus activity (address line A12)
+rather than only reacting to reads/writes aimed at it — which is why
+`Mapper.chrRead` is now mutable, and which caught a real, pre-existing PPU
+gap (`Ppu.fetchSpriteUnits` skipping sprite pattern fetches on scanlines
+with no sprites in range — invisible until a mapper depended on the bus
+activity itself, not just its visible effect). See
 `docs/adr/0001-audio-playback-no-howler.md` for the threaded-audio pipeline
 decision, `docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter
-decisions and the deferred DMC-DMA-stealing gap, and
+decisions and the deferred DMC-DMA-stealing gap,
 `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md` for the
-two interface changes MMC1 forced.
+two interface changes MMC1 forced, and
+`docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md` for MMC3's A12
+design and the PPU fix it forced.
 
 ## Conventions worth knowing before touching either side
 
