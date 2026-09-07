@@ -126,7 +126,38 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    const mod_tests = b.addTest(.{ .root_module = test_mod });
+    // ENG-72 (M7a): the MMC1 conformance stage. Unlike every other vendored
+    // suite here, holy-mapperel is **zlib licensed** -- an explicit grant
+    // rather than the "no formal grant found" posture the Blargg ROMs rest
+    // on. Results come off the screen, not $6000; see mapperel_harness.zig
+    // and tests/roms/holy_mapperel/ATTRIBUTION.md.
+    const mapperel_names = [_][]const u8{
+        "M1_P128K_CR8K", "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+    };
+    for (mapperel_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("mapperel_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/holy_mapperel/{s}.nes", .{name})),
+        });
+    }
+
+    // ENG-72 (M7a): the *combined* ppu_vbl_nmi ROM -- mapper 1, 256KB PRG,
+    // the one this codebase could not run until MMC1 existed. Its ten
+    // sub-tests are already vendored individually above as NROM singles, so
+    // a failure here is the mapper and nothing else.
+    test_mod.addAnonymousImport("ppu_vbl_nmi_combined", .{
+        .root_source_file = b.path("tests/roms/ppu_vbl_nmi/ppu_vbl_nmi.nes"),
+    });
+
+    // The vendored-ROM suites make a full run take minutes, so allow
+    // narrowing it: `zig build test -Dtest-filter=Mmc1`. Correctness still
+    // means an unfiltered run; this is for the edit/run loop.
+    const test_filters = b.option(
+        []const []const u8,
+        "test-filter",
+        "Only run tests whose name contains this string (repeatable)",
+    ) orelse &[_][]const u8{};
+
+    const mod_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);

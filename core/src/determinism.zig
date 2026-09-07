@@ -269,6 +269,18 @@ fn hashPulse(hasher: *Sha256, p: *const apu_mod.Pulse) void {
 fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
     switch (mapper.*) {
         .nrom => |*n| if (n.chr_is_ram) hasher.update(&n.chr),
+        // MMC1 adds the first *registers* any cartridge here has had. They
+        // are as much emulation state as CHR-RAM is: two runs that diverge
+        // only in which bank is mapped would otherwise hash identically.
+        // `shift` and `last_write_cycle` are included because a
+        // half-completed 5-write sequence, and the consecutive-write rule's
+        // memory of the last write, both survive into the next instruction.
+        .mmc1 => |*m| {
+            if (m.chr_rom.len == 0) hasher.update(&m.chr_ram);
+            hasher.update(&[_]u8{ m.shift, m.control, m.chr_bank0, m.chr_bank1, m.prg_bank });
+            hasher.update(std.mem.asBytes(&m.cycle));
+            hasher.update(std.mem.asBytes(&m.last_write_cycle));
+        },
         .test_stub => {},
     }
 }

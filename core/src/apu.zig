@@ -1325,7 +1325,7 @@ test "a pulse channel driven through its real registers emits the period and dut
     // whole CPU cycles through `tick`) and measures the waveform that
     // comes out the other side.
     var prg = [_]u8{0} ** 0x8000;
-    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}) };
+    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}, .horizontal) };
 
     var apu = Apu{};
     apu.writeRegister(0x4015, 0x01); // enable pulse 1
@@ -1375,7 +1375,7 @@ test "the filtered sample leaving the APU is DC-free when silent and swings when
     // ENG-62 specifies. This test is the proof that the DC actually gets
     // blocked rather than being shipped to the worklet as a fixed offset.
     var prg = [_]u8{0} ** 0x8000;
-    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}) };
+    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}, .horizontal) };
 
     var quiet = Apu{};
     var i: u32 = 0;

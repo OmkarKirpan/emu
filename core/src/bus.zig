@@ -99,8 +99,10 @@ pub const Bus = struct {
     /// Last value driven on the data bus; see the open-bus note above.
     open_bus: u8 = 0,
 
-    pub fn init(m: Mapper, mirroring: Mirroring) Bus {
-        return .{ .mapper = m, .ppu = Ppu.init(mirroring) };
+    /// Takes no mirroring: it lives on the cartridge now (`Mapper.mirroring`),
+    /// which is where MMC1 changes it at runtime.
+    pub fn init(m: Mapper) Bus {
+        return .{ .mapper = m, .ppu = Ppu.init() };
     }
 
     pub fn read(self: *Bus, addr: u16) u8 {
@@ -170,7 +172,7 @@ pub const Bus = struct {
 };
 
 fn testBus(prg: []const u8) Bus {
-    return Bus.init(Mapper{ .nrom = Nrom.init(prg, &.{}) }, .horizontal);
+    return Bus.init(Mapper{ .nrom = Nrom.init(prg, &.{}, .horizontal) });
 }
 
 test "Bus mirrors WRAM every 2KB through $1FFF" {

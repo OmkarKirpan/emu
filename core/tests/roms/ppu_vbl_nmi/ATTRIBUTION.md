@@ -6,11 +6,18 @@ Source: **`ppu_vbl_nmi`**, one of the standard Blargg (Shay Green,
 `gblargg@gmail.com`) NES PPU diagnostic suites, via the NESdev-wiki-endorsed
 mirror [`christopherpow/nes-test-roms`](https://github.com/christopherpow/nes-test-roms).
 
-The suite's combined `ppu_vbl_nmi/ppu_vbl_nmi.nes` (an interactive, all-10-in-
-one ROM for running under a real console or full-featured emulator) is
-**mapper 1 (MMC1)** — confirmed by its iNES header (`flags6 = 0x11`, 256KB
-PRG) — which this codebase cannot run (only mapper 0/NROM exists through
-M2). The suite also ships each of its 10 individual checks as a **standalone
+The suite's combined `ppu_vbl_nmi/ppu_vbl_nmi.nes` (an all-10-in-one ROM
+that banks each sub-test in) is **mapper 1 (MMC1)** — confirmed by its iNES
+header (`flags6 = 0x11`, 256KB PRG). Through M6 this codebase could not run
+it, since only mapper 0/NROM existed; **as of M7a (ENG-72) it is vendored
+here too**, as the secondary MMC1 gate. It is worth having precisely because
+its ten sub-tests already pass individually as NROM singles, so a failure of
+the combined ROM can only be the mapper — and it costs no new harness code,
+since it speaks the same `$6000` protocol (`core/src/mmc1_test.zig`). The
+primary MMC1 gate is the purpose-built holy-mapperel suite; see
+`../holy_mapperel/ATTRIBUTION.md`.
+
+The suite also ships each of its 10 individual checks as a **standalone
 mapper-0/NROM ROM** under `rom_singles/`, each independently confirmed via
 its iNES header (`flags6 = 0x01`: mapper low nibble 0, vertical mirroring;
 `flags7 = 0x00`; 32KB PRG + 8KB CHR-ROM, 40,976 bytes) before vendoring here.
@@ -30,6 +37,7 @@ Downloaded, unmodified, from:
 | `08-nmi_off_timing.nes` | `.../ppu_vbl_nmi/rom_singles/08-nmi_off_timing.nes` | 40,976 bytes |
 | `09-even_odd_frames.nes` | `.../ppu_vbl_nmi/rom_singles/09-even_odd_frames.nes` | 40,976 bytes |
 | `10-even_odd_timing.nes` | `.../ppu_vbl_nmi/rom_singles/10-even_odd_timing.nes` | 40,976 bytes |
+| `ppu_vbl_nmi.nes` (combined, MMC1) | `.../ppu_vbl_nmi/ppu_vbl_nmi.nes` | 262,160 bytes |
 
 (each `...` is `https://raw.githubusercontent.com/christopherpow/nes-test-roms/master`)
 

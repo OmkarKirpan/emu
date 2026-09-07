@@ -79,10 +79,16 @@ fn paletteIndex(addr: u16) u5 {
 /// degrades to vertical mirroring -- a named, deliberate fallback rather
 /// than a silent mishandling. TODO(M7 or later): give `Mapper` a hook for
 /// cartridge-supplied nametable VRAM and route four_screen through it.
-fn physicalNametable(mirroring: Mirroring, logical: u2) u1 {
+pub fn physicalNametable(mirroring: Mirroring, logical: u2) u1 {
     return switch (mirroring) {
         .horizontal => @intCast(logical >> 1),
         .vertical, .four_screen => @intCast(logical & 1),
+        // Both physical banks show the same 1KB; which one is the mapper's
+        // choice. MMC1 (M7a) is the first cartridge here that can ask for
+        // this, and it is why `Ppu` asks the mapper per access instead of
+        // caching a mirroring mode of its own.
+        .single_screen_lower => 0,
+        .single_screen_upper => 1,
     };
 }
 
@@ -237,8 +243,6 @@ pub const Ppu = struct {
     /// flip-X attribute bit itself.
     sprite_units: [8]SpriteUnit = [_]SpriteUnit{.{}} ** 8,
 
-    mirroring: Mirroring,
-
     // ------------------------------------------------------- dot/scanline
     /// 0-261; 0-239 visible, 240 idle ("post-render"), 241-260 vblank, 261
     /// pre-render (fills the shifters for scanline 0 exactly like a visible
@@ -285,8 +289,12 @@ pub const Ppu = struct {
     /// to is that the *index* is the one the background pipeline decoded.
     framebuffer: [256 * 240]u8 = [_]u8{0} ** (256 * 240),
 
-    pub fn init(mirroring: Mirroring) Ppu {
-        return .{ .mirroring = mirroring };
+    /// Takes no mirroring: the cartridge owns it (`Mapper.mirroring`), and
+    /// the PPU resolves it per nametable access. Before M7a this was a field
+    /// set once from the iNES header, which MMC1's runtime mirroring control
+    /// made untenable.
+    pub fn init() Ppu {
+        return .{};
     }
 
     /// What survives a CPU /RESET vs. what a fresh `Ppu.init` gives you.
@@ -383,13 +391,14 @@ pub const Ppu = struct {
 
     // ------------------------------------------------------------- memory
 
-    fn vramAddress(self: *const Ppu, addr: u16) u11 {
+    fn vramAddress(self: *const Ppu, addr: u16, mapper: *const Mapper) u11 {
+        _ = self;
         // $3000-$3EFF mirrors $2000-$2EFF before the per-cartridge mirroring
         // math ever sees it.
         const folded: u16 = if (addr >= 0x3000) addr - 0x1000 else addr;
         const offset: u16 = folded & 0x0FFF;
         const logical: u2 = @intCast(offset >> 10);
-        const physical: u1 = physicalNametable(self.mirroring, logical);
+        const physical: u1 = physicalNametable(mapper.mirroring(), logical);
         return (@as(u11, physical) << 10) | @as(u11, @intCast(offset & 0x03FF));
     }
 
@@ -397,7 +406,7 @@ pub const Ppu = struct {
         const a = addr & 0x3FFF;
         return switch (a) {
             0x0000...0x1FFF => mapper.chrRead(a),
-            0x2000...0x3EFF => self.vram[self.vramAddress(a)],
+            0x2000...0x3EFF => self.vram[self.vramAddress(a, mapper)],
             0x3F00...0x3FFF => self.palette[paletteIndex(a)],
             else => unreachable,
         };
@@ -407,7 +416,7 @@ pub const Ppu = struct {
         const a = addr & 0x3FFF;
         switch (a) {
             0x0000...0x1FFF => mapper.chrWrite(a, value),
-            0x2000...0x3EFF => self.vram[self.vramAddress(a)] = value,
+            0x2000...0x3EFF => self.vram[self.vramAddress(a, mapper)] = value,
             0x3F00...0x3FFF => self.palette[paletteIndex(a)] = value,
             else => unreachable,
         }
@@ -961,16 +970,22 @@ pub const Ppu = struct {
 
 // ============================== tests ==============================
 
-fn testPpu(mirroring: Mirroring) Ppu {
-    return Ppu.init(mirroring);
+fn testPpu() Ppu {
+    return Ppu.init();
 }
 
 fn testMapper() Mapper {
-    return Mapper{ .nrom = Nrom.init(&.{}, &.{}) }; // CHR-RAM, 8KB
+    return Mapper{ .nrom = Nrom.init(&.{}, &.{}, .horizontal) }; // CHR-RAM, 8KB
+}
+
+/// A mapper reporting a specific mirroring, for the nametable tests that
+/// used to get it from `Ppu.init`.
+fn testMapperM(mirroring: Mirroring) Mapper {
+    return Mapper{ .nrom = Nrom.init(&.{}, &.{}, mirroring) };
 }
 
 test "PPUSTATUS read clears the VBL flag and the write-toggle" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.status.vblank = true;
     ppu.w = true;
@@ -981,7 +996,7 @@ test "PPUSTATUS read clears the VBL flag and the write-toggle" {
 }
 
 test "PPUSTATUS read returns open-bus bits from the data-bus latch" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2000, 0b0001_0101, &m); // arbitrary, lands in data_bus
     const v = ppu.readRegister(0x2002, &m);
@@ -989,7 +1004,7 @@ test "PPUSTATUS read returns open-bus bits from the data-bus latch" {
 }
 
 test "writing PPUSTATUS is a no-op besides driving the data bus" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.status.vblank = true;
     ppu.writeRegister(0x2002, 0xFF, &m);
@@ -997,7 +1012,7 @@ test "writing PPUSTATUS is a no-op besides driving the data bus" {
 }
 
 test "PPUADDR is written high byte first, then low, then v=t" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2006, 0x21, &m); // high byte (top 2 bits dropped: 6 bits kept)
     try testing.expect(ppu.w);
@@ -1009,7 +1024,7 @@ test "PPUADDR is written high byte first, then low, then v=t" {
 }
 
 test "a PPUSTATUS read clears the write toggle mid-PPUADDR-write" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2006, 0x21, &m); // first write, w=1
     _ = ppu.readRegister(0x2002, &m); // clears w
@@ -1019,7 +1034,7 @@ test "a PPUSTATUS read clears the write toggle mid-PPUADDR-write" {
 }
 
 test "PPUDATA reads are buffered by one access, except for palette addresses" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     // Prime nametable byte at $2000 via a direct VRAM write.
     ppu.vram[0] = 0xAB;
@@ -1039,7 +1054,7 @@ test "PPUDATA reads are buffered by one access, except for palette addresses" {
 }
 
 test "PPUDATA increments v by 1 or 32 depending on PPUCTRL bit 2" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.v = 0x2000;
     ppu.writeRegister(0x2007, 0x11, &m);
@@ -1058,7 +1073,7 @@ test "PPUDATA increments v by 1 or 32 depending on PPUCTRL bit 2" {
 }
 
 test "PPUDATA writes reach CHR-RAM and nametable VRAM through the mapper" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper(); // CHR-RAM
     ppu.v = 0x0010;
     ppu.writeRegister(0x2007, 0x77, &m);
@@ -1070,7 +1085,7 @@ test "PPUDATA writes reach CHR-RAM and nametable VRAM through the mapper" {
 }
 
 test "OAMDATA writes auto-increment OAMADDR; reads do not" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2003, 0x10, &m);
     ppu.writeRegister(0x2004, 0xAA, &m);
@@ -1083,7 +1098,7 @@ test "OAMDATA writes auto-increment OAMADDR; reads do not" {
 }
 
 test "PPUSCROLL's two writes set fine-X, coarse X, coarse Y, and fine Y" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2005, 0b0101_1011, &m); // coarse X=0b01011=11, fine X=0b011=3
     try testing.expectEqual(@as(u3, 0b011), ppu.fine_x);
@@ -1095,7 +1110,7 @@ test "PPUSCROLL's two writes set fine-X, coarse X, coarse Y, and fine Y" {
 }
 
 test "PPUCTRL and PPUMASK writes latch one dot late; everything else is immediate" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
 
     // PPUMASK: `advanceDot`'s odd-frame skip and `renderingEnabled` read
@@ -1124,7 +1139,7 @@ test "PPUCTRL and PPUMASK writes latch one dot late; everything else is immediat
 }
 
 test "a second PPUCTRL write does not swallow the first one's pending latch" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2000, 0x80, &m); // nmi_enable, pending
     ppu.writeRegister(0x2000, 0x04, &m); // increment32; flushes the first
@@ -1136,7 +1151,7 @@ test "a second PPUCTRL write does not swallow the first one's pending latch" {
 }
 
 test "Ppu.reset drops a pending PPUCTRL/PPUMASK latch instead of letting it apply after" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2000, 0x80, &m);
     ppu.writeRegister(0x2001, 0x1E, &m);
@@ -1147,7 +1162,7 @@ test "Ppu.reset drops a pending PPUCTRL/PPUMASK latch instead of letting it appl
 }
 
 test "PPUCTRL's nametable bits land in t bits 10-11" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.writeRegister(0x2000, 0b10, &m);
     try testing.expectEqual(@as(u15, 0x0800), ppu.t & 0x0C00);
@@ -1157,7 +1172,7 @@ test "$2002/register mirroring: Bus is responsible for the every-8-bytes fold, n
     // Ppu.readRegister/writeRegister take an already-folded $2000-$2007
     // address -- this test just documents that expectation exists at the
     // Ppu level (Bus's own mirroring test lives in bus.zig).
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.status.vblank = true;
     const a = ppu.readRegister(0x2002, &m);
@@ -1165,7 +1180,7 @@ test "$2002/register mirroring: Bus is responsible for the every-8-bytes fold, n
 }
 
 test "horizontal mirroring ties $2000/$2400 together and $2800/$2C00 together" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.v = 0x2000;
     ppu.writeRegister(0x2007, 0x11, &m);
@@ -1179,8 +1194,8 @@ test "horizontal mirroring ties $2000/$2400 together and $2800/$2C00 together" {
 }
 
 test "vertical mirroring ties $2000/$2800 together and $2400/$2C00 together" {
-    var ppu = testPpu(.vertical);
-    var m = testMapper();
+    var ppu = testPpu();
+    var m = testMapperM(.vertical);
     ppu.v = 0x2000;
     ppu.writeRegister(0x2007, 0x33, &m);
     ppu.v = 0x2800;
@@ -1188,8 +1203,45 @@ test "vertical mirroring ties $2000/$2800 together and $2400/$2C00 together" {
     try testing.expectEqual(@as(u8, 0x00), ppu.vramRead(0x2400, &m));
 }
 
+test "single-screen mirroring ties all four nametables to one physical bank" {
+    // MMC1 (M7a) is the first cartridge here that can select these, and the
+    // two modes must land in *different* physical banks -- a mapper that
+    // reported both as bank 0 would pass a same-bank-only test.
+    var ppu = testPpu();
+    var lower = testMapperM(.single_screen_lower);
+    ppu.v = 0x2000;
+    ppu.writeRegister(0x2007, 0x55, &lower);
+    for ([_]u16{ 0x2000, 0x2400, 0x2800, 0x2C00 }) |nt| {
+        try testing.expectEqual(@as(u8, 0x55), ppu.vramRead(nt, &lower));
+    }
+    try testing.expectEqual(@as(u8, 0x55), ppu.vram[0]);
+
+    var upper = testMapperM(.single_screen_upper);
+    ppu.v = 0x2000;
+    ppu.writeRegister(0x2007, 0x66, &upper);
+    for ([_]u16{ 0x2000, 0x2400, 0x2800, 0x2C00 }) |nt| {
+        try testing.expectEqual(@as(u8, 0x66), ppu.vramRead(nt, &upper));
+    }
+    try testing.expectEqual(@as(u8, 0x66), ppu.vram[0x400]); // the *other* bank
+    try testing.expectEqual(@as(u8, 0x55), ppu.vram[0]); // lower's byte, untouched
+}
+
+test "the PPU follows a mapper that changes mirroring mid-run" {
+    // The reason mirroring moved onto the mapper: MMC1 rewrites it whenever
+    // its control register is written, so a cached copy in `Ppu` would go
+    // stale. Writing through one mode and reading through another must see
+    // the remap.
+    var ppu = testPpu();
+    var m = testMapperM(.horizontal);
+    ppu.v = 0x2400;
+    ppu.writeRegister(0x2007, 0x77, &m); // horizontal: $2400 -> bank 0
+    m.nrom.mirroring_mode = .vertical; // ... now $2400 -> bank 1
+    try testing.expectEqual(@as(u8, 0x00), ppu.vramRead(0x2400, &m));
+    try testing.expectEqual(@as(u8, 0x77), ppu.vramRead(0x2000, &m));
+}
+
 test "$3000-$3EFF mirrors $2000-$2EFF" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.v = 0x2001;
     ppu.writeRegister(0x2007, 0x44, &m);
@@ -1197,7 +1249,7 @@ test "$3000-$3EFF mirrors $2000-$2EFF" {
 }
 
 test "palette writes mirror $3F10/$14/$18/$1C onto $3F00/$04/$08/$0C" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.v = 0x3F10;
     ppu.writeRegister(0x2007, 0x0F, &m);
@@ -1208,7 +1260,7 @@ test "palette writes mirror $3F10/$14/$18/$1C onto $3F00/$04/$08/$0C" {
 }
 
 test "Ppu.reset clears PPUCTRL/PPUMASK/the write toggle/the read buffer/t/fine_x, but not v or PPUSTATUS/OAM" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     ppu.ctrl.nmi_enable = true;
     ppu.mask.show_bg = true;
     ppu.w = true;
@@ -1234,7 +1286,7 @@ test "Ppu.reset clears PPUCTRL/PPUMASK/the write toggle/the read buffer/t/fine_x
 }
 
 test "the dot/scanline counter advances 341 dots per scanline, 262 scanlines per frame" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     // Rendering disabled: no odd-frame skip, so exactly 341*262 ticks
     // returns to (0,0) of the next frame.
@@ -1246,7 +1298,7 @@ test "the dot/scanline counter advances 341 dots per scanline, 262 scanlines per
 }
 
 test "the VBL flag sets at scanline 241 dot 1 and clears at scanline 261 dot 1" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     // `tick` processes whatever (scanline, dot) is *current* and then
     // advances -- so after N calls, the fields hold the dot *about to be*
@@ -1278,7 +1330,7 @@ test "the VBL flag sets at scanline 241 dot 1 and clears at scanline 261 dot 1" 
 }
 
 test "nmiSignal is the AND of the VBL flag and PPUCTRL's NMI-enable bit" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     try testing.expect(!ppu.nmiSignal());
     ppu.status.vblank = true;
     try testing.expect(!ppu.nmiSignal());
@@ -1289,7 +1341,7 @@ test "nmiSignal is the AND of the VBL flag and PPUCTRL's NMI-enable bit" {
 }
 
 test "odd-frame skip drops one dot from the pre-render scanline only when rendering is enabled and only every other frame" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     ppu.mask.show_bg = true; // rendering enabled
 
@@ -1308,7 +1360,7 @@ test "odd-frame skip drops one dot from the pre-render scanline only when render
 }
 
 test "a $2002 read one PPU clock before the VBL flag sets suppresses it for the frame" {
-    var ppu = testPpu(.horizontal);
+    var ppu = testPpu();
     var m = testMapper();
     // Land the fields on (241, 1) -- i.e. dot 1's effects (setting the
     // flag) have not run yet, so a read landing here is "one PPU clock

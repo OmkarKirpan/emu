@@ -4,8 +4,13 @@ const testing = std.testing;
 const mapper_mod = @import("mapper.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
+const Mmc1 = mapper_mod.Mmc1;
 
-pub const Mirroring = enum { horizontal, vertical, four_screen };
+/// Re-exported from `mapper.zig`, which owns it: the cartridge decides
+/// mirroring at runtime, and this header field is only the power-on value.
+/// `parseHeader` never produces the single-screen variants -- iNES cannot
+/// express them; only a mapper (MMC1) can select them.
+pub const Mirroring = mapper_mod.Mirroring;
 
 pub const Header = struct {
     prg_rom_size: usize,
@@ -77,7 +82,18 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
                 return MapperError.InvalidRomGeometry;
             if (rom.chr_rom.len != 0 and rom.chr_rom.len != 0x2000)
                 return MapperError.InvalidRomGeometry;
-            break :blk Mapper{ .nrom = Nrom.init(rom.prg_rom, rom.chr_rom) };
+            break :blk Mapper{ .nrom = Nrom.init(rom.prg_rom, rom.chr_rom, rom.header.mirroring) };
+        },
+        1 => blk: {
+            // MMC1: 16KB-512KB PRG in 16KB units, and either CHR-RAM (no
+            // CHR-ROM) or 8KB-128KB CHR-ROM in 8KB units. The header's
+            // mirroring is ignored -- MMC1 powers on with control = $0C and
+            // drives mirroring from its own register from then on.
+            if (rom.prg_rom.len < 0x4000 or rom.prg_rom.len > 0x80000 or rom.prg_rom.len % 0x4000 != 0)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len > 0x20000 or rom.chr_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .mmc1 = Mmc1.init(rom.prg_rom, rom.chr_rom) };
         },
         else => MapperError.UnsupportedMapper,
     };
@@ -163,11 +179,29 @@ test "Rom.load reports Truncated when the file is shorter than the header promis
     try testing.expectError(Rom.LoadError.Truncated, Rom.load(buf[0 .. buf.len - 1]));
 }
 
-test "createMapper returns UnsupportedMapper for anything but mapper 0" {
+test "createMapper builds an MMC1 for mapper 1" {
     var buf = buildMinimalNrom(2, 1);
-    buf[6] = 0x10; // mapper number 1 (MMC1) — not implemented until M7
+    buf[6] = 0x10; // mapper number 1 (MMC1), implemented as of M7a
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .mmc1);
+}
+
+test "createMapper returns UnsupportedMapper for a mapper outside the closed set" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x50; // mapper number 5 (MMC5) — never in scope
     const rom = try Rom.load(&buf);
     try testing.expectError(MapperError.UnsupportedMapper, createMapper(rom));
+}
+
+test "createMapper rejects MMC1 geometry it cannot map" {
+    var too_big = buildMinimalNrom(2, 1);
+    too_big[5] = 17; // 136KB CHR-ROM: past MMC1's 128KB ceiling
+    var padded = [_]u8{0} ** (16 + 2 * 16384 + 17 * 8192);
+    @memcpy(padded[0..16], too_big[0..16]);
+    padded[6] = 0x10;
+    const rom = try Rom.load(&padded);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
 }
 
 test "createMapper rejects a ROM with 0 PRG banks" {
