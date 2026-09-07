@@ -45,7 +45,12 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   `web/` before `dev`/`build` — nothing under `web/src/wasm/*.wasm` is
   committed; `core/` stays the single source of truth.
 - **`docs/adr/`** — one file per architecture decision that's reached
-  code, numbered in decision order. `docs/research/` holds the
+  code, numbered in decision order. `docs/reference/external-resources.md`
+  indexes the outside material this project builds against (reference
+  emulators, test-ROM suites, test-data sets, toolchains) and states the
+  licensing rule that governs reading them — most NES emulators are GPL,
+  this repo is MIT, and the difference decides which ones may be read and
+  which may only be run. `docs/research/` holds the
   longer-form wayfinder research findings an ADR's "Decision" section
   summarizes; ADRs cite them rather than restating them.
 
