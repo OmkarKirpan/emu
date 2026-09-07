@@ -325,6 +325,7 @@ pub const Cpu = struct {
         self.bus.ppu.tick(&self.bus.mapper);
         self.bus.ppu.tick(&self.bus.mapper);
         self.bus.apu.tick(&self.bus.mapper);
+        self.bus.mapper.tick();
     }
 
     /// Re-latch the CPU's edge-triggered NMI input from the PPU's current
@@ -1502,9 +1503,9 @@ const TestHarness = struct {
         self.prg[0x7FFC] = 0x00; // reset vector low  ($FFFC)
         self.prg[0x7FFD] = 0xC0; // reset vector high ($FFFD)
         self.bus = Bus.init(switch (which) {
-            .nrom => Mapper{ .nrom = Nrom.init(&self.prg, &.{}) },
+            .nrom => Mapper{ .nrom = Nrom.init(&self.prg, &.{}, .horizontal) },
             .test_stub => Mapper{ .test_stub = TestStub.init(&self.prg) },
-        }, .horizontal);
+        });
         self.cpu = Cpu.init(&self.bus);
         self.cpu.reset();
         self.cpu.cycles = 0;

@@ -41,8 +41,8 @@ fn writeSequential(ppu: *Ppu, mapper: *Mapper, start_addr: u16, bytes: []const u
 test "background pipeline decodes one tile's pattern+attribute+palette correctly across a full frame" {
     // CHR-RAM (0 CHR banks in the header), written through $2006/$2007 --
     // exactly the fixture shape ENG-66 asks for.
-    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
-    var ppu = Ppu.init(.horizontal);
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}, .horizontal) };
+    var ppu = Ppu.init();
 
     // ---- Pattern table: tile #1, all 8 rows identical.
     //
@@ -141,8 +141,8 @@ test "background pipeline decodes one tile's pattern+attribute+palette correctly
 }
 
 test "background pipeline hides the leftmost 8 columns when PPUMASK's show_bg_left is clear" {
-    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
-    var ppu = Ppu.init(.horizontal);
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}, .horizontal) };
+    var ppu = Ppu.init();
 
     // Tile #1 solid pixel-value-3 (both planes all 1s), placed at nametable
     // tile (0, 0) -- screen columns 0-7 -- so it would be visible at the
@@ -171,8 +171,8 @@ test "background pipeline hides the leftmost 8 columns when PPUMASK's show_bg_le
 }
 
 test "attribute-table quadrant selection: all four 2x2-tile quadrants of one cell" {
-    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
-    var ppu = Ppu.init(.horizontal);
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}, .horizontal) };
+    var ppu = Ppu.init();
 
     // Tile #1, solid pixel value 1: low plane all 1s, high plane all 0s, so
     // every pixel is (0 << 1) | 1 = 1 -- palette entry 1 of whichever group
@@ -228,8 +228,8 @@ test "attribute-table quadrant selection: all four 2x2-tile quadrants of one cel
 }
 
 test "fine-X scroll shifts the rendered background left by fine_x pixels" {
-    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}) };
-    var ppu = Ppu.init(.horizontal);
+    var mapper = Mapper{ .nrom = Nrom.init(&.{}, &.{}, .horizontal) };
+    var ppu = Ppu.init();
 
     // Solid pixel-value-1 tile at nametable tile (1,0) -- screen columns 8-15
     // with no scroll at all.

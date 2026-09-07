@@ -30,7 +30,7 @@ pub const Machine = struct {
     /// this core can't emulate.
     pub fn init(self: *Machine, rom_bytes: []const u8) !void {
         const rom = try rom_mod.Rom.load(rom_bytes);
-        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom), rom.header.mirroring);
+        self.bus = bus_mod.Bus.init(try rom_mod.createMapper(rom));
         self.cpu = cpu_mod.Cpu.init(&self.bus);
         self.cpu.reset();
     }
