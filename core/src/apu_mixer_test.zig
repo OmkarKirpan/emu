@@ -107,40 +107,51 @@ test "apu_mixer dmc: the DMC DAC's own non-linearity cancels to near-silence" {
     try testing.expect(r.quiet_rms < cancelled_rms_max);
 }
 
-/// Looser bound than `square`/`dmc`, and **not a clean pass** -- this
-/// threshold documents a measured, unexplained inaccuracy rather than
-/// asserting correctness. Tighten it to ~0.002 once the cause is found.
+/// Looser bound than `square`/`dmc`, for a reason that is understood and
+/// is **not a fault in the triangle channel**: this ROM is the only one of
+/// the four that sweeps the DMC DAC across its *entire* range, and our
+/// mixer models that DAC as perfectly linear.
 ///
-/// What is established, so the next person starts from evidence rather
-/// than from this file's first guess:
+/// `mixOutput` gives the DMC a single linear term (`dmc / 22638`), which
+/// is what both of nesdev's published mixer formulas do. The real DAC is
+/// not quite linear, and Blargg's cancellation table encodes the real
+/// curve -- its steps are deliberately uneven (3, 3, 2, 3, 3, 3, 2, 3...).
+/// The ROM's own header says as much: "Scans over range of DMC DAC to test
+/// non-linearity."
 ///
-/// * **Magnitude.** ~0.0066 RMS here, against ~0.001 for `square`/`dmc`.
-/// * **Not the ROM's own quantisation.** An earlier version of this
-///   comment blamed the triangle's stepped ramp not cancelling exactly
-///   against the DMC's steps. Computing the residual this ROM's tables
-///   imply for a *perfect* mixer gives ~0.0014 RMS, so the measurement is
-///   ~5x above that floor. The explanation was wrong.
-/// * **Cancellation is mostly working.** The triangle playing solo would
-///   be ~0.071 RMS, so ~90% of it is being cancelled -- this is a
-///   refinement error, not a channel that fails to cancel at all.
-/// * **Shape: a tone, not hash.** A clean peak at the triangle's 999Hz
-///   fundamental, 140x over the broadband floor, with odd harmonics
-///   falling as ~1/n.
-/// * **Not a phase offset, despite that shape.** The 1/n harmonics look
-///   like a time-shift residual (a triangle's derivative is a square
-///   wave), but stalling the triangle sequencer mid-run by 1, 2, 3, 4, 14,
-///   28 and even 100,000 CPU cycles moves the measured residual by less
-///   than 1e-5 -- while a probe confirms the channel is genuinely running
-///   throughout (enabled, length 10, linear 127, period 55, sequencer
-///   advancing ~32k times/sec, output spanning 0..15). Whatever this is,
-///   it does not depend on the triangle's phase relative to the DMC
-///   staircase that is cancelling it.
+/// Measured proof, residual per DAC region across one run:
 ///
-/// So it is not quantisation, not a dead channel, and not phase. The
-/// remaining suspects are the triangle's level mapping or its coefficient
-/// relative to the DMC's in the mixer -- note `square.nes` cancelling to
-/// ~0.001 already validates the *pulse*-to-DMC coefficient ratio, so
-/// whatever is off is specific to the triangle's own term.
+/// ```
+///   DMC 70..123 -> 0.00596      DMC 33..86 -> 0.00750
+///   DMC 57..111 -> 0.00641      DMC 20..74 -> 0.00815
+///   DMC 45..98  -> 0.00693      DMC  8..61 -> 0.00888
+/// ```
+///
+/// Monotone in the DAC's operating point, worst at the bottom of the range
+/// where a straight line fits the real curve least well. That also
+/// explains why `square.nes` passes at ~0.001 while using the identical
+/// mixer: its own cancellation table only ever drives the DMC between $38
+/// and $7F, the upper half, where the linear approximation is closest.
+///
+/// Three explanations were tested and rejected before this one, recorded
+/// so they are not re-tried:
+///
+/// * **The ROM's own quantisation.** The residual its tables imply for a
+///   perfect mixer is ~0.0014 RMS -- 5x below what we measure.
+/// * **A timing/phase offset.** The residue is a clean tone at the
+///   triangle's 999Hz fundamental with odd harmonics falling as ~1/n,
+///   which is the signature of a time-shift residual (a triangle's
+///   derivative is a square wave). But stalling the sequencer mid-run by
+///   1, 2, 3, 4, 14, 28 and even 100,000 CPU cycles moves the result by
+///   under 1e-5, with a probe confirming the channel runs throughout.
+/// * **The choice of mixer formula.** Swapping `mixOutput` to nesdev's
+///   lookup-table form (which differs from the exact rational form by
+///   ~3.7% at the triangle's levels) makes this *worse*, not better:
+///   0.00786 against 0.00660.
+///
+/// Closing this properly means modelling the DMC DAC's real curve, which
+/// neither published formula provides -- a deliberate gap, not an
+/// oversight. Tighten this bound if that ever lands.
 const triangle_rms_max: f32 = 0.02;
 
 test "apu_mixer triangle: the triangle cancels to within its quantisation residue" {
