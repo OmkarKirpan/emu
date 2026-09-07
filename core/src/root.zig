@@ -66,4 +66,5 @@ test {
     _ = @import("nrom_sprite_input_test.zig");
     _ = @import("apu_test.zig");
     _ = @import("mmc1_test.zig");
+    _ = @import("cnrom_test.zig");
 }

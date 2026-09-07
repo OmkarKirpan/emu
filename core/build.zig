@@ -131,8 +131,11 @@ pub fn build(b: *std.Build) void {
     // rather than the "no formal grant found" posture the Blargg ROMs rest
     // on. Results come off the screen, not $6000; see mapperel_harness.zig
     // and tests/roms/holy_mapperel/ATTRIBUTION.md.
+    // ENG-74 (M7c): the CNROM conformance stage, added to the same suite.
+    // See tests/roms/holy_mapperel/ATTRIBUTION.md and cnrom_test.zig.
     const mapperel_names = [_][]const u8{
         "M1_P128K_CR8K", "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+        "M3_P32K_C32K_H",
     };
     for (mapperel_names) |name| {
         test_mod.addAnonymousImport(b.fmt("mapperel_{s}", .{name}), .{
