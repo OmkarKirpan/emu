@@ -113,6 +113,19 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // ENG-71 (M6): Blargg's `apu_mixer` suite. Unlike every other vendored
+    // suite these are *listen* tests -- each has the channel under test
+    // cancelled by an inverse DMC waveform, so correct relative volumes and
+    // correct DAC non-linearity produce near-silence rather than a $6000
+    // pass code (see `apu_mixer_test.zig`, which measures that silence
+    // instead of reading a result byte). All 4 confirmed mapper 0/NROM.
+    const apu_mixer_names = [_][]const u8{ "square", "triangle", "noise", "dmc" };
+    for (apu_mixer_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("apu_mixer_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/apu_mixer/{s}.nes", .{name})),
+        });
+    }
+
     const mod_tests = b.addTest(.{ .root_module = test_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
     const test_step = b.step("test", "Run tests");

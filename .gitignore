@@ -7,3 +7,11 @@ node_modules/
 dist/
 dist-ssr/
 *.local
+
+# Commercial game ROMs, never committed. This repo vendors only test ROMs
+# whose redistribution was researched (docs/research/test-rom-licensing.md)
+# plus its own hand-written `sprite_input_demo.nes`; a real game dropped in
+# here for local testing must not reach a public repo by way of a stray
+# `git add -A`. Keep personal ROM libraries outside the tree entirely --
+# this is a backstop, not the plan.
+docs/roms/

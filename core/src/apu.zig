@@ -135,11 +135,19 @@ test "clockLength decrements unless halted, and never goes below 0" {
     try testing.expectEqual(@as(u8, 5), counter);
 }
 
-/// https://www.nesdev.org/wiki/APU_Pulse -- each duty's 8-step waveform, in
-/// the order the sequencer actually plays it back (not the raw bit-pattern
-/// the register byte represents, which nesdev documents separately as
-/// reading the same table backward -- this is the played-back shape, which
-/// is what `output()` needs).
+/// https://www.nesdev.org/wiki/APU_Pulse -- each duty's 8-step waveform in
+/// the order the sequencer actually plays it back.
+///
+/// **This is the already-reversed form, so `tickTimer` must step it
+/// forward.** nesdev gives each duty as a raw bit pattern (duty 0 is
+/// `0 0 0 0 0 0 0 1`) and notes the sequencer reads that pattern in
+/// *reverse* index order, yielding the waveform `0 1 0 0 0 0 0 0` -- which
+/// is what these rows store. Stepping these rows backward would apply the
+/// reversal a second time: same duty *ratio*, wrong *phase*. That bug
+/// shipped, and nothing caught it -- the duty test asserts the ratio, and
+/// no conformance ROM listens to a channel -- until `apu_mixer/square.nes`
+/// and `dmc.nes`, whose whole method is cancelling a pulse against an
+/// inverse DMC waveform, refused to cancel. See `apu_mixer_test.zig`.
 pub const duty_sequences = [4][8]u1{
     .{ 0, 1, 0, 0, 0, 0, 0, 0 },
     .{ 0, 1, 1, 0, 0, 0, 0, 0 },
@@ -205,7 +213,9 @@ pub const Pulse = struct {
     pub fn tickTimer(self: *Pulse) void {
         if (self.timer == 0) {
             self.timer = self.timer_period;
-            self.sequence_pos -%= 1; // hardware walks the sequence backward
+            // Forward, because `duty_sequences` already holds the
+            // played-back (reversed) form -- see its doc comment.
+            self.sequence_pos +%= 1;
         } else {
             self.timer -= 1;
         }
@@ -292,14 +302,29 @@ test "Pulse.writeReg3 does not reload length while the channel is disabled" {
     try testing.expectEqual(@as(u8, 0), p.length_counter);
 }
 
-test "Pulse.tickTimer advances the duty sequencer on timer reload, walking backward through the table" {
+test "Pulse.tickTimer steps the duty sequencer forward, emitting the waveform in its documented phase" {
     var p = Pulse{};
-    p.writeReg0(0b01_0_1_0000); // duty 1, halt, constant volume, vol 0
-    p.timer_period = 1; // reloads every tick for a fast test
+    p.writeReg0(0b10_0_1_1111); // duty 2 (50%), constant volume 15
+    p.enabled = true;
+    p.writeReg3(0b00001_000); // load length; also resets the sequencer to step 0
+    p.timer_period = 8; // shortest period that is not muted
     p.timer = 0;
-    p.sequence_pos = 0;
-    p.tickTimer(); // timer underflows -> reload, sequence_pos decrements (wraps 0->7)
-    try testing.expectEqual(@as(u3, 7), p.sequence_pos);
+
+    // Phase, not just ratio: duty 2 plays as 0,1,1,1,1,0,0,0 from step 0,
+    // so the channel starts low, goes high for four steps, then low for
+    // three. Walking the table backward yields the same 50% ratio with the
+    // high window in the wrong place -- which is what broke the mixer
+    // ROMs' cancellation and what this test now pins down.
+    const expected = [8]u4{ 0, 15, 15, 15, 15, 0, 0, 0 };
+    for (expected, 0..) |want, step| {
+        testing.expectEqual(want, p.output()) catch |err| {
+            std.debug.print("duty step {d}: got {d}, want {d}\n", .{ step, p.output(), want });
+            return err;
+        };
+        // One duty step is `timer_period + 1` APU ticks.
+        for (0..9) |_| p.tickTimer();
+    }
+    try testing.expectEqual(@as(u3, 0), p.sequence_pos); // wrapped exactly once
 }
 
 test "Pulse sweep: pulse1 negates with the ones' complement, pulse2 with the twos'" {

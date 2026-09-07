@@ -58,6 +58,7 @@ test {
     // via anonymous imports declared in build.zig. Deliberately reachable
     // only from this test block so `zig build wasm` never has to embed the
     // vendored test-ROM data.
+    _ = @import("apu_mixer_test.zig");
     _ = @import("nestest_test.zig");
     _ = @import("ppu_vbl_nmi_test.zig");
     _ = @import("ppu_background_test.zig");

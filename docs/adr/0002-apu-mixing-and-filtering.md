@@ -133,6 +133,34 @@ driving the real ROM through `Machine`/`Cpu.step` and logging register
 writes and state transitions against real CPU-cycle counts) as the
 oracle.
 
+## The mixer is now conformance-tested, and it caught a real bug
+
+The original version of this ADR shipped with the mixer's *formula*
+cross-checked against nesdev's alternate lookup-table derivation, but with
+nothing testing the mixer's behaviour on a real signal -- all 8 `apu_test`
+ROMs observe the APU only through `$4015` and the IRQ line, and none of
+them listens to a channel. Blargg's `apu_mixer` suite closes that: each ROM
+cancels the channel under test against an inverse waveform on the DMC DAC,
+so correct relative volumes and correct non-linearity produce near-silence.
+`core/src/apu_mixer_test.zig` measures that silence rather than asking a
+human to judge it.
+
+Standing it up immediately failed on `square.nes` and `dmc.nes`, and the
+cause was a genuine bug in the pulse channel: `duty_sequences` stores each
+duty cycle in its *played-back* form (nesdev gives the raw bit pattern and
+notes the sequencer reads it in reverse; the stored rows are already the
+reversed result), but `Pulse.tickTimer` stepped that table **backward**,
+applying the reversal a second time. The duty *ratio* is unchanged by this
+-- which is why every existing test passed -- but the waveform's *phase* is
+shifted, and phase is precisely what a cancellation test measures. Fixed by
+stepping the sequencer forward; confirmed independently against
+[jsnes](https://github.com/bfirsh/jsnes), whose `dutyLookup` rows are
+identical to ours and whose sequencer advances `squareCounter++`.
+
+The lesson worth keeping: the entire APU had been verified by ROMs that
+never listen to it. A channel could be correct in every CPU-visible respect
+and still produce the wrong sound.
+
 ## Consequences
 
 - `Apu` is a normal, shared (native + wasm) subsystem exported from
