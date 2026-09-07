@@ -5,6 +5,9 @@ const mapper_mod = @import("mapper.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mmc1 = mapper_mod.Mmc1;
+const Mmc3 = mapper_mod.Mmc3;
+const Uxrom = mapper_mod.Uxrom;
+const Cnrom = mapper_mod.Cnrom;
 
 /// Re-exported from `mapper.zig`, which owns it: the cartridge decides
 /// mirroring at runtime, and this header field is only the power-on value.
@@ -94,6 +97,45 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
             if (rom.chr_rom.len > 0x20000 or rom.chr_rom.len % 0x2000 != 0)
                 return MapperError.InvalidRomGeometry;
             break :blk Mapper{ .mmc1 = Mmc1.init(rom.prg_rom, rom.chr_rom) };
+        },
+        4 => blk: {
+            // MMC3: PRG-ROM in 8KB units (its banking granularity), 16KB to
+            // 512KB. CHR is either CHR-RAM (no CHR-ROM) or CHR-ROM in
+            // 8KB-header-unit multiples up to 256KB -- the largest vendored
+            // holy-mapperel MMC3 ROM. The header's mirroring is ignored, same
+            // as MMC1: MMC3 drives it from its own $A000 register from the
+            // moment the game writes it, and the register's power-on state
+            // is unspecified (see `Mmc3`'s doc comment).
+            if (rom.prg_rom.len < 0x4000 or rom.prg_rom.len > 0x80000 or rom.prg_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len > 0x40000 or rom.chr_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .mmc3 = Mmc3.init(rom.prg_rom, rom.chr_rom) };
+        },
+        2 => blk: {
+            // UxROM: 32KB-512KB PRG in 16KB units, always CHR-RAM (no
+            // CHR-ROM at all -- unlike NROM and MMC1, UxROM boards never
+            // carry CHR-ROM, so anything other than 0 is a malformed ROM
+            // rather than a variant this mapper supports). The header's
+            // mirroring is used as-is: UxROM has no mirroring register.
+            if (rom.prg_rom.len < 0x8000 or rom.prg_rom.len > 0x80000 or rom.prg_rom.len % 0x4000 != 0)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .uxrom = Uxrom.init(rom.prg_rom, rom.header.mirroring) };
+        },
+        3 => blk: {
+            // CNROM: 16KB or 32KB PRG (fixed, exactly like NROM), and 8KB-
+            // 32KB switchable CHR-ROM in 8KB units. CNROM has no CHR-RAM
+            // variant -- switching between CHR-ROM banks is the entire
+            // point of the board -- so unlike NROM's `chr_rom.len == 0`
+            // case, empty CHR is invalid geometry here rather than "use
+            // CHR-RAM".
+            if (rom.prg_rom.len != 0x4000 and rom.prg_rom.len != 0x8000)
+                return MapperError.InvalidRomGeometry;
+            if (rom.chr_rom.len == 0 or rom.chr_rom.len > 0x8000 or rom.chr_rom.len % 0x2000 != 0)
+                return MapperError.InvalidRomGeometry;
+            break :blk Mapper{ .cnrom = Cnrom.init(rom.prg_rom, rom.chr_rom, rom.header.mirroring) };
         },
         else => MapperError.UnsupportedMapper,
     };
@@ -204,6 +246,28 @@ test "createMapper rejects MMC1 geometry it cannot map" {
     try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
 }
 
+test "createMapper builds a Uxrom for mapper 2" {
+    var buf = buildMinimalNrom(2, 0); // 32KB PRG, CHR-RAM
+    buf[6] = 0x20; // mapper number 2 (UxROM)
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .uxrom);
+}
+
+test "createMapper rejects UxROM CHR-ROM -- the board never carries any" {
+    var buf = buildMinimalNrom(2, 1); // 8KB CHR-ROM: not a shape UxROM has
+    buf[6] = 0x20;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a UxROM PRG size below the 32KB floor" {
+    var buf = buildMinimalNrom(1, 0); // 16KB PRG: below UxROM's 32KB minimum
+    buf[6] = 0x20;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
 test "createMapper rejects a ROM with 0 PRG banks" {
     const buf = buildMinimalNrom(0, 1);
     const rom = try Rom.load(&buf);
@@ -214,6 +278,44 @@ test "createMapper rejects a ROM with 3 PRG banks (48KB, neither 16 nor 32KB)" {
     const buf = buildMinimalNrom(3, 1);
     const rom = try Rom.load(&buf);
     try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper builds an MMC3 for mapper 4" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x40; // mapper number 4 (MMC3)
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .mmc3);
+}
+
+test "createMapper rejects MMC3 geometry it cannot map" {
+    var too_big = buildMinimalNrom(2, 1);
+    too_big[5] = 33; // 264KB CHR-ROM: past MMC3's 256KB ceiling
+    var padded = [_]u8{0} ** (16 + 2 * 16384 + 33 * 8192);
+    @memcpy(padded[0..16], too_big[0..16]);
+    padded[6] = 0x40;
+    const rom = try Rom.load(&padded);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects an MMC3 ROM with 0 PRG banks" {
+    var buf = buildMinimalNrom(0, 1);
+    buf[6] = 0x40;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper wires an MMC3 ROM's bytes through to the Mapper interface" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x40;
+    buf[16] = 0x11; // first PRG byte
+    buf[16 + 32768] = 0x22; // first CHR byte
+    const rom = try Rom.load(&buf);
+    var m = try createMapper(rom);
+    // Power-on state: PRG mode 0, R6=R7=0 -> $8000 and $A000 both show bank
+    // 0, the first byte of PRG.
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
 }
 
 test "createMapper rejects a ROM with 2 CHR banks (16KB, not 0 or 8KB)" {
@@ -229,5 +331,49 @@ test "createMapper wires an NROM ROM's bytes through to the Mapper interface" {
     const rom = try Rom.load(&buf);
     var m = try createMapper(rom);
     try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
+}
+
+test "createMapper builds a CNROM for mapper 3" {
+    var buf = buildMinimalNrom(2, 4); // 32KB PRG, 32KB CHR-ROM
+    buf[6] = 0x30; // mapper number 3 (CNROM), implemented as of M7c
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expect(m == .cnrom);
+}
+
+test "createMapper rejects CNROM geometry with no CHR-ROM at all" {
+    // Unlike NROM, CNROM has no CHR-RAM fallback: switching CHR-ROM banks
+    // is the whole point of the board, so 0 CHR banks is invalid, not "use
+    // CHR-RAM".
+    var buf = buildMinimalNrom(2, 0);
+    buf[6] = 0x30;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects CNROM geometry past the 32KB CHR ceiling" {
+    var too_big = buildMinimalNrom(2, 5); // 40KB CHR-ROM: past CNROM's 32KB (4-bank) ceiling
+    too_big[6] = 0x30;
+    const rom = try Rom.load(&too_big);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper rejects a CNROM ROM with 3 PRG banks (48KB, neither 16 nor 32KB)" {
+    var buf = buildMinimalNrom(3, 1);
+    buf[6] = 0x30;
+    const rom = try Rom.load(&buf);
+    try testing.expectError(MapperError.InvalidRomGeometry, createMapper(rom));
+}
+
+test "createMapper wires a CNROM ROM's bytes through to the Mapper interface" {
+    var buf = buildMinimalNrom(1, 2); // 16KB PRG, 16KB CHR-ROM (2 banks)
+    buf[6] = 0x30;
+    buf[16] = 0x11; // first PRG byte
+    buf[16 + 16384 + 0x2000] = 0x22; // first byte of CHR bank 1
+    const rom = try Rom.load(&buf);
+    var m = try createMapper(rom);
+    try testing.expectEqual(@as(u8, 0x11), m.prgRead(0x8000));
+    m.prgWrite(0x8000, 1); // select CHR bank 1
     try testing.expectEqual(@as(u8, 0x22), m.chrRead(0));
 }

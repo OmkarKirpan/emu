@@ -192,8 +192,8 @@ fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
     hashPulse(hasher, &a.pulse2);
 
     hasher.update(&[_]u8{
-        @intFromBool(a.triangle.enabled),       a.triangle.length_counter,
-        a.triangle.linear_counter,              a.triangle.linear_reload_value,
+        @intFromBool(a.triangle.enabled),            a.triangle.length_counter,
+        a.triangle.linear_counter,                   a.triangle.linear_reload_value,
         @intFromBool(a.triangle.linear_reload_flag), @intFromBool(a.triangle.control_flag),
         @as(u8, a.triangle.sequence_pos),
     });
@@ -207,15 +207,16 @@ fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
     hasher.update(std.mem.asBytes(&a.noise.timer));
 
     hasher.update(&[_]u8{
-        @intFromBool(a.dmc.enabled),     @intFromBool(a.dmc.irq_enabled),
-        @intFromBool(a.dmc.loop),        a.dmc.rate_index,
-        a.dmc.output_level,              @intFromBool(a.dmc.silence),
-        a.dmc.bits_remaining,            a.dmc.shift_register,
+        @intFromBool(a.dmc.enabled),  @intFromBool(a.dmc.irq_enabled),
+        @intFromBool(a.dmc.loop),     a.dmc.rate_index,
+        a.dmc.output_level,           @intFromBool(a.dmc.silence),
+        a.dmc.bits_remaining,         a.dmc.shift_register,
         @intFromBool(a.dmc.irq_flag),
         // `?u8`: a byte waiting in the 1-byte sample buffer is real
         // resume-critical state, and "empty" has to hash differently from
         // "holding $00" -- hence the presence flag alongside the value.
-        @intFromBool(a.dmc.sample_buffer != null), a.dmc.sample_buffer orelse 0,
+        @intFromBool(a.dmc.sample_buffer != null),
+        a.dmc.sample_buffer orelse 0,
     });
     hasher.update(std.mem.asBytes(&a.dmc.sample_address));
     hasher.update(std.mem.asBytes(&a.dmc.sample_length));
@@ -224,8 +225,8 @@ fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
     hasher.update(std.mem.asBytes(&a.dmc.timer));
 
     hasher.update(&[_]u8{
-        a.frame.mode,                              @intFromBool(a.frame.irq_inhibit),
-        @intFromBool(a.frame.irq_flag),            @intFromBool(a.frame.half_frame_pending),
+        a.frame.mode,                   @intFromBool(a.frame.irq_inhibit),
+        @intFromBool(a.frame.irq_flag), @intFromBool(a.frame.half_frame_pending),
         @intFromBool(a.even_cycle),
     });
     hasher.update(std.mem.asBytes(&a.frame.cycle));
@@ -281,6 +282,33 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
             hasher.update(std.mem.asBytes(&m.cycle));
             hasher.update(std.mem.asBytes(&m.last_write_cycle));
         },
+        // MMC3 (M7d) adds a scanline IRQ with real timing state: two runs
+        // that diverge only in counter phase, A12 filter progress, or which
+        // bank is mapped would otherwise hash identically.
+        .mmc3 => |*m| {
+            if (m.chr_rom.len == 0) hasher.update(&m.chr_ram);
+            hasher.update(&m.bank_data);
+            hasher.update(&[_]u8{
+                m.bank_select,                      @intFromBool(m.mirror_horizontal),
+                m.irq_latch,                        m.irq_counter,
+                @intFromBool(m.irq_reload_pending), @intFromBool(m.irq_enabled),
+                @intFromBool(m.irq_pending),        @intFromBool(m.a12),
+            });
+            hasher.update(std.mem.asBytes(&m.a12_low_ticks));
+        },
+        // UxROM's CHR is always RAM (unlike NROM/MMC1, which can be either),
+        // and `prg_bank` is its one register -- both are emulation state two
+        // otherwise-identical runs could diverge in.
+        .uxrom => |*u| {
+            hasher.update(&u.chr_ram);
+            hasher.update(&[_]u8{u.prg_bank});
+        },
+        // CNROM has exactly one register (which CHR-ROM bank is selected)
+        // and no CHR-RAM to speak of -- see `mapper.zig`'s `Cnrom` doc
+        // comment. Two runs differing only in the selected bank would
+        // otherwise hash identically, same reasoning as MMC1's registers
+        // above.
+        .cnrom => |*c| hasher.update(&[_]u8{c.chr_bank}),
         .test_stub => {},
     }
 }

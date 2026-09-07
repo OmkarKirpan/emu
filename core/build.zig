@@ -104,7 +104,7 @@ pub fn build(b: *std.Build) void {
     // same $6000-protocol treatment as ppu_vbl_nmi/oam_read above -- see
     // tests/roms/apu_test/ATTRIBUTION.md.
     const apu_test_names = [_][]const u8{
-        "1-len_ctr", "2-len_table", "3-irq_flag", "4-jitter",
+        "1-len_ctr",    "2-len_table",       "3-irq_flag",   "4-jitter",
         "5-len_timing", "6-irq_flag_timing", "7-dmc_basics", "8-dmc_rates",
     };
     for (apu_test_names) |name| {
@@ -126,13 +126,23 @@ pub fn build(b: *std.Build) void {
         });
     }
 
-    // ENG-72 (M7a): the MMC1 conformance stage. Unlike every other vendored
-    // suite here, holy-mapperel is **zlib licensed** -- an explicit grant
-    // rather than the "no formal grant found" posture the Blargg ROMs rest
-    // on. Results come off the screen, not $6000; see mapperel_harness.zig
-    // and tests/roms/holy_mapperel/ATTRIBUTION.md.
+    // ENG-72 (M7a) / ENG-73 (M7b) / ENG-74 (M7c) / ENG-75 (M7d): the mapper
+    // conformance stages. Unlike every other vendored suite here,
+    // holy-mapperel is **zlib licensed** -- an explicit grant rather than
+    // the "no formal grant found" posture the Blargg ROMs rest on. Results
+    // come off the screen, not $6000; see mapperel_harness.zig and
+    // tests/roms/holy_mapperel/ATTRIBUTION.md.
+    //
+    // One list, one directory, one harness, across every mapper milestone.
+    // The two M4 (MMC3) ROMs cover CHR-ROM banking at maximum size and the
+    // CHR-RAM baseline; M7d's third available ROM (`M4_P128K_CR32K`, 32KB
+    // CHR-RAM) is not vendored -- CHR-ROM already exercises MMC3's 1KB/2KB
+    // banking, which CHR-RAM alone cannot. For M7b, see `ATTRIBUTION.md`'s
+    // entry on why `M2_P128K_CR8K_V` and not its sibling `M2_P128K_V.nes`.
     const mapperel_names = [_][]const u8{
-        "M1_P128K_CR8K", "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+        "M1_P128K_CR8K",   "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+        "M2_P128K_CR8K_V", "M3_P32K_C32K_H",
+        "M4_P256K_C256K",  "M4_P128K_CR8K",
     };
     for (mapperel_names) |name| {
         test_mod.addAnonymousImport(b.fmt("mapperel_{s}", .{name}), .{

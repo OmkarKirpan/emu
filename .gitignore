@@ -15,3 +15,6 @@ dist-ssr/
 # `git add -A`. Keep personal ROM libraries outside the tree entirely --
 # this is a backstop, not the plan.
 docs/roms/
+
+# Agent worktrees (transient, created by the Agent tool)
+.claude/worktrees/
