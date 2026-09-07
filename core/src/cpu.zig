@@ -6,6 +6,7 @@ const mapper_mod = @import("mapper.zig");
 const Bus = bus_mod.Bus;
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
+const Mmc3 = mapper_mod.Mmc3;
 const TestStub = mapper_mod.TestStub;
 
 /// The processor status register.
@@ -2151,6 +2152,72 @@ test "a mapper-asserted IRQ is seen by the CPU without mapper-specific code" {
     // Acknowledging through the same interface drops it again.
     h.bus.mapper.irqAcknowledge();
     try testing.expect(!h.bus.mapper.irqPending());
+}
+
+test "an MMC3 scanline IRQ reaches the CPU through Bus and fires a real interrupt handler" {
+    // Unlike the `TestStub` test above (which pokes `irq` directly), this
+    // drives every part of the real M7d path: register writes through
+    // `Mapper.prgWrite` exactly as `Bus.write` would deliver them, A12
+    // clocking through `Mapper.chrRead` exactly as `Ppu.vramRead` would, and
+    // `Cpu.tick`'s own per-cycle `mapper.tick()` call for the filter timing
+    // -- MMC3 is the first mapper here whose IRQ this project can actually
+    // exercise end to end, since `TestStub` has no hardware behind its flag.
+    var prg = [_]u8{0} ** 0x8000; // 32KB: 4 x 8KB banks
+    // MMC3 powers on in PRG mode 0 with every bank register at 0, which maps
+    // bank 2 (of 4) at $C000 and bank 3 (the last) at $E000-$FFFF -- the
+    // same offsets (0x4000, 0x7FFC) NROM's own 32KB layout uses elsewhere in
+    // this file, so the code-at-$C000 / vectors-at-$7FFC convention needs no
+    // special-casing here.
+    prg[0x4000] = 0xEA; // NOP at $C000
+    prg[0x4001] = 0xEA; // NOP at $C001
+    prg[0x7FFC] = 0x00; // reset vector -> $C000
+    prg[0x7FFD] = 0xC0;
+    prg[0x7FFE] = 0x00; // IRQ/BRK vector -> $D000
+    prg[0x7FFF] = 0xD0;
+
+    var bus = Bus.init(Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) }); // CHR-RAM
+    var cpu = Cpu.init(&bus);
+    cpu.reset();
+    cpu.cycles = 0;
+    cpu.p.i = false;
+
+    // Arm the scanline IRQ through the mapper's real register protocol.
+    bus.mapper.prgWrite(0xC000, 1); // latch = 1
+    bus.mapper.prgWrite(0xC001, 0); // force reload on the next qualifying rise
+    bus.mapper.prgWrite(0xE001, 0); // enable IRQs
+
+    // Drive two qualifying A12 rises the way `Ppu` actually would (CHR reads
+    // through `Mapper.chrRead`), spaced by real `tick()` calls so the A12
+    // low-time filter (`Mmc3.observeA12`) sees them as genuine, not as
+    // within-one-instant noise -- this is the "be deliberate about cycle
+    // spacing" lesson M7a's own tests learned, applied to a different clock.
+    _ = bus.mapper.chrRead(0x0000); // A12 low
+    cpu.tick(); // note: private to this module, so this file can call it directly
+    cpu.tick();
+    _ = bus.mapper.chrRead(0x1000); // 1st rise: counter reloads to latch (1), no IRQ yet
+    try testing.expect(!bus.mapper.irqPending());
+
+    _ = bus.mapper.chrRead(0x0000); // low again
+    cpu.tick();
+    cpu.tick();
+    _ = bus.mapper.chrRead(0x1000); // 2nd rise: decrements to 0 -> IRQ asserted
+    try testing.expect(bus.mapper.irqPending());
+
+    // The CPU's own /IRQ input is untouched; only the OR in `irqAsserted`
+    // carries this into the interrupt logic -- same as the TestStub test.
+    try testing.expect(!cpu.irq_line);
+    cpu.step(); // NOP at $C000, whose poll now sees the cartridge line
+    try testing.expect(cpu.irq_ready);
+    cpu.step(); // services the interrupt
+    try testing.expectEqual(@as(u16, 0xD000), cpu.pc);
+    try testing.expect(cpu.p.i);
+    try testing.expectEqual(@as(u8, 0x20), bus.wram[0x01FB] & 0x30); // B clear
+
+    // $E000 is the real hardware acknowledge path (disable + clear), not the
+    // generic `Mapper.irqAcknowledge()` the TestStub test used -- proving the
+    // whole software-visible protocol, not just the interface hook.
+    bus.mapper.prgWrite(0xE000, 0);
+    try testing.expect(!bus.mapper.irqPending());
 }
 
 test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advancing OAMADDR" {
