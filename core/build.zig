@@ -131,8 +131,12 @@ pub fn build(b: *std.Build) void {
     // rather than the "no formal grant found" posture the Blargg ROMs rest
     // on. Results come off the screen, not $6000; see mapperel_harness.zig
     // and tests/roms/holy_mapperel/ATTRIBUTION.md.
+    // ENG-73 (M7b) adds "M2_P128K_CR8K_V" (UxROM) to the same directory and
+    // the same list -- see `ATTRIBUTION.md`'s M7b entry for why that ROM,
+    // and not its sibling `M2_P128K_V.nes`, is the one vendored.
     const mapperel_names = [_][]const u8{
         "M1_P128K_CR8K", "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+        "M2_P128K_CR8K_V",
     };
     for (mapperel_names) |name| {
         test_mod.addAnonymousImport(b.fmt("mapperel_{s}", .{name}), .{

@@ -2,17 +2,41 @@
 
 ## What these are
 
-Three MMC1 ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing
+Four ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing
 test by Damian Yerrick (tepples):
 [`pinobatch/holy-mapperel`](https://github.com/pinobatch/holy-mapperel),
 release **v0.02** (2018-09-29), extracted unmodified from that release's
-`holy-mapperel-bin-0.02.7z` archive.
+`holy-mapperel-bin-0.02.7z` archive. Three cover MMC1 (M7a); one covers
+UxROM (M7b).
 
 | File | Size | Board | What it reaches here |
 |---|---|---|---|
 | `M1_P128K_CR8K.nes` | 131,088 | SNROM | 128KB PRG, 8KB CHR-**RAM** — the common MMC1 shape |
 | `M1_P128K_C128K.nes` | 262,160 | SKROM | 128KB PRG, 128KB CHR-**ROM** — CHR bank switching at maximum size |
 | `M1_P512K_CR8K_S8K.nes` | 524,304 | SUROM | 512KB PRG — the PRG-A18 path, plus 8KB battery-backed WRAM |
+| `M2_P128K_CR8K_V.nes` | 131,088 | U*ROM (UNROM/UOROM) | 128KB PRG, 8KB CHR-RAM — the only shape UxROM has |
+
+### Why `M2_P128K_CR8K_V.nes`, not `M2_P128K_V.nes`
+
+The archive's `testroms/` directory has *two* mapper-2 ROMs. Both parse as
+128KB PRG with an NES 2.0 header declaring 8KB of CHR-RAM (byte 11 = `$07`,
+i.e. `64 << 7` bytes) — on paper, either would do. Two things broke the tie
+toward `_CR8K_V`:
+
+- Every other CHR-RAM board in this release names that shape explicitly —
+  `M1_P128K_CR8K.nes`, `M4_P128K_CR8K.nes`, `M7_P128K_CR8K.nes` — so
+  `M2_P128K_CR8K_V.nes` is the name consistent with the rest of the set;
+  `M2_P128K_V.nes` (no `CR8K`) is the odd one out.
+- The archive's own directory listing timestamps `M2_P128K_V.nes` at
+  `2017-11-20 06:45:18`, roughly 28 minutes before every other ROM in the
+  release (all stamped `07:13:15`, the batch `make_roms.py` produced last).
+  That strongly suggests it is a stale artifact left over from before the
+  final build, not a deliberately-distinct variant — `cmp` confirms the two
+  files' PRG data differs, so it is not simply a duplicate.
+
+`M2_P128K_CR8K_V.nes` matches this milestone's target board (UNROM/UOROM,
+8KB CHR-RAM) and the current, consistently-named generation of the release;
+it is the one vendored.
 
 ## License: zlib — an actual grant
 
@@ -59,10 +83,10 @@ a conformance suite in the Blargg sense.
 
 ## How they are used
 
-`core/src/mmc1_test.zig` embeds each ROM at build time (anonymous imports
-declared in `core/build.zig`) and runs it through
-`core/src/mapperel_harness.zig`, which differs from the two existing
-harnesses in three ways:
+`core/src/mmc1_test.zig` (three MMC1 ROMs) and `core/src/uxrom_test.zig`
+(the one UxROM ROM) embed each ROM at build time (anonymous imports declared
+in `core/build.zig`) and run it through `core/src/mapperel_harness.zig`,
+which differs from the two existing harnesses in three ways:
 
 - there is no `$6000` status protocol to poll, so it runs to a result screen
   under a cycle ceiling;
@@ -70,12 +94,16 @@ harnesses in three ways:
   64-tile font), so they are folded back;
 - logical nametable 0 is resolved to a physical VRAM bank through
   `Mapper.mirroring()` rather than assumed to be bank 0 — MMC1 can select
-  one-screen-upper, and this ROM writes to mirroring ports on purpose.
+  one-screen-upper, and this ROM writes to mirroring ports on purpose (UxROM
+  itself never moves off the header's mirroring, but the harness is shared
+  code, so this still applies when it runs the M2 ROM).
 
-Each test asserts the **exact** four-digit code, including the WRAM digit
-that is nonzero because MMC1's PRG-RAM disable bit is deliberately deferred
-(ENG-79). See `mmc1_test.zig` for the per-ROM values and why each is what it
-is.
+Each test asserts the **exact** four-digit code. The MMC1 ROMs' WRAM digit
+is nonzero because MMC1's PRG-RAM disable bit is deliberately deferred
+(ENG-79) — see `mmc1_test.zig` for the per-ROM values and why each is what
+it is. The UxROM ROM's code is `0000`: UxROM has no WRAM, no IRQ, one PRG
+mode that always maps correctly, and CHR that is always plain unbanked RAM
+— see `uxrom_test.zig`.
 
 Native test binary only — `zig build wasm` never sees this data, exactly like
 every other vendored ROM here.
@@ -87,11 +115,12 @@ gh release download v0.02 --repo pinobatch/holy-mapperel
 ```
 
 ```bash
-7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes
+7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes testroms/M2_P128K_CR8K_V.nes
 ```
 
-The archive also contains ROMs for mappers 2, 3, and 4 (M7b, M7c, M7d) plus
-many out-of-scope mappers. Each milestone vendors only what it gates on.
+The archive also contains ROMs for mappers 3 and 4 (M7c, M7d), a second
+mapper-2 ROM not vendored (see above), and many out-of-scope mappers. Each
+milestone vendors only what it gates on.
 
 ## A note on headers
 
