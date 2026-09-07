@@ -112,9 +112,21 @@ doc comments at their fix sites:
   too regressed `3-irq_flag`/`4-jitter`/`6-irq_flag_timing`, all of which
   call it.
 
+The last of these is the one to treat with suspicion: a mode-dependent
+reset delay appears nowhere in the wiki's description of $4017, and it is
+fitted to `5-len_timing`'s macro rather than derived. A tidier
+reformulation was tried -- deferring a mode-1 write's own half-frame clock
+by one cycle via the same `half_frame_pending` mechanism the sequence's
+last step already uses, and deleting the special case outright -- which
+keeps 7 of 8 ROMs green but fails `5-len_timing` #2 ("First length of mode
+0 is too soon"). So the compensation is doing real work on the mode-1 ->
+mode-0 path and is not just a stand-in for that deferral. It stays, with
+the dead end recorded in `FrameSequencer.write`'s doc comment so the next
+attempt does not re-walk it.
+
 None of these were independently re-derived from first principles against
-the nesdev wiki's prose -- each was pinned down empirically, per this
-plan's own "let the test decide" instruction for exactly this kind of
+the nesdev wiki's prose -- each was pinned down empirically, per the
+implementation plan's own "let the test decide" instruction for this kind of
 corner case, using the conformance ROMs (and, where the ROMs' own failure
 text wasn't specific enough, a temporary instrumented diagnostic test
 driving the real ROM through `Machine`/`Cpu.step` and logging register

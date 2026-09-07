@@ -844,9 +844,24 @@ pub const FrameSequencer = struct {
     /// `sync_apu`'s own internal back-to-back $4017 writes never change
     /// mode (both are mode 0) -- broadening this to any close pair breaks
     /// `3-irq_flag`/`4-jitter`/`6-irq_flag_timing`, all of which call it.
-    /// Root cause not independently re-derived from the wiki; this is this
-    /// plan's "let the test decide" fallback for a corner nesdev itself
-    /// flags as one of the two likeliest trouble spots.
+    /// **Status: an empirical deviation, not a derived rule.** The wiki
+    /// gives no mode-dependent reset delay, so this is fitted to the ROMs
+    /// rather than to documented hardware, and it is flagged here (and in
+    /// `docs/adr/0002-apu-mixing-and-filtering.md`) as such rather than
+    /// left looking principled.
+    ///
+    /// One alternative was tried and rejected on evidence: deferring this
+    /// write's own half-frame clock by one CPU cycle (reusing
+    /// `half_frame_pending`, so mode 1's "immediate quarter and half"
+    /// splits exactly like the sequence's last step does) and deleting the
+    /// mode-change special case entirely. That is a strictly tidier rule
+    /// -- one mechanism, no exception -- and it keeps seven of the eight
+    /// conformance ROMs green, but `5-len_timing` then fails #2 ("First
+    /// length of mode 0 is too soon"): the compensation this special case
+    /// supplies is needed on the mode-1 -> mode-0 path specifically, and
+    /// is not merely standing in for the deferral. Whatever the real
+    /// mechanism is, it is not that; recorded so the next attempt starts
+    /// past this dead end rather than in it.
     pub fn write(self: *FrameSequencer, value: u8) FrameEvent {
         const old_mode = self.mode;
         self.mode = @truncate(value >> 7);
