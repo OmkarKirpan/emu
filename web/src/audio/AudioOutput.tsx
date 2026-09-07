@@ -5,6 +5,12 @@ type Status = { kind: 'idle' } | { kind: 'starting' } | { kind: 'running' } | { 
 interface DebugInfo {
   fill: number
   underrunCount: number
+  /** Peak magnitude of the samples most recently written to the ring, and
+   * their RMS -- how `e2e/audio.spec.ts` tells real audio from a pipeline
+   * that is dutifully moving silence. See `emulatorWorker.ts`'s
+   * `measureRing`. */
+  peak: number
+  rms: number
 }
 
 /** Debug/test hook only: `web/e2e/audio.spec.ts` reads this to assert the
@@ -75,8 +81,8 @@ export function AudioOutput({ worker }: AudioOutputProps) {
         pendingNodeRef.current = null
         if (node && audioContext) node.connect(audioContext.destination)
       } else if (data.type === 'stats') {
-        const { fill, underrunCount } = data as DebugInfo & { type: 'stats' }
-        debugInfoRef.current = { fill, underrunCount }
+        const { fill, underrunCount, peak, rms } = data as DebugInfo & { type: 'stats' }
+        debugInfoRef.current = { fill, underrunCount, peak, rms }
         setDebugInfo(debugInfoRef.current)
       }
     }
@@ -138,7 +144,8 @@ export function AudioOutput({ worker }: AudioOutputProps) {
       {status.kind === 'error' && <p className="audio-error">{status.message}</p>}
       {status.kind === 'running' && debugInfo && (
         <p className="audio-debug">
-          ring fill: {debugInfo.fill} samples · underruns: {debugInfo.underrunCount}
+          ring fill: {debugInfo.fill} samples · underruns: {debugInfo.underrunCount} · peak:{' '}
+          {debugInfo.peak.toFixed(3)}
         </p>
       )}
     </div>

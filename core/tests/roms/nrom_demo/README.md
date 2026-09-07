@@ -28,12 +28,34 @@ stack, not a direct-register-poke unit test) without that risk.
    1s -> pixel value 3).
 3. Writes a palette: universal backdrop plus sprite palette 0's pixel-value-3
    entry.
-4. Waits for a second VBLANK, then turns on background and sprite
+4. Programs the APU for a continuous pulse-1 tone (50% duty, constant
+   volume 15, length counter halted so it never decays, period `$1FD` ~=
+   219 Hz) with the frame IRQ inhibited.
+5. Waits for a second VBLANK, then turns on background and sprite
    rendering (`$2001 = $1E`).
-5. Every frame thereafter: waits for VBLANK, triggers OAMDMA from page
+6. Every frame thereafter: waits for VBLANK, triggers OAMDMA from page
    `$02`, strobes both controllers, reads controller 1's 8 bits in NES bit
-   order (A, B, Select, Start, Up, Down, Left, Right), and moves the sprite
-   one pixel per frame in whichever D-pad direction(s) are held.
+   order (A, B, Select, Start, Up, Down, Left, Right), moves the sprite
+   one pixel per frame in whichever D-pad direction(s) are held, and
+   writes the sprite's Y position into the pulse timer's low byte -- so
+   moving up/down retunes the tone, making input audible as well as
+   visible.
+
+## Why it makes noise (ENG-71, M6)
+
+Through M5 this ROM never wrote an APU register, which meant the entire
+audio pipeline -- mixer, filter cascade, ring buffer, AudioWorklet --
+carried silence end to end with the emulator's only loadable ROM. Nothing
+downstream of the core could tell correct audio from no audio at all, so
+M6's "real game audio is correct in-browser" criterion had nothing to
+observe. The tone added in step 4 is deliberately the simplest thing that
+fixes that: one channel, no envelope, no length decay, so any silence,
+click, or dropout downstream is the pipeline's doing and not the ROM's.
+
+`core/src/nrom_sprite_input_test.zig` asserts both halves natively (the
+channel is programmed and unmuted; the filtered signal actually swings
+about zero), and `web/e2e/audio.spec.ts` asserts the same signal survives
+the trip through the Worker, the ring buffer, and the worklet.
 
 No NMI is used — `PPUCTRL`'s NMI-enable bit stays clear throughout, and the
 frame loop polls `PPUSTATUS` bit 7 directly, which is what the harness

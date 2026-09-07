@@ -47,4 +47,4 @@ export type EmulatorWorkerOutbound =
   | { type: 'status'; status: 'running'; renderer: RendererKind }
   | { type: 'status'; status: 'error'; message: string }
   | ({ type: 'audio-ready' } & RingHandshake)
-  | { type: 'stats'; fill: number; underrunCount: number }
+  | { type: 'stats'; fill: number; underrunCount: number; peak: number; rms: number }

@@ -7,7 +7,9 @@ import { expect, test } from './fixtures'
  * is a debug/test-only contract, not application logic, so a second,
  * narrow copy of the shape is a reasonable place to stop rather than
  * wiring the two tsconfig projects together for it. */
-type AudioDebugWindow = { __audioDebug__?: () => { fill: number; underrunCount: number } | null }
+type AudioDebugWindow = {
+  __audioDebug__?: () => { fill: number; underrunCount: number; peak: number; rms: number } | null
+}
 
 function readAudioDebug(page: Page) {
   return page.evaluate(() => (window as unknown as AudioDebugWindow).__audioDebug__?.() ?? null)
@@ -83,4 +85,54 @@ test('audio output reaches a stable ring fill with no steady-state underruns', a
   expect(settled!.fill).toBeGreaterThan(0)
   expect(settled!.fill).toBeLessThan(8192)
   expect(settled!.underrunCount).toBe(baselineUnderruns)
+})
+
+/**
+ * ENG-71 (M6) acceptance criterion 2: "Real game audio is correct
+ * in-browser through the M5 pipeline."
+ *
+ * The test above it is the M5 criterion, and it is deliberately blind to
+ * *what* is in the ring -- a pipeline moving a steady stream of zeroes
+ * scores a perfect fill and zero underruns. That was fine when the
+ * producer was a sine generator that could not be silent; with a real APU
+ * behind it, "silently shipping nothing" is exactly the failure mode worth
+ * guarding, and the one no amount of fill/underrun watching would catch.
+ *
+ * "Correct" audio can only be judged by ear, and there is no speaker in
+ * CI. What is machine-checkable is everything short of that: the samples
+ * reaching the worklet's own view of the ring carry real, bounded,
+ * non-silent signal from the emulated APU. `sprite_input_demo.nes` plays a
+ * continuous ~219Hz pulse tone for exactly this reason -- see
+ * `core/tests/roms/nrom_demo/README.md`.
+ */
+test('the ring carries real, non-silent, non-clipping audio from the emulated APU', async ({ page }) => {
+  const button = page.locator('.audio-output button')
+  await button.click()
+  await expect(button).toHaveText('Audio playing')
+
+  await expect
+    .poll(() => readAudioDebug(page), {
+      message: 'no audio debug stats ever arrived from the Worker',
+      timeout: 5000,
+    })
+    .not.toBeNull()
+
+  // Give the ring a moment past its priming window so the samples being
+  // summarized are steady-state playback rather than the initial fill.
+  await page.waitForTimeout(1000)
+
+  const audio = await readAudioDebug(page)
+  expect(audio).not.toBeNull()
+
+  // Not silence. A 50%-duty pulse at full volume lands well above this
+  // after the mixer's non-linear curve and the RC filter cascade; a muted
+  // channel, a mis-wired mixer, or a ring never actually written would all
+  // sit at (or near) zero.
+  expect(audio!.rms).toBeGreaterThan(0.005)
+  expect(audio!.peak).toBeGreaterThan(0.02)
+
+  // ...and not clipping or garbage: the ring's contract is f32 normalized
+  // to -1.0..1.0 (ENG-62), so anything at or beyond full scale means the
+  // mixer or the filters are producing something the worklet cannot play.
+  expect(audio!.peak).toBeLessThan(1.0)
 })

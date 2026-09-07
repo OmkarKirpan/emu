@@ -143,3 +143,61 @@ test "sprite_input_demo: releasing all buttons stops further movement" {
     m.runFrames(5);
     try testing.expectEqual(settled, spriteX(&m));
 }
+
+test "sprite_input_demo: the APU tone it programs reaches the mixer as a real, swinging signal (ENG-71)" {
+    // ENG-71's second acceptance criterion is about audio coming out of
+    // the browser, which no native test can observe directly. What a
+    // native test *can* pin down is the half that everything downstream
+    // depends on: that this ROM programs the APU at all, and that what the
+    // core produces for it is a genuine waveform rather than silence or a
+    // stuck DC level. Until M6 this fixture never touched an APU register,
+    // so the entire audio pipeline could have been wired up backwards and
+    // every test in the tree would still have passed.
+    var m: Machine = undefined;
+    try m.init(@embedFile("sprite_input_demo"));
+    m.runFrames(settle_frames);
+
+    // The ROM's own init, read back through the emulated registers.
+    try testing.expect(m.bus.apu.pulse1.enabled);
+    try testing.expect(m.bus.apu.pulse1.length_counter > 0);
+    try testing.expect(!m.bus.apu.pulse1.muted());
+    try testing.expectEqual(@as(u4, 15), m.bus.apu.pulse1.envelope.output());
+
+    // Sample the filtered signal the APU hands to the ring, across a few
+    // frames -- comfortably more than one period of the ~219Hz tone.
+    var min_sample: f32 = 1.0;
+    var max_sample: f32 = -1.0;
+    const target_frame = m.bus.ppu.frame + 3;
+    while (m.bus.ppu.frame < target_frame) {
+        m.cpu.step();
+        min_sample = @min(min_sample, m.bus.apu.output_sample);
+        max_sample = @max(max_sample, m.bus.apu.output_sample);
+    }
+
+    // A square wave at full volume on one pulse channel is ~0.13
+    // peak-to-peak out of the mixer's non-linear curve.
+    try testing.expect(max_sample - min_sample > 0.05);
+    // ...centred, not riding the DC offset the triangle's held DAC level
+    // parks on the mixer (see `apu.zig`'s own filter test).
+    try testing.expect(min_sample < 0 and max_sample > 0);
+}
+
+test "sprite_input_demo: moving the sprite retunes the pulse channel (ENG-71)" {
+    // The ROM writes the sprite's Y position into the pulse timer's low
+    // byte every frame, so input -> pitch is observable end to end. This
+    // is what keeps the audio path exercised by the *input* tests above
+    // rather than only by a static boot state.
+    var m: Machine = undefined;
+    try m.init(@embedFile("sprite_input_demo"));
+    m.runFrames(settle_frames);
+    const period_at_rest = m.bus.apu.pulse1.timer_period;
+
+    m.bus.controllers[0].setButtons(controller_mod.button_up);
+    m.runFrames(4);
+    const period_after_up = m.bus.apu.pulse1.timer_period;
+
+    try testing.expect(period_after_up != period_at_rest);
+    // Up decrements Y, and Y is the timer's low byte: a shorter period.
+    try testing.expect(period_after_up < period_at_rest);
+    try testing.expect(!m.bus.apu.pulse1.muted()); // still audible at the new pitch
+}
