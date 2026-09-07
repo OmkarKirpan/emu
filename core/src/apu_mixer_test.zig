@@ -107,11 +107,40 @@ test "apu_mixer dmc: the DMC DAC's own non-linearity cancels to near-silence" {
     try testing.expect(r.quiet_rms < cancelled_rms_max);
 }
 
-/// Looser bound than `square`/`dmc`, deliberately. The triangle's stepped
-/// 15-level ramp cannot be cancelled exactly by the DMC's own stepped DAC,
-/// so a residue remains even when the mixing is right -- Blargg's readme
-/// asks only for "near silence", not silence. Measured ~0.007 here, still
-/// an order of magnitude under the ~0.06 a genuine mixing error produces.
+/// Looser bound than `square`/`dmc`, and **not a clean pass** -- this
+/// threshold documents a measured, unexplained inaccuracy rather than
+/// asserting correctness. Tighten it to ~0.002 once the cause is found.
+///
+/// What is established, so the next person starts from evidence rather
+/// than from this file's first guess:
+///
+/// * **Magnitude.** ~0.0066 RMS here, against ~0.001 for `square`/`dmc`.
+/// * **Not the ROM's own quantisation.** An earlier version of this
+///   comment blamed the triangle's stepped ramp not cancelling exactly
+///   against the DMC's steps. Computing the residual this ROM's tables
+///   imply for a *perfect* mixer gives ~0.0014 RMS, so the measurement is
+///   ~5x above that floor. The explanation was wrong.
+/// * **Cancellation is mostly working.** The triangle playing solo would
+///   be ~0.071 RMS, so ~90% of it is being cancelled -- this is a
+///   refinement error, not a channel that fails to cancel at all.
+/// * **Shape: a tone, not hash.** A clean peak at the triangle's 999Hz
+///   fundamental, 140x over the broadband floor, with odd harmonics
+///   falling as ~1/n.
+/// * **Not a phase offset, despite that shape.** The 1/n harmonics look
+///   like a time-shift residual (a triangle's derivative is a square
+///   wave), but stalling the triangle sequencer mid-run by 1, 2, 3, 4, 14,
+///   28 and even 100,000 CPU cycles moves the measured residual by less
+///   than 1e-5 -- while a probe confirms the channel is genuinely running
+///   throughout (enabled, length 10, linear 127, period 55, sequencer
+///   advancing ~32k times/sec, output spanning 0..15). Whatever this is,
+///   it does not depend on the triangle's phase relative to the DMC
+///   staircase that is cancelling it.
+///
+/// So it is not quantisation, not a dead channel, and not phase. The
+/// remaining suspects are the triangle's level mapping or its coefficient
+/// relative to the DMC's in the mixer -- note `square.nes` cancelling to
+/// ~0.001 already validates the *pulse*-to-DMC coefficient ratio, so
+/// whatever is off is specific to the triangle's own term.
 const triangle_rms_max: f32 = 0.02;
 
 test "apu_mixer triangle: the triangle cancels to within its quantisation residue" {
