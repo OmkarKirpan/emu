@@ -47,13 +47,10 @@ pub const Nrom = struct {
     /// nothing to gate: this keeps exactly the behavior `Bus` gave every
     /// cartridge before ENG-79, just owned by the cartridge now instead of
     /// the bus.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
     /// 2KB of cartridge-side nametable VRAM, live only when the header
     /// declares four-screen mirroring (see `Ppu.physicalNametable`). Zero
     /// cost for the overwhelming majority of NROM boards that never do --
     /// see `docs/adr/0005-cartridge-owns-its-memory.md`'s ENG-80 section.
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     /// PRG-ROM is borrowed, not copied: `prg_rom` is a slice into the
     /// caller-owned ROM file bytes, so the caller must keep the original ROM
     /// buffer (whatever `Rom.load` sliced from) alive for as long as this
@@ -114,22 +111,10 @@ pub const Nrom = struct {
     /// Unconditional, unlike `Mmc1`/`Mmc3` -- see the field doc comment.
     /// `null` would mean "nothing drove the bus"; NROM's PRG-RAM always
     /// does.
-    pub fn prgRamRead(self: *const Nrom, addr: u16) ?u8 {
-        return self.prg_ram[addr & 0x1FFF];
-    }
-
-    pub fn prgRamWrite(self: *Nrom, addr: u16, value: u8) void {
-        self.prg_ram[addr & 0x1FFF] = value;
-    }
-
-    /// `addr` is already the 11-bit index into the cartridge's 2KB
-    /// nametable chip (bank<<10 | offset) -- see `Ppu.vramAddress`.
-    pub fn nametableRead(self: *const Nrom, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *Nrom, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    pub fn prgRamMap(self: *const Nrom, addr: u16, write: bool) ?usize {
+        _ = self;
+        _ = write;
+        return addr & 0x1FFF;
     }
 };
 
@@ -168,9 +153,6 @@ pub const TestStub = struct {
     ticks: u64 = 0,
     /// Unconditional, same as `Nrom` -- no CPU test that installs `TestStub`
     /// depends on PRG-RAM gating, so it stays the simplest possible case.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     pub fn init(prg_rom: []const u8) TestStub {
         return .{ .prg_rom = prg_rom };
     }
@@ -218,20 +200,10 @@ pub const TestStub = struct {
         self.ticks += 1;
     }
 
-    pub fn prgRamRead(self: *const TestStub, addr: u16) ?u8 {
-        return self.prg_ram[addr & 0x1FFF];
-    }
-
-    pub fn prgRamWrite(self: *TestStub, addr: u16, value: u8) void {
-        self.prg_ram[addr & 0x1FFF] = value;
-    }
-
-    pub fn nametableRead(self: *const TestStub, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *TestStub, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    pub fn prgRamMap(self: *const TestStub, addr: u16, write: bool) ?usize {
+        _ = self;
+        _ = write;
+        return addr & 0x1FFF;
     }
 };
 
@@ -367,7 +339,6 @@ pub const Mmc1 = struct {
     prg_ram_size: usize = 0x2000,
     /// $6000-$7FFF, fixed at 32KB (SXROM's ceiling) regardless of
     /// `prg_ram_size` -- see the type doc comment.
-    prg_ram: [0x8000]u8 = [_]u8{0} ** 0x8000,
     /// 2KB of cartridge-side nametable VRAM. MMC1 never actually selects
     /// four-screen mirroring (`mirroring()` only ever returns the four
     /// register-driven modes), so this is dead storage on every real MMC1
@@ -375,8 +346,6 @@ pub const Mmc1 = struct {
     /// dispatch has one signature across every variant, the same reasoning
     /// `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md` used for
     /// widening `chrRead`'s `self`.
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     /// Load register. The initial $10 is a walking sentinel bit: it reaches
     /// bit 0 after four writes, which is how the fifth write knows it is the
     /// fifth without a separate counter.
@@ -534,8 +503,8 @@ pub const Mmc1 = struct {
     fn isSnromWramGate(self: *const Mmc1) bool {
         const chr_total = if (self.chrIsRam()) self.chr_ram.len else self.chr_rom.len;
         return self.prg_ram_size <= 0x2000 // not SOROM/SXROM banked PRG-RAM
-            and self.prg_rom.len <= 0x40000 // not SUROM/SXROM's PRG-A18 use
-            and chr_total <= 0x2000; // not SKROM/SLROM's real CHR bank bit
+        and self.prg_rom.len <= 0x40000 // not SUROM/SXROM's PRG-A18 use
+        and chr_total <= 0x2000; // not SKROM/SLROM's real CHR bank bit
     }
 
     fn prgRamEnabled(self: *const Mmc1) bool {
@@ -558,22 +527,28 @@ pub const Mmc1 = struct {
         return (bank % banks) * 0x2000 + (addr & 0x1FFF);
     }
 
-    pub fn prgRamRead(self: *const Mmc1, addr: u16) ?u8 {
+    pub fn prgRamMap(self: *const Mmc1, addr: u16, write: bool) ?usize {
+        _ = write;
         if (!self.prgRamEnabled()) return null;
-        return self.prg_ram[self.prgRamOffset(addr)];
+        return self.prgRamOffset(addr);
+    }
+};
+
+/// Test-only stand-in for the PRG-RAM `Bus` owns in a real machine: the
+/// mapper decides *where* an access lands (or that it lands nowhere), this
+/// holds the bytes. Keeps these tests checking the same read-back round trip
+/// they always did, now through the mapping the mapper actually exposes.
+const TestPrgRam = struct {
+    bytes: [0x8000]u8 = [_]u8{0} ** 0x8000,
+
+    fn read(self: *const TestPrgRam, m: *const Mapper, addr: u16) ?u8 {
+        const off = m.prgRamMap(addr, false) orelse return null;
+        return self.bytes[off];
     }
 
-    pub fn prgRamWrite(self: *Mmc1, addr: u16, value: u8) void {
-        if (!self.prgRamEnabled()) return;
-        self.prg_ram[self.prgRamOffset(addr)] = value;
-    }
-
-    pub fn nametableRead(self: *const Mmc1, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *Mmc1, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    fn write(self: *TestPrgRam, m: *const Mapper, addr: u16, value: u8) void {
+        const off = m.prgRamMap(addr, true) orelse return;
+        self.bytes[off] = value;
     }
 };
 
@@ -798,45 +773,50 @@ test "Mmc1 reports no IRQ" {
 test "Mmc1 $E000 bit 4 disables PRG-RAM; clearing it re-enables without losing contents" {
     var prg = taggedPrg(2);
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
-    m.prgRamWrite(0x6000, 0xAB);
-    try testing.expectEqual(@as(?u8, 0xAB), m.prgRamRead(0x6000));
+    var prg_ram = TestPrgRam{};
+    prg_ram.write(&m, 0x6000, 0xAB);
+    try testing.expectEqual(@as(?u8, 0xAB), prg_ram.read(&m, 0x6000));
 
     mmc1Write(&m, 0xE000, 0b10000); // bit 4 set: disabled
-    try testing.expectEqual(@as(?u8, null), m.prgRamRead(0x6000));
-    m.prgRamWrite(0x6000, 0xCD); // dropped while disabled
+    try testing.expectEqual(@as(?u8, null), prg_ram.read(&m, 0x6000));
+    prg_ram.write(&m, 0x6000, 0xCD); // dropped while disabled
 
     mmc1Write(&m, 0xE000, 0b00000); // bit 4 clear: re-enabled
-    try testing.expectEqual(@as(?u8, 0xAB), m.prgRamRead(0x6000)); // the dropped write never landed
+    try testing.expectEqual(@as(?u8, 0xAB), prg_ram.read(&m, 0x6000)); // the dropped write never landed
 }
 
 test "Mmc1 SNROM quirk: $A000 bit 4 also disables PRG-RAM on an 8KB-CHR, <=256KB-PRG board" {
     var prg = taggedPrg(8); // 128KB: well under the 256KB SUROM/SXROM threshold
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) }; // CHR-RAM, 8KB total
-    m.prgRamWrite(0x6000, 0x42);
+    var prg_ram = TestPrgRam{};
+    prg_ram.write(&m, 0x6000, 0x42);
     mmc1Write(&m, 0xA000, 0b10000); // CHR bank0 bit 4
-    try testing.expectEqual(@as(?u8, null), m.prgRamRead(0x6000));
+    try testing.expectEqual(@as(?u8, null), prg_ram.read(&m, 0x6000));
     mmc1Write(&m, 0xA000, 0b00000);
-    try testing.expectEqual(@as(?u8, 0x42), m.prgRamRead(0x6000));
+    try testing.expectEqual(@as(?u8, 0x42), prg_ram.read(&m, 0x6000));
 }
 
 test "Mmc1 SUROM does not apply the SNROM quirk -- $A000 bit 4 there is PRG-A18, not a WRAM gate" {
     var prg = taggedPrg(32); // 512KB: over the SUROM/SXROM threshold
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) }; // still 8KB CHR-RAM
+    var prg_ram = TestPrgRam{};
     mmc1Write(&m, 0xA000, 0b10000); // selects the upper 256KB half on this board
-    try testing.expectEqual(@as(?u8, 0), m.prgRamRead(0x6000)); // still enabled (untouched, reads 0)
+    try testing.expectEqual(@as(?u8, 0), prg_ram.read(&m, 0x6000)); // still enabled (untouched, reads 0)
 }
 
 test "Mmc1 SKROM does not apply the SNROM quirk -- large CHR-ROM needs $A000 bit 4 as a real bank bit" {
     var prg = taggedPrg(8);
     var chr = [_]u8{0} ** 0x20000; // 128KB CHR-ROM: needs all 5 bank bits
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &chr) };
+    var prg_ram = TestPrgRam{};
     mmc1Write(&m, 0xA000, 0b10000); // a real CHR bank-select bit here, not a WRAM gate
-    try testing.expectEqual(@as(?u8, 0), m.prgRamRead(0x6000)); // still enabled
+    try testing.expectEqual(@as(?u8, 0), prg_ram.read(&m, 0x6000)); // still enabled
 }
 
 test "Mmc1 banks $6000-$7FFF in 8KB units through $A000 bits 2-3 when prg_ram_size > 8KB (SXROM)" {
     var prg = taggedPrg(32); // 512KB: the real SXROM shape
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) };
+    var prg_ram = TestPrgRam{};
     m.mmc1.prg_ram_size = 0x8000; // 32KB: four independent 8KB banks
 
     const banks = [_]struct { select: u5, value: u8 }{
@@ -847,20 +827,21 @@ test "Mmc1 banks $6000-$7FFF in 8KB units through $A000 bits 2-3 when prg_ram_si
     };
     for (banks) |b| {
         mmc1Write(&m, 0xA000, b.select);
-        m.prgRamWrite(0x6000, b.value);
+        prg_ram.write(&m, 0x6000, b.value);
     }
     for (banks) |b| {
         mmc1Write(&m, 0xA000, b.select);
-        try testing.expectEqual(@as(?u8, b.value), m.prgRamRead(0x6000));
+        try testing.expectEqual(@as(?u8, b.value), prg_ram.read(&m, 0x6000));
     }
 }
 
 test "Mmc1 does not bank PRG-RAM when prg_ram_size is the 8KB default (bank always 0)" {
     var prg = taggedPrg(2);
     var m = Mapper{ .mmc1 = Mmc1.init(&prg, &.{}) }; // prg_ram_size defaults to 0x2000
-    m.prgRamWrite(0x6000, 0x11);
+    var prg_ram = TestPrgRam{};
+    prg_ram.write(&m, 0x6000, 0x11);
     mmc1Write(&m, 0xA000, 0b01100); // would select bank 3 on a banked board; here it's a no-op
-    try testing.expectEqual(@as(?u8, 0x11), m.prgRamRead(0x6000));
+    try testing.expectEqual(@as(?u8, 0x11), prg_ram.read(&m, 0x6000));
 }
 
 /// MMC3 (mapper 4): the first cartridge here with an IRQ that actually
@@ -919,7 +900,6 @@ pub const Mmc3 = struct {
     /// SOROM/SXROM's MMC1 does, so unlike `Mmc1.prg_ram` there is no bank
     /// count or offset math here, just the $A001 write-protect gate below.
     /// See `docs/adr/0005-cartridge-owns-its-memory.md`.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
     /// $A001 bit 6, the real "read-only mode" bit holy-mapperel's WRAM
     /// digit `2` names. **Bit 7 (chip enable) is deliberately not modeled**
     /// -- see the type doc comment.
@@ -927,8 +907,6 @@ pub const Mmc3 = struct {
     /// 2KB of cartridge-side nametable VRAM. Same dead-storage-on-every-
     /// real-board reasoning as `Mmc1.cart_nametable`: MMC3's `mirroring()`
     /// only ever returns `.horizontal`/`.vertical`, never `.four_screen`.
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     /// R0-R7. Raw as written; `prgOffset`/`chrOffset` apply the low-bit mask
     /// for R0/R1 and the modulo-by-bank-count wrap.
     bank_data: [8]u8 = [_]u8{0} ** 8,
@@ -1142,21 +1120,9 @@ pub const Mmc3 = struct {
 
     /// Chip-enable (bit 7) is not modeled -- see the type doc comment -- so
     /// this never returns `null`; only the write-protect bit gates writes.
-    pub fn prgRamRead(self: *const Mmc3, addr: u16) ?u8 {
-        return self.prg_ram[addr & 0x1FFF];
-    }
-
-    pub fn prgRamWrite(self: *Mmc3, addr: u16, value: u8) void {
-        if (self.prg_ram_write_protect) return;
-        self.prg_ram[addr & 0x1FFF] = value;
-    }
-
-    pub fn nametableRead(self: *const Mmc3, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *Mmc3, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    pub fn prgRamMap(self: *const Mmc3, addr: u16, write: bool) ?usize {
+        if (write and self.prg_ram_write_protect) return null;
+        return addr & 0x1FFF;
     }
 };
 
@@ -1284,32 +1250,35 @@ test "Mmc3 $A000 bit 0 selects vertical/horizontal mirroring (opposite polarity 
 test "Mmc3 $A001 bit 6 write-protects PRG-RAM; clearing it re-enables writes" {
     var prg = taggedPrg8k(2);
     var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
-    m.prgRamWrite(0x6000, 0xAB);
-    try testing.expectEqual(@as(?u8, 0xAB), m.prgRamRead(0x6000));
+    var prg_ram = TestPrgRam{};
+    prg_ram.write(&m, 0x6000, 0xAB);
+    try testing.expectEqual(@as(?u8, 0xAB), prg_ram.read(&m, 0x6000));
 
     m.prgWrite(0xA001, 0x40); // bit 6: write-protect
-    m.prgRamWrite(0x6000, 0xCD); // dropped
-    try testing.expectEqual(@as(?u8, 0xAB), m.prgRamRead(0x6000));
+    prg_ram.write(&m, 0x6000, 0xCD); // dropped
+    try testing.expectEqual(@as(?u8, 0xAB), prg_ram.read(&m, 0x6000));
 
     m.prgWrite(0xA001, 0x00); // clear write-protect
-    m.prgRamWrite(0x6000, 0xEF);
-    try testing.expectEqual(@as(?u8, 0xEF), m.prgRamRead(0x6000));
+    prg_ram.write(&m, 0x6000, 0xEF);
+    try testing.expectEqual(@as(?u8, 0xEF), prg_ram.read(&m, 0x6000));
 }
 
 test "Mmc3 PRG-RAM reads never return null -- chip enable ($A001 bit 7) is not modeled" {
     var prg = taggedPrg8k(2);
     var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
+    var prg_ram = TestPrgRam{};
     m.prgWrite(0xA001, 0x00); // bit 7 clear: "disabled" on real hardware, not honored here
-    try testing.expectEqual(@as(?u8, 0), m.prgRamRead(0x6000));
+    try testing.expectEqual(@as(?u8, 0), prg_ram.read(&m, 0x6000));
 }
 
 test "Mmc3 PRG-RAM is mirrored across the whole $6000-$7FFF window" {
     var prg = taggedPrg8k(2);
     var m = Mapper{ .mmc3 = Mmc3.init(&prg, &.{}) };
-    m.prgRamWrite(0x6000, 0x11);
-    m.prgRamWrite(0x7FFF, 0x22);
-    try testing.expectEqual(@as(?u8, 0x11), m.prgRamRead(0x6000));
-    try testing.expectEqual(@as(?u8, 0x22), m.prgRamRead(0x7FFF));
+    var prg_ram = TestPrgRam{};
+    prg_ram.write(&m, 0x6000, 0x11);
+    prg_ram.write(&m, 0x7FFF, 0x22);
+    try testing.expectEqual(@as(?u8, 0x11), prg_ram.read(&m, 0x6000));
+    try testing.expectEqual(@as(?u8, 0x22), prg_ram.read(&m, 0x7FFF));
 }
 
 test "Mmc3 does not count an A12 rise unless the line was held low across a full tick" {
@@ -1435,9 +1404,6 @@ pub const Uxrom = struct {
     /// own to gate with, so this keeps the behavior `Bus` gave every
     /// cartridge before ENG-79 rather than removing it outright. See
     /// `docs/adr/0005-cartridge-owns-its-memory.md`.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     pub fn init(prg_rom: []const u8, header_mirroring: Mirroring) Uxrom {
         return .{ .prg_rom = prg_rom, .mirroring_mode = header_mirroring };
     }
@@ -1490,20 +1456,10 @@ pub const Uxrom = struct {
         _ = self;
     }
 
-    pub fn prgRamRead(self: *const Uxrom, addr: u16) ?u8 {
-        return self.prg_ram[addr & 0x1FFF];
-    }
-
-    pub fn prgRamWrite(self: *Uxrom, addr: u16, value: u8) void {
-        self.prg_ram[addr & 0x1FFF] = value;
-    }
-
-    pub fn nametableRead(self: *const Uxrom, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *Uxrom, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    pub fn prgRamMap(self: *const Uxrom, addr: u16, write: bool) ?usize {
+        _ = self;
+        _ = write;
+        return addr & 0x1FFF;
     }
 };
 
@@ -1616,9 +1572,6 @@ pub const Cnrom = struct {
     /// it with, so this preserves `Bus`'s pre-ENG-79 behavior rather than
     /// removing it -- see `cnrom_test.zig`'s doc comment and
     /// `docs/adr/0005-cartridge-owns-its-memory.md`.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
-    cart_nametable: [0x800]u8 = [_]u8{0} ** 0x800,
-
     /// See the type doc comment for why `prg_rom`/`chr_rom` are borrowed
     /// slices rather than copied, unlike `Nrom.chr`.
     pub fn init(prg_rom: []const u8, chr_rom: []const u8, header_mirroring: Mirroring) Cnrom {
@@ -1667,20 +1620,10 @@ pub const Cnrom = struct {
         _ = self;
     }
 
-    pub fn prgRamRead(self: *const Cnrom, addr: u16) ?u8 {
-        return self.prg_ram[addr & 0x1FFF];
-    }
-
-    pub fn prgRamWrite(self: *Cnrom, addr: u16, value: u8) void {
-        self.prg_ram[addr & 0x1FFF] = value;
-    }
-
-    pub fn nametableRead(self: *const Cnrom, addr: u11) u8 {
-        return self.cart_nametable[addr];
-    }
-
-    pub fn nametableWrite(self: *Cnrom, addr: u11, value: u8) void {
-        self.cart_nametable[addr] = value;
+    pub fn prgRamMap(self: *const Cnrom, addr: u16, write: bool) ?usize {
+        _ = self;
+        _ = write;
+        return addr & 0x1FFF;
     }
 };
 
@@ -1862,32 +1805,20 @@ pub const Mapper = union(enum) {
     /// bus (PRG-RAM disabled, or absent) -- `Bus.read`/`peek` fall back to
     /// `open_bus`, matching what real hardware's floating bus does. See
     /// `docs/adr/0005-cartridge-owns-its-memory.md`.
-    pub fn prgRamRead(self: *const Mapper, addr: u16) ?u8 {
+    /// Where, if anywhere, a $6000-$7FFF access lands in `Bus`'s PRG-RAM.
+    ///
+    /// `null` means the cartridge is not driving the bus for this access:
+    /// the board has no PRG-RAM, MMC1 has disabled it, or MMC3 has
+    /// write-protected it and this is a write. `Bus` turns that into open
+    /// bus on a read and a discarded write, the same convention it already
+    /// uses for every unmapped region.
+    ///
+    /// **The mapper decides the mapping; `Bus` owns the memory.** Storing
+    /// the array in each variant instead cost a measured 5x on the whole
+    /// native suite -- see `docs/adr/0005-cartridge-owns-its-memory.md`.
+    pub fn prgRamMap(self: *const Mapper, addr: u16, write: bool) ?usize {
         switch (self.*) {
-            inline else => |*m| return m.prgRamRead(addr),
-        }
-    }
-
-    pub fn prgRamWrite(self: *Mapper, addr: u16, value: u8) void {
-        switch (self.*) {
-            inline else => |*m| m.prgRamWrite(addr, value),
-        }
-    }
-
-    /// The cartridge's extra 2KB nametable VRAM, live only on a four-screen
-    /// board (see `Ppu.physicalNametable`). `addr` is the pre-resolved
-    /// 11-bit index into that 2KB chip -- `Ppu.vramAddress` has already done
-    /// the mirroring math and decided this access belongs here rather than
-    /// in the console's own `Ppu.vram`.
-    pub fn nametableRead(self: *const Mapper, addr: u11) u8 {
-        switch (self.*) {
-            inline else => |*m| return m.nametableRead(addr),
-        }
-    }
-
-    pub fn nametableWrite(self: *Mapper, addr: u11, value: u8) void {
-        switch (self.*) {
-            inline else => |*m| m.nametableWrite(addr, value),
+            inline else => |*m| return m.prgRamMap(addr, write),
         }
     }
 };

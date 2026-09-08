@@ -222,16 +222,76 @@ for widening `chrRead`'s mutability across every mapper, not only MMC3.
   unit tests in `ppu.zig` driving a header-declared four-screen `Nrom`
   directly. This is named, not hidden — see "Deliberately out of scope."
 
+
+## Revised before merge: storage moved back to `Bus` and `Ppu`
+
+The first implementation of this ADR put the arrays inside each `Mapper`
+variant, exactly as the Decision section describes. **It cost a measured 5x
+on the native test suite** and was changed before merging. The decision below
+still stands in substance — the cartridge decides how its memory is addressed
+— but the *bytes* live on `Bus` and `Ppu`.
+
+### The measurement
+
+Same 11 `sprite_hit` ROMs, warm cache, `--summary all` separating compile
+from run, on identical work with no new ROMs involved:
+
+| | run time |
+|---|---|
+| `main` (before this ADR) | 1s |
+| per-variant storage | 5s |
+| storage on `Bus`/`Ppu` | 1s |
+
+The cause is size, not indirection. `Mmc1` alone carried 8KB CHR-RAM + 32KB
+PRG-RAM + 2KB nametable; a tagged union is as large as its largest variant,
+so `Mapper` went from roughly 8KB to roughly 42KB — and `Bus` embeds it *by
+value*, directly beside the CPU, PPU and APU state the emulator touches every
+cycle. Confirmed by bisection: shrinking only `Mmc1.prg_ram` from 32KB to 8KB
+took the same test from 5s to 2s.
+
+Note what this was *not*. The union dispatch is written correctly
+(`inline else => |*m|`, by pointer, per ADR 0003), and the nametable hot path
+already read `Ppu.vram` directly for console-sourced accesses without
+touching the mapper at all. Neither was the problem; both were the first
+things suspected.
+
+### What changed
+
+`prgRamRead`/`prgRamWrite` became **`prgRamMap(addr, write) ?usize`** — the
+mapper answers *where* an access lands, or `null` for "nothing is driving the
+bus" (no PRG-RAM, MMC1 disabled, MMC3 write-protected on a write). `Bus`
+holds one `[0x8000]u8` and does the indexing. `nametableRead`/`nametableWrite`
+disappeared entirely: `Ppu` holds `cart_vram: [0x800]u8`, and the mapper's
+existing `mirroring()` already says whether a logical nametable resolves to
+the console's chip or the cartridge's.
+
+### Why this is not the anti-pattern the alternative was rejected for
+
+The original objection was that splitting storage from policy would recreate
+ADR 0003's "two copies of one fact." It does not. There is exactly one copy
+of the policy (the mapper's registers) and one copy of the bytes (`Bus`,
+`Ppu`). Nothing has to be kept in sync, and no second component can answer
+the same question differently — which was the actual failure mode ADR 0003
+was guarding against, where both `Ppu` and the cartridge held a mirroring
+mode.
+
+The sizing objection is answered by returning an **offset** rather than a
+bool: `Bus`'s array is 32KB, SXROM's four 8KB banks are selected by
+`Mmc1.prgRamOffset`, and the vendored `M1_P512K_CR8K_S32K` board still
+reports `0000`.
+
+The honest cost is that `Bus` now carries 32KB for every cartridge, most of
+which have 8KB or none. That is 32KB once per machine, against 34KB added to
+every `Mapper` value on the hot path — a trade the measurement settles.
+
 ## Alternatives considered
 
 **PRG-RAM: keep `Bus` owning the storage, ask the mapper only "is it
 enabled?"** (e.g. `Mapper.prgRamEnabled() bool`, with `Bus.prg_ram` still a
-flat array). Rejected: it solves the disable-bit problem but not the sizing
-one — SXROM's 32KB banked WRAM still has nowhere to live, since `Bus` would
-still own one undifferentiated 8KB block. It also splits one cartridge
-feature (PRG-RAM) across two owners (`Bus` for storage, `Mapper` for
-policy), the same anti-pattern ADR 0003 rejected for mirroring ("two copies
-of one fact").
+flat array). Rejected as stated — see the revision below, which adopts a
+stronger form of it. As originally framed the objection held: a bool solves
+the disable-bit problem but not the sizing one, since SXROM's 32KB banked
+WRAM has nowhere to live if `Bus` owns one undifferentiated 8KB block.
 
 **PRG-RAM: widen `Mapper.prgRead`/`prgWrite` to cover $6000-$FFFF instead of
 adding new methods.** Rejected: PRG-ROM and PRG-RAM are different kinds of

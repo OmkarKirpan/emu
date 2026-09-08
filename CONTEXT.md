@@ -43,11 +43,10 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   owns its own memory** as of the ENG-82/ENG-79/ENG-80 follow-on to M7:
   `rom.zig` parses NES 2.0 headers (submapper, mapper bits 8-11, PRG/CHR
   size extensions, and PRG-RAM/CHR-RAM sizes) where plain iNES has no room
-  to say more; `Mapper.prgRamRead`/`prgRamWrite` own $6000-$7FFF instead of
-  `Bus` (MMC1 honors its `$E000`/SNROM-`$A000` disable bits and banks
+  to say more; `Mapper.prgRamMap` decides where $6000-$7FFF lands (`Bus` still holds the
+  bytes -- storing them per-variant cost a measured 5x, see the ADR) (MMC1 honors its `$E000`/SNROM-`$A000` disable bits and banks
   SXROM's 32KB WRAM, MMC3 honors its `$A001` write-protect bit, NROM/
-  TestStub/UxROM/CNROM stay unconditional 8KB); and `Mapper.nametableRead`/
-  `nametableWrite` give a four-screen board's extra 2KB VRAM chip a home,
+  TestStub/UxROM/CNROM stay unconditional 8KB); and `Ppu.cart_vram` gives a four-screen board's extra 2KB VRAM chip a home,
   with `Ppu.physicalNametable` now naming which physical memory a logical
   nametable resolves to, not just which bank. See
   `docs/adr/0005-cartridge-owns-its-memory.md`.

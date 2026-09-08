@@ -100,6 +100,17 @@ pub const Bus = struct {
     /// Port 0 ($4016) and port 1 ($4017). See `Controller`'s doc comment for
     /// the shift-register model and the shared-strobe wiring.
     controllers: [2]Controller = [_]Controller{.{}} ** 2,
+    /// $6000-$7FFF cartridge PRG-RAM, 32KB -- SXROM's banked maximum.
+    ///
+    /// **The memory lives here; the cartridge decides how it is addressed.**
+    /// `Mapper.prgRamMap` says where an access lands, or that it lands
+    /// nowhere (no PRG-RAM on the board, MMC1's disable bit, MMC3's
+    /// write-protect). Putting the array in each `Mapper` variant instead
+    /// made the union roughly five times larger and cost a measured 5x on
+    /// the whole native suite, because `Bus` embeds the union by value next
+    /// to the state the emulator touches every cycle -- see
+    /// `docs/adr/0005-cartridge-owns-its-memory.md`.
+    prg_ram: [0x8000]u8 = [_]u8{0} ** 0x8000,
     /// Last value driven on the data bus; see the open-bus note above.
     open_bus: u8 = 0,
 
@@ -118,7 +129,7 @@ pub const Bus = struct {
             0x4016 => (self.open_bus & 0xFE) | self.controllers[0].read(),
             0x4017 => (self.open_bus & 0xFE) | self.controllers[1].read(),
             0x4018...0x5FFF => self.open_bus, // CPU test regs + cartridge expansion
-            0x6000...0x7FFF => self.mapper.prgRamRead(addr) orelse self.open_bus,
+            0x6000...0x7FFF => if (self.mapper.prgRamMap(addr, false)) |off| self.prg_ram[off] else self.open_bus,
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
         self.open_bus = value;
@@ -145,7 +156,9 @@ pub const Bus = struct {
             // port -- controller *writes* both go through $4016 only.
             0x4017 => self.apu.writeRegister(addr, value),
             0x4018...0x5FFF => {},
-            0x6000...0x7FFF => self.mapper.prgRamWrite(addr, value),
+            0x6000...0x7FFF => {
+                if (self.mapper.prgRamMap(addr, true)) |off| self.prg_ram[off] = value;
+            },
             0x8000...0xFFFF => self.mapper.prgWrite(addr, value),
         }
     }
@@ -169,7 +182,7 @@ pub const Bus = struct {
             0x4016 => (self.open_bus & 0xFE) | self.controllers[0].peek(),
             0x4017 => (self.open_bus & 0xFE) | self.controllers[1].peek(),
             0x4018...0x5FFF => self.open_bus,
-            0x6000...0x7FFF => self.mapper.prgRamRead(addr) orelse self.open_bus,
+            0x6000...0x7FFF => if (self.mapper.prgRamMap(addr, false)) |off| self.prg_ram[off] else self.open_bus,
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
     }

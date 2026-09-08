@@ -305,6 +305,13 @@ pub const Ppu = struct {
     bg_shift_attr_lo: u16 = 0,
     bg_shift_attr_hi: u16 = 0,
 
+    /// The extra 2KB VRAM chip a four-screen cartridge wires up, holding
+    /// logical nametables 2-3 (see `physicalNametable`). Dead weight on
+    /// every other board, which is why it is 2KB here rather than 2KB in
+    /// each of six `Mapper` variants -- the cartridge decides that its
+    /// nametables come from here, the console holds the bytes.
+    cart_vram: [0x800]u8 = [_]u8{0} ** 0x800,
+
     /// One entry per pixel, row-major, holding a 6-bit NES palette index
     /// (0-63) -- not an RGB color. Turning that index into a displayable
     /// color is a delivery-layer concern (M4+); what this milestone commits
@@ -449,7 +456,7 @@ pub const Ppu = struct {
                 const nt = self.vramAddress(a, mapper);
                 break :blk switch (nt.source) {
                     .console => self.vram[nt.index],
-                    .cartridge => mapper.nametableRead(nt.index),
+                    .cartridge => self.cart_vram[nt.index],
                 };
             },
             0x3F00...0x3FFF => self.palette[paletteIndex(a)],
@@ -465,7 +472,7 @@ pub const Ppu = struct {
                 const nt = self.vramAddress(a, mapper);
                 switch (nt.source) {
                     .console => self.vram[nt.index] = value,
-                    .cartridge => mapper.nametableWrite(nt.index, value),
+                    .cartridge => self.cart_vram[nt.index] = value,
                 }
             },
             0x3F00...0x3FFF => self.palette[paletteIndex(a)] = value,
@@ -1326,8 +1333,8 @@ test "four-screen mirroring puts logical 0-1 on the console's own VRAM and 2-3 o
     try testing.expectEqual(@as(u8, 0x10), ppu.vram[0]);
     try testing.expectEqual(@as(u8, 0x11), ppu.vram[0x400]);
     // ...and logical 2-3 landed in the cartridge's chip instead, not here.
-    try testing.expectEqual(@as(u8, 0x12), m.nrom.cart_nametable[0]);
-    try testing.expectEqual(@as(u8, 0x13), m.nrom.cart_nametable[0x400]);
+    try testing.expectEqual(@as(u8, 0x12), ppu.cart_vram[0]);
+    try testing.expectEqual(@as(u8, 0x13), ppu.cart_vram[0x400]);
 }
 
 test "physicalNametable never routes logical 0-1 to the cartridge, even under four-screen" {
