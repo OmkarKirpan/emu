@@ -2,19 +2,21 @@
 
 ## What these are
 
-Seven ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing test
+Eight ROMs from **Holy Mapperel**, an NES cartridge PCB manufacturing test
 by Damian Yerrick (tepples):
 [`pinobatch/holy-mapperel`](https://github.com/pinobatch/holy-mapperel),
 release **v0.02** (2018-09-29), extracted unmodified from that release's
-`holy-mapperel-bin-0.02.7z` archive. Three are MMC1 (M7a, ENG-72), one is
-UxROM (M7b, ENG-73), one is CNROM (M7c, ENG-74), and two are MMC3 (M7d,
-ENG-75).
+`holy-mapperel-bin-0.02.7z` archive. Four are MMC1 (three from M7a/ENG-72,
+plus `M1_P512K_CR8K_S32K` vendored later for ENG-79/ENG-82's banked-WRAM
+path), one is UxROM (M7b, ENG-73), one is CNROM (M7c, ENG-74), and two are
+MMC3 (M7d, ENG-75).
 
 | File | Size | Board | What it reaches here |
 |---|---|---|---|
 | `M1_P128K_CR8K.nes` | 131,088 | SNROM | 128KB PRG, 8KB CHR-**RAM** — the common MMC1 shape |
 | `M1_P128K_C128K.nes` | 262,160 | SKROM | 128KB PRG, 128KB CHR-**ROM** — CHR bank switching at maximum size |
 | `M1_P512K_CR8K_S8K.nes` | 524,304 | SUROM | 512KB PRG — the PRG-A18 path, plus 8KB battery-backed WRAM |
+| `M1_P512K_CR8K_S32K.nes` | 524,304 | SXROM | 512KB PRG (the SUROM PRG-A18 path again) plus 32KB of *banked* battery WRAM, selected through $A000 bits 2-3. Vendored as of ENG-79/ENG-82, once `rom.zig` parsed NES 2.0's PRG-RAM size field and `Mmc1` learned to bank it — see below and `mmc1_test.zig` |
 | `M2_P128K_CR8K_V.nes` | 131,088 | U*ROM (UNROM/UOROM) | 128KB PRG, 8KB CHR-RAM — the only shape UxROM has |
 | `M3_P32K_C32K_H.nes` | 65,552 | CNROM | 32KB PRG (fixed), 32KB CHR-**ROM** (switchable, all 4 banks), horizontal mirroring |
 | `M4_P256K_C256K.nes` | 524,304 | TSROM | 256KB PRG, 256KB CHR-**ROM** — MMC3's 1KB/2KB CHR banking in both CHR-A12 modes, at maximum size |
@@ -107,22 +109,29 @@ harnesses in three ways:
 Each test asserts the **exact** four-digit code, and every nonzero digit is
 explained rather than tolerated:
 
-- **MMC1** reports a nonzero WRAM digit because its PRG-RAM disable bit is
-  deliberately deferred (ENG-79). **MMC3** reports one for the same
-  underlying reason — its `$A001` PRG-RAM protect bit is out of scope on the
-  same `Bus`-owns-`$6000-$7FFF` grounds, and holy-mapperel's README
-  separately confirms that code is expected in an iNES-only environment,
-  which this repo's parser deliberately is.
+- **MMC1 reports `0000` on all four boards** (SNROM, SKROM, SUROM, and the
+  banked-WRAM SXROM). Through M7a its PRG-RAM disable bit went unhonored,
+  reporting a nonzero WRAM digit; as of ENG-79/ENG-82
+  (`docs/adr/0005-cartridge-owns-its-memory.md`), `Mmc1` owns $6000-$7FFF
+  itself and honors both the standard `$E000` disable bit and the
+  SNROM-specific `$A000` one, and banks SXROM's 32KB WRAM through `$A000`
+  bits 2-3. See `mmc1_test.zig`.
+- **MMC3 reports `1000` on both boards**, down from `2000`. Its `$A001`
+  write-protect bit (bit 6, holy-mapperel's "read-only mode") is now
+  honored the same way; the remaining `1` is `$A001` bit 7 (PRG-RAM chip
+  enable), left deliberately unmodeled — nesdev.org's MMC3 page notes many
+  emulators skip it to avoid a documented MMC6 incompatibility. See
+  `mmc3_test.zig`.
 - **UxROM and CNROM** both report `0000` outright: no bank-switch register
   either one owns can be got wrong without the PRG or CHR digit saying so,
   and neither board has an IRQ.
 
 Worth knowing about the CNROM `0000`: real CNROM boards have no PRG-RAM,
-while `Bus` maps $6000-$7FFF as unconditional WRAM — so a WRAM digit *could*
-have been expected here. It is zero because this ROM has no disable register
-to probe on a CNROM board; it only confirms that whatever RAM it finds
-behaves like RAM. The ENG-79 gap is real but this ROM is not the instrument
-that catches it. See `cnrom_test.zig`.
+while `Mapper.prgRamRead`/`prgRamWrite` (formerly `Bus`) still give it
+unconditional $6000-$7FFF WRAM, same as before ENG-79 — `Cnrom` has no
+disable register of its own to gate that with, and this particular ROM
+never probes for one anyway; it only confirms that whatever RAM it finds
+behaves like RAM. See `cnrom_test.zig`.
 
 The MMC3 ROMs' IRQ digit is worth reading `mmc3_test.zig`'s doc comment for
 on its own: it started nonzero, and the cause was a pre-existing PPU gap
@@ -141,7 +150,7 @@ gh release download v0.02 --repo pinobatch/holy-mapperel
 ```
 
 ```bash
-7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes testroms/M2_P128K_CR8K_V.nes testroms/M3_P32K_C32K_H.nes testroms/M4_P256K_C256K.nes testroms/M4_P128K_CR8K.nes
+7z e holy-mapperel-bin-0.02.7z testroms/M1_P128K_CR8K.nes testroms/M1_P128K_C128K.nes testroms/M1_P512K_CR8K_S8K.nes testroms/M1_P512K_CR8K_S32K.nes testroms/M2_P128K_CR8K_V.nes testroms/M3_P32K_C32K_H.nes testroms/M4_P256K_C256K.nes testroms/M4_P128K_CR8K.nes
 ```
 
 The archive also contains a second mapper-2 ROM this milestone did not
@@ -152,11 +161,27 @@ out-of-scope mappers. Each milestone vendors only what it gates on.
 
 ## A note on headers
 
-Every holy-mapperel ROM carries an **NES 2.0** header (`flags7` bit 3 set),
-not plain iNES. `core/src/rom.zig` parses iNES only and reads these correctly
-regardless: the mapper number is `(flags6 >> 4) | (flags7 & 0xF0)`, which
-masks the NES 2.0 marker off, and every size here fits the 8-bit iNES
-bank-count fields. What is lost is NES 2.0 bytes 10-11, the PRG-RAM and
-CHR-RAM *sizes* — which is why the `_S32K` (SXROM, 32KB banked WRAM) ROM is
-not vendored, and why the mapper-034 and mapper-078.3 ROMs in the archive are
-unusable here. None of those is in this project's mapper scope.
+Every holy-mapperel ROM carries an **NES 2.0** header (`flags7` bits 2-3 =
+`0b10`), not plain iNES. Before ENG-82, `core/src/rom.zig` parsed iNES only
+and read these correctly *by accident*: the mapper number is
+`(flags6 >> 4) | (flags7 & 0xF0)`, which never looks at the NES 2.0 marker
+bits at all, and every size here fits the 8-bit iNES bank-count fields. What
+was lost was NES 2.0 bytes 10-11, the PRG-RAM and CHR-RAM *sizes* — which is
+why the `_S32K` (SXROM, 32KB banked WRAM) ROM was not vendored originally.
+
+As of ENG-82, `parseHeader` reads the NES 2.0 marker on purpose and decodes
+bytes 8-11 (submapper, mapper bits 8-11, PRG/CHR size extensions, and the
+PRG-RAM/CHR-RAM shift-count sizes) when it is present. `M1_P512K_CR8K_S32K`
+is vendored as of ENG-79/ENG-82: its byte 10 is `$90` (high nibble 9,
+`64 << 9 = 32768` bytes of *battery-backed* PRG-RAM), which `Rom.createMapper`
+now reads and wires into `Mmc1.prg_ram_size` — see `mmc1_test.zig`.
+`M1_P512K_CR8K_S8K`'s byte 10 (`$70`, `64 << 7 = 8192` battery-backed) is the
+worked example in `rom.zig`'s own header-parsing tests. Interestingly, most
+of the *other* boards here (SNROM, SKROM, SUROM) declare byte 10 as `$00` --
+no PRG-RAM at all -- despite genuinely carrying 8KB of WRAM their own
+self-test measures and exercises; `Rom.createMapper` falls back to the
+historical 8KB default for MMC1 whenever the header says "none" rather than
+trusting that literally, which is what makes their WRAM work at all (see
+`createMapper`'s comment for the MMC1 case). The mapper-034 and mapper-078.3
+ROMs in the archive remain unusable here regardless — neither mapper is in
+this project's scope.

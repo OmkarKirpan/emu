@@ -139,10 +139,16 @@ pub fn build(b: *std.Build) void {
     // CHR-RAM) is not vendored -- CHR-ROM already exercises MMC3's 1KB/2KB
     // banking, which CHR-RAM alone cannot. For M7b, see `ATTRIBUTION.md`'s
     // entry on why `M2_P128K_CR8K_V` and not its sibling `M2_P128K_V.nes`.
+    // ENG-79/ENG-82: `M1_P512K_CR8K_S32K` (SXROM, 32KB banked WRAM) became
+    // vendorable once PRG-RAM sizing came from the NES 2.0 header and
+    // `Mmc1` learned to bank it -- see `mmc1_test.zig` and
+    // `docs/adr/0005-cartridge-owns-its-memory.md`. It was previously
+    // unusable here (ATTRIBUTION.md's "A note on headers") because `rom.zig`
+    // didn't parse bytes 10-11 at all.
     const mapperel_names = [_][]const u8{
-        "M1_P128K_CR8K",   "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
-        "M2_P128K_CR8K_V", "M3_P32K_C32K_H",
-        "M4_P256K_C256K",  "M4_P128K_CR8K",
+        "M1_P128K_CR8K",       "M1_P128K_C128K", "M1_P512K_CR8K_S8K",
+        "M1_P512K_CR8K_S32K",  "M2_P128K_CR8K_V", "M3_P32K_C32K_H",
+        "M4_P256K_C256K",      "M4_P128K_CR8K",
     };
     for (mapperel_names) |name| {
         test_mod.addAnonymousImport(b.fmt("mapperel_{s}", .{name}), .{

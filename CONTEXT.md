@@ -39,7 +39,17 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   mutable (not `*const`) as of M7d, since MMC3 tracks PPU address line A12
   from every CHR access; see
   `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md` and
-  `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`.
+  `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`. **The cartridge
+  owns its own memory** as of the ENG-82/ENG-79/ENG-80 follow-on to M7:
+  `rom.zig` parses NES 2.0 headers (submapper, mapper bits 8-11, PRG/CHR
+  size extensions, and PRG-RAM/CHR-RAM sizes) where plain iNES has no room
+  to say more; `Mapper.prgRamMap` decides where $6000-$7FFF lands (`Bus` still holds the
+  bytes -- storing them per-variant cost a measured 5x, see the ADR) (MMC1 honors its `$E000`/SNROM-`$A000` disable bits and banks
+  SXROM's 32KB WRAM, MMC3 honors its `$A001` write-protect bit, NROM/
+  TestStub/UxROM/CNROM stay unconditional 8KB); and `Ppu.cart_vram` gives a four-screen board's extra 2KB VRAM chip a home,
+  with `Ppu.physicalNametable` now naming which physical memory a logical
+  nametable resolves to, not just which bank. See
+  `docs/adr/0005-cartridge-owns-its-memory.md`.
   **The audio ring buffer
   (`audio_ring.zig`) used to sit on the wasm-only side of that line; as of
   M6 it does not.** `Apu` is a shared subsystem ticked from `Cpu.tick`
@@ -86,14 +96,26 @@ rather than only reacting to accesses aimed at it — which is why
 `Mapper.chrRead` is now mutable, and which caught a real, pre-existing PPU
 gap (`Ppu.fetchSpriteUnits` skipping sprite pattern fetches on scanlines
 with no sprites in range — invisible until a mapper depended on the bus
-activity itself, not just its visible effect). See
+activity itself, not just its visible effect). A follow-on to M7
+(ENG-82/ENG-79/ENG-80) then closed the three gaps ADR 0003 and ADR 0004 had
+each explicitly deferred: `rom.zig` parses NES 2.0 headers, `Mapper` owns
+$6000-$7FFF PRG-RAM instead of `Bus` (MMC1's disable bits and SXROM's banked
+WRAM, MMC3's write-protect bit), and `Mapper` owns a four-screen board's
+extra nametable VRAM instead of `Ppu` silently folding it into vertical
+mirroring. holy-mapperel's MMC1 WRAM digit reached `0000` on all four
+vendored boards (SNROM, SKROM, SUROM, and the newly-vendorable SXROM); MMC3's
+dropped from `2` to `1`, the remaining digit being a real, documented,
+deliberately-unmodeled hardware ambiguity (MMC3 `$A001` bit 7's
+MMC6-incompatibility problem), not a bug. See
 `docs/adr/0001-audio-playback-no-howler.md` for the threaded-audio pipeline
 decision, `docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter
 decisions and the deferred DMC-DMA-stealing gap,
 `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md` for the
-two interface changes MMC1 forced, and
+two interface changes MMC1 forced,
 `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md` for MMC3's A12
-design and the PPU fix it forced.
+design and the PPU fix it forced, and
+`docs/adr/0005-cartridge-owns-its-memory.md` for the cartridge-memory
+follow-on.
 
 ## Conventions worth knowing before touching either side
 

@@ -64,31 +64,49 @@ fn paletteIndex(addr: u16) u5 {
     return @intCast(a);
 }
 
+/// Which physical nametable bank (and which chip it lives on) backs one of
+/// the four *logical* 1KB nametables. See `physicalNametable`.
+pub const PhysicalNametable = struct {
+    source: mapper_mod.NametableSource,
+    /// Bank index *within* whichever chip `source` names -- the console's
+    /// own 2KB VRAM has two 1KB banks, and so does a four-screen board's
+    /// extra cartridge chip, so `u1` still says everything a single chip
+    /// needs regardless of which one this is.
+    bank: u1,
+};
+
 /// Map one of the four *logical* 1KB nametables ($2000/$2400/$2800/$2C00,
-/// `logical` = 0-3) onto one of the console's two *physical* 1KB VRAM banks,
-/// per the cartridge's mirroring wiring. See
+/// `logical` = 0-3) onto one of the physical 1KB VRAM banks that can back
+/// it, per the cartridge's mirroring wiring. See
 /// https://www.nesdev.org/wiki/Mirroring -- horizontal mirroring ties the
 /// two nametables in each row together (0=0,1=0,2=1,3=1: A11 selects),
 /// vertical ties each column together (0=0,1=1,2=0,3=1: A10 selects).
 ///
-/// `four_screen` implies a cartridge-supplied extra 2KB VRAM chip wired to a
-/// mapper pin this milestone's `Mapper` interface has no entry point for
-/// (the same class of gap `bus.zig` documents for $6000-$7FFF PRG-RAM: a
-/// real feature with no home in the M0-era interface, not an oversight).
-/// NROM cartridges essentially never set the four-screen header bit, so this
-/// degrades to vertical mirroring -- a named, deliberate fallback rather
-/// than a silent mishandling. TODO(M7 or later): give `Mapper` a hook for
-/// cartridge-supplied nametable VRAM and route four_screen through it.
-pub fn physicalNametable(mirroring: Mirroring, logical: u2) u1 {
+/// **`four_screen` is the one mode that needs more than the console's own
+/// two physical banks can express**, because it means no mirroring at all:
+/// all four logical nametables are independently writable, which needs a
+/// cartridge-supplied extra 2KB VRAM chip (see
+/// `docs/adr/0005-cartridge-owns-its-memory.md`'s ENG-80 section for the
+/// interface-shape decision this forced and the alternatives it rejected).
+/// Logical 0-1 stay on the console's own chip (banks 0-1, same as vertical
+/// mirroring); logical 2-3 resolve to the cartridge's chip instead (also
+/// banks 0-1, but a different chip -- see `source`). `vramRead`/`vramWrite`
+/// dispatch on `source` to decide whether to index `Ppu.vram` or call
+/// `Mapper.nametableRead`/`nametableWrite`.
+pub fn physicalNametable(mirroring: Mirroring, logical: u2) PhysicalNametable {
     return switch (mirroring) {
-        .horizontal => @intCast(logical >> 1),
-        .vertical, .four_screen => @intCast(logical & 1),
+        .horizontal => .{ .source = .console, .bank = @intCast(logical >> 1) },
+        .vertical => .{ .source = .console, .bank = @intCast(logical & 1) },
+        .four_screen => .{
+            .source = if (logical < 2) .console else .cartridge,
+            .bank = @intCast(logical & 1),
+        },
         // Both physical banks show the same 1KB; which one is the mapper's
         // choice. MMC1 (M7a) is the first cartridge here that can ask for
         // this, and it is why `Ppu` asks the mapper per access instead of
         // caching a mirroring mode of its own.
-        .single_screen_lower => 0,
-        .single_screen_upper => 1,
+        .single_screen_lower => .{ .source = .console, .bank = 0 },
+        .single_screen_upper => .{ .source = .console, .bank = 1 },
     };
 }
 
@@ -205,8 +223,12 @@ pub const Ppu = struct {
     data_bus: u8 = 0,
 
     /// 2KB of console-side nametable VRAM, addressed through
-    /// `physicalNametable`'s mirroring math -- NROM carts add no VRAM of
-    /// their own, so this is *all* the nametable storage that exists.
+    /// `physicalNametable`'s mirroring math. **Not necessarily all the
+    /// nametable storage that exists** -- a four-screen board wires up an
+    /// extra 2KB chip of its own (`Mapper.nametableRead`/`nametableWrite`),
+    /// which `vramRead`/`vramWrite` reach instead of this array whenever
+    /// `physicalNametable` resolves to `.cartridge`. See
+    /// `docs/adr/0005-cartridge-owns-its-memory.md`.
     vram: [0x0800]u8 = [_]u8{0} ** 0x0800,
     /// 32 bytes, background+sprite palettes; see `paletteIndex` for the
     /// $3F10-family mirror.
@@ -282,6 +304,13 @@ pub const Ppu = struct {
     bg_shift_pattern_hi: u16 = 0,
     bg_shift_attr_lo: u16 = 0,
     bg_shift_attr_hi: u16 = 0,
+
+    /// The extra 2KB VRAM chip a four-screen cartridge wires up, holding
+    /// logical nametables 2-3 (see `physicalNametable`). Dead weight on
+    /// every other board, which is why it is 2KB here rather than 2KB in
+    /// each of six `Mapper` variants -- the cartridge decides that its
+    /// nametables come from here, the console holds the bytes.
+    cart_vram: [0x800]u8 = [_]u8{0} ** 0x800,
 
     /// One entry per pixel, row-major, holding a 6-bit NES palette index
     /// (0-63) -- not an RGB color. Turning that index into a displayable
@@ -391,26 +420,45 @@ pub const Ppu = struct {
 
     // ------------------------------------------------------------- memory
 
-    fn vramAddress(self: *const Ppu, addr: u16, mapper: *const Mapper) u11 {
+    /// A $2000-$3EFF address, resolved to a physical location: which chip
+    /// (`PhysicalNametable.source`) and the 11-bit index into it
+    /// (`physical bank << 10 | offset within the bank`). `vramRead`/
+    /// `vramWrite` are the only callers, and both dispatch on `source`
+    /// before touching either `Ppu.vram` or the mapper's cartridge VRAM.
+    const ResolvedNametable = struct {
+        source: mapper_mod.NametableSource,
+        index: u11,
+    };
+
+    fn vramAddress(self: *const Ppu, addr: u16, mapper: *const Mapper) ResolvedNametable {
         _ = self;
         // $3000-$3EFF mirrors $2000-$2EFF before the per-cartridge mirroring
         // math ever sees it.
         const folded: u16 = if (addr >= 0x3000) addr - 0x1000 else addr;
         const offset: u16 = folded & 0x0FFF;
         const logical: u2 = @intCast(offset >> 10);
-        const physical: u1 = physicalNametable(mapper.mirroring(), logical);
-        return (@as(u11, physical) << 10) | @as(u11, @intCast(offset & 0x03FF));
+        const physical = physicalNametable(mapper.mirroring(), logical);
+        const index: u11 = (@as(u11, physical.bank) << 10) | @as(u11, @intCast(offset & 0x03FF));
+        return .{ .source = physical.source, .index = index };
     }
 
     // `mapper` is mutable (unlike a plain "read" elsewhere) because
     // `Mapper.chrRead` is: MMC3 (M7d) tracks PPU address line A12 from
     // every CHR access to clock its scanline IRQ. See
-    // `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`.
+    // `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md`. The same
+    // mutability lets a four-screen board's `Mapper.nametableRead` be
+    // called from here too.
     fn vramRead(self: *const Ppu, addr: u16, mapper: *Mapper) u8 {
         const a = addr & 0x3FFF;
         return switch (a) {
             0x0000...0x1FFF => mapper.chrRead(a),
-            0x2000...0x3EFF => self.vram[self.vramAddress(a, mapper)],
+            0x2000...0x3EFF => blk: {
+                const nt = self.vramAddress(a, mapper);
+                break :blk switch (nt.source) {
+                    .console => self.vram[nt.index],
+                    .cartridge => self.cart_vram[nt.index],
+                };
+            },
             0x3F00...0x3FFF => self.palette[paletteIndex(a)],
             else => unreachable,
         };
@@ -420,7 +468,13 @@ pub const Ppu = struct {
         const a = addr & 0x3FFF;
         switch (a) {
             0x0000...0x1FFF => mapper.chrWrite(a, value),
-            0x2000...0x3EFF => self.vram[self.vramAddress(a, mapper)] = value,
+            0x2000...0x3EFF => {
+                const nt = self.vramAddress(a, mapper);
+                switch (nt.source) {
+                    .console => self.vram[nt.index] = value,
+                    .cartridge => self.cart_vram[nt.index] = value,
+                }
+            },
             0x3F00...0x3FFF => self.palette[paletteIndex(a)] = value,
             else => unreachable,
         }
@@ -1252,6 +1306,42 @@ test "single-screen mirroring ties all four nametables to one physical bank" {
     }
     try testing.expectEqual(@as(u8, 0x66), ppu.vram[0x400]); // the *other* bank
     try testing.expectEqual(@as(u8, 0x55), ppu.vram[0]); // lower's byte, untouched
+}
+
+test "four-screen mirroring puts logical 0-1 on the console's own VRAM and 2-3 on the cartridge's" {
+    // ENG-80: four-screen boards wire an extra 2KB VRAM chip of their own.
+    // Writing through all four logical nametables must leave four distinct
+    // bytes -- no mirroring at all -- split across two different backing
+    // arrays (`Ppu.vram` and `Mapper.nrom.cart_nametable`).
+    var ppu = testPpu();
+    var m = testMapperM(.four_screen);
+    ppu.v = 0x2000;
+    ppu.writeRegister(0x2007, 0x10, &m);
+    ppu.v = 0x2400;
+    ppu.writeRegister(0x2007, 0x11, &m);
+    ppu.v = 0x2800;
+    ppu.writeRegister(0x2007, 0x12, &m);
+    ppu.v = 0x2C00;
+    ppu.writeRegister(0x2007, 0x13, &m);
+
+    try testing.expectEqual(@as(u8, 0x10), ppu.vramRead(0x2000, &m));
+    try testing.expectEqual(@as(u8, 0x11), ppu.vramRead(0x2400, &m));
+    try testing.expectEqual(@as(u8, 0x12), ppu.vramRead(0x2800, &m));
+    try testing.expectEqual(@as(u8, 0x13), ppu.vramRead(0x2C00, &m));
+
+    // Logical 0-1 landed in the console's own 2KB VRAM, at its two banks...
+    try testing.expectEqual(@as(u8, 0x10), ppu.vram[0]);
+    try testing.expectEqual(@as(u8, 0x11), ppu.vram[0x400]);
+    // ...and logical 2-3 landed in the cartridge's chip instead, not here.
+    try testing.expectEqual(@as(u8, 0x12), ppu.cart_vram[0]);
+    try testing.expectEqual(@as(u8, 0x13), ppu.cart_vram[0x400]);
+}
+
+test "physicalNametable never routes logical 0-1 to the cartridge, even under four-screen" {
+    try testing.expectEqual(mapper_mod.NametableSource.console, physicalNametable(.four_screen, 0).source);
+    try testing.expectEqual(mapper_mod.NametableSource.console, physicalNametable(.four_screen, 1).source);
+    try testing.expectEqual(mapper_mod.NametableSource.cartridge, physicalNametable(.four_screen, 2).source);
+    try testing.expectEqual(mapper_mod.NametableSource.cartridge, physicalNametable(.four_screen, 3).source);
 }
 
 test "the PPU follows a mapper that changes mirroring mid-run" {

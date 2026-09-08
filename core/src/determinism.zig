@@ -86,6 +86,10 @@ fn hashState(cpu: *const cpu_mod.Cpu, bus: *const bus_mod.Bus) Digest {
     var hasher = Sha256.init(.{});
     hashCpu(&hasher, cpu);
     hasher.update(&bus.wram);
+    // Cartridge PRG-RAM. It lives on `Bus` rather than inside the `Mapper`
+    // union for performance (see `Bus.prg_ram`), but it is still cartridge
+    // state a save-state has to carry -- `hashMapper` covers the registers
+    // that decide how it is addressed, this covers the bytes.
     hasher.update(&bus.prg_ram);
     hashPpu(&hasher, &bus.ppu);
     hashMapper(&hasher, &bus.mapper);
@@ -145,6 +149,10 @@ fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
     hasher.update(std.mem.asBytes(&p.dot));
     hasher.update(std.mem.asBytes(&p.frame));
     hasher.update(&p.vram);
+    // The four-screen board's own 2KB chip, held here rather than in each
+    // `Mapper` variant (see `Ppu.cart_vram`). Zero on every other board,
+    // so hashing it unconditionally costs nothing observable.
+    hasher.update(&p.cart_vram);
     hasher.update(&p.palette);
     hasher.update(&p.oam);
     hasher.update(&p.secondary_oam);
@@ -264,12 +272,28 @@ fn hashPulse(hasher: *Sha256, p: *const apu_mod.Pulse) void {
     hasher.update(std.mem.asBytes(&p.timer));
 }
 
-/// See the module doc comment: only CHR-RAM is mutable state worth hashing.
-/// `TestStub` is a CPU-test-only double (see `mapper.zig`), never reachable
-/// from a real ROM, so it isn't handled here.
+/// See the module doc comment: CHR-RAM, PRG-RAM, and (ENG-80) cartridge
+/// nametable VRAM are the mutable-storage state worth hashing here, plus
+/// each cartridge's own bank/IRQ registers. `TestStub` is a CPU-test-only
+/// double (see `mapper.zig`), never reachable from a real ROM, so it isn't
+/// handled here.
+///
+/// **PRG-RAM (ENG-79)**: every variant now owns its own $6000-$7FFF storage
+/// instead of `Bus` owning one shared array, so it moved from `hashState`'s
+/// top level into this per-variant hash -- two runs differing only in WRAM
+/// contents, or (MMC1/MMC3) only in the state of a PRG-RAM disable/protect
+/// register, would otherwise hash identically. **Cartridge nametable VRAM
+/// (ENG-80)** is hashed on every variant for the same reason `Nrom.chr` is
+/// hashed unconditionally when it's RAM: it's live storage a four-screen
+/// board writes into, even though no variant here can currently select
+/// `.four_screen` mirroring from its own registers (`Mmc1`/`Mmc3`) or has a
+/// vendored four-screen ROM to exercise it (`Nrom`/`Uxrom`/`Cnrom`) -- see
+/// `docs/adr/0005-cartridge-owns-its-memory.md`.
 fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
     switch (mapper.*) {
-        .nrom => |*n| if (n.chr_is_ram) hasher.update(&n.chr),
+        .nrom => |*n| {
+            if (n.chr_is_ram) hasher.update(&n.chr);
+        },
         // MMC1 adds the first *registers* any cartridge here has had. They
         // are as much emulation state as CHR-RAM is: two runs that diverge
         // only in which bank is mapped would otherwise hash identically.
@@ -281,6 +305,7 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
             hasher.update(&[_]u8{ m.shift, m.control, m.chr_bank0, m.chr_bank1, m.prg_bank });
             hasher.update(std.mem.asBytes(&m.cycle));
             hasher.update(std.mem.asBytes(&m.last_write_cycle));
+            hasher.update(std.mem.asBytes(&m.prg_ram_size));
         },
         // MMC3 (M7d) adds a scanline IRQ with real timing state: two runs
         // that diverge only in counter phase, A12 filter progress, or which
@@ -289,10 +314,11 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
             if (m.chr_rom.len == 0) hasher.update(&m.chr_ram);
             hasher.update(&m.bank_data);
             hasher.update(&[_]u8{
-                m.bank_select,                      @intFromBool(m.mirror_horizontal),
-                m.irq_latch,                        m.irq_counter,
-                @intFromBool(m.irq_reload_pending), @intFromBool(m.irq_enabled),
-                @intFromBool(m.irq_pending),        @intFromBool(m.a12),
+                m.bank_select,                         @intFromBool(m.mirror_horizontal),
+                m.irq_latch,                           m.irq_counter,
+                @intFromBool(m.irq_reload_pending),    @intFromBool(m.irq_enabled),
+                @intFromBool(m.irq_pending),           @intFromBool(m.a12),
+                @intFromBool(m.prg_ram_write_protect),
             });
             hasher.update(std.mem.asBytes(&m.a12_low_ticks));
         },
@@ -308,7 +334,9 @@ fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
         // comment. Two runs differing only in the selected bank would
         // otherwise hash identically, same reasoning as MMC1's registers
         // above.
-        .cnrom => |*c| hasher.update(&[_]u8{c.chr_bank}),
+        .cnrom => |*c| {
+            hasher.update(&[_]u8{c.chr_bank});
+        },
         .test_stub => {},
     }
 }
@@ -359,7 +387,8 @@ fn minimalNromBuf() [16 + 0x4000]u8 {
     return buf;
 }
 
-test "the hash changes if bus.prg_ram (the vendored ROMs' \\$6000 result-code RAM) differs" {
+test "the hash changes if the cartridge's PRG-RAM (the vendored ROMs' \\$6000 result-code RAM) differs" {
+    // ENG-79: PRG-RAM moved from `Bus.prg_ram` onto the mapper itself.
     const buf = minimalNromBuf();
     var a_machine: Machine = undefined;
     try a_machine.init(&buf);
