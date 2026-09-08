@@ -63,8 +63,12 @@ fn tileToChar(tile: u8) u8 {
 /// nametable 0, decoded to characters. Resolves to a physical VRAM bank
 /// through the cartridge's current mirroring rather than assuming bank 0.
 fn screenText(m: *const Machine, buf: *[960]u8) []const u8 {
-    const bank = ppu_mod.physicalNametable(m.bus.mapper.mirroring(), 0);
-    const base = @as(usize, bank) * 0x400;
+    const nt = ppu_mod.physicalNametable(m.bus.mapper.mirroring(), 0);
+    // Logical nametable 0 always resolves to the console's own VRAM chip --
+    // see `Ppu.physicalNametable`: only logical 2-3 can ever land on a
+    // four-screen board's cartridge chip.
+    std.debug.assert(nt.source == .console);
+    const base = @as(usize, nt.bank) * 0x400;
     for (m.bus.ppu.vram[base..][0..960], 0..) |tile, i| buf[i] = tileToChar(tile);
     return buf[0..960];
 }

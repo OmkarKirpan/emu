@@ -30,7 +30,7 @@ const Controller = controller_mod.Controller;
 ///     $4017        APU frame counter (write, `Apu.writeRegister`) / port 1 data (read)
 ///     $4018-$401F  remaining CPU-test registers -- not implemented: open bus
 ///     $4020-$5FFF  cartridge expansion       -- unmapped on NROM
-///     $6000-$7FFF  cartridge PRG-RAM         -- `Bus.prg_ram`, unconditional
+///     $6000-$7FFF  cartridge PRG-RAM         -- `Mapper.prgRamRead`/`prgRamWrite`
 ///     $8000-$FFFF  cartridge PRG-ROM         -- `Mapper.prgRead`/`prgWrite`
 ///
 /// **$4014 (OAMDMA) is not decoded by `Bus` at all.** Copying 256 bytes into
@@ -51,20 +51,27 @@ const Controller = controller_mod.Controller;
 /// convention as `Ppu.data_bus` and this type's own open-bus handling below.
 /// Writing $4017 is the APU frame-counter register, not a controller
 /// input -- decoded through `Apu.writeRegister` (M6).
-/// **$6000-$7FFF is plain 8KB WRAM, unconditionally, not routed through
-/// `Mapper`.** Despite the mapper-0 name, "NROM" says nothing about whether a
-/// given cartridge board wires up PRG-RAM at $6000 -- that varies per board,
-/// which is exactly why the iNES/NES 2.0 header carries a separate PRG-RAM
-/// size field rather than deriving it from the mapper number. Concretely: the
-/// vendored Blargg `ppu_vbl_nmi` test ROMs (mapper 0) require exactly this
-/// RAM to exist, to hand back their `$6000` result-code protocol at all — see
-/// `docs/research/test-rom-licensing.md` and `ppu_vbl_nmi_test.zig`. Giving
-/// every cartridge this RAM unconditionally is a deliberate simplification
-/// (no battery-backed persistence, no mapper-specific enable/disable), on the
-/// same "known, named gap" footing as the rest of this doc comment: real
-/// MMC1/MMC3 boards (M7) may also bank-switch or battery-back this window,
-/// which `Mapper` still has no entry point for and isn't needed until then.
-/// Flagged so the omission reads as known rather than as an oversight.
+/// **$6000-$7FFF is routed through `Mapper.prgRamRead`/`prgRamWrite`, not
+/// owned by `Bus` directly.** Despite the mapper-0 name, "NROM" says nothing
+/// about whether a given cartridge board wires up PRG-RAM at $6000 -- that
+/// varies per board, which is exactly why the iNES/NES 2.0 header carries a
+/// separate PRG-RAM size field rather than deriving it from the mapper
+/// number. `Bus` used to map this window as unconditional 8KB WRAM itself
+/// (`prg_ram: [0x2000]u8`, no mapper involvement); as of ENG-79 the storage
+/// and any enable/disable logic belong to the cartridge instead, the same
+/// direction ADR 0003 already moved mirroring and ADR 0004 moved CHR memory
+/// -- see `docs/adr/0005-cartridge-owns-its-memory.md` for why, including
+/// direct engagement with the reasoning this comment used to give for the
+/// unconditional-WRAM decision. `prgRamRead` returns `?u8`: `null` means the
+/// cartridge is not driving the bus (PRG-RAM disabled, or the board never
+/// had any), in which case the read falls back to `open_bus` below, exactly
+/// like every other unmapped-by-`Bus` region. NROM/`TestStub` (and UxROM/
+/// CNROM, which have no enable register of their own) keep the old
+/// unconditional-8KB behavior; MMC1 and MMC3 gate it from their own real
+/// registers. The vendored Blargg `ppu_vbl_nmi` test ROMs (mapper 0, always
+/// unconditional) still depend on this RAM existing to hand back their
+/// `$6000` result-code protocol at all — see
+/// `docs/research/test-rom-licensing.md` and `ppu_vbl_nmi_test.zig`.
 ///
 /// **Open-bus convention.** Every region that is not backed by real storage
 /// reads back `open_bus`: the last value the CPU actually drove onto or
@@ -93,9 +100,6 @@ pub const Bus = struct {
     /// Port 0 ($4016) and port 1 ($4017). See `Controller`'s doc comment for
     /// the shift-register model and the shared-strobe wiring.
     controllers: [2]Controller = [_]Controller{.{}} ** 2,
-    /// $6000-$7FFF. See the type doc comment for why this is unconditional
-    /// rather than mapper-gated.
-    prg_ram: [0x2000]u8 = [_]u8{0} ** 0x2000,
     /// Last value driven on the data bus; see the open-bus note above.
     open_bus: u8 = 0,
 
@@ -114,7 +118,7 @@ pub const Bus = struct {
             0x4016 => (self.open_bus & 0xFE) | self.controllers[0].read(),
             0x4017 => (self.open_bus & 0xFE) | self.controllers[1].read(),
             0x4018...0x5FFF => self.open_bus, // CPU test regs + cartridge expansion
-            0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF],
+            0x6000...0x7FFF => self.mapper.prgRamRead(addr) orelse self.open_bus,
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
         self.open_bus = value;
@@ -141,7 +145,7 @@ pub const Bus = struct {
             // port -- controller *writes* both go through $4016 only.
             0x4017 => self.apu.writeRegister(addr, value),
             0x4018...0x5FFF => {},
-            0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF] = value,
+            0x6000...0x7FFF => self.mapper.prgRamWrite(addr, value),
             0x8000...0xFFFF => self.mapper.prgWrite(addr, value),
         }
     }
@@ -165,7 +169,7 @@ pub const Bus = struct {
             0x4016 => (self.open_bus & 0xFE) | self.controllers[0].peek(),
             0x4017 => (self.open_bus & 0xFE) | self.controllers[1].peek(),
             0x4018...0x5FFF => self.open_bus,
-            0x6000...0x7FFF => self.prg_ram[addr & 0x1FFF],
+            0x6000...0x7FFF => self.mapper.prgRamRead(addr) orelse self.open_bus,
             0x8000...0xFFFF => self.mapper.prgRead(addr),
         };
     }

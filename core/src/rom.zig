@@ -189,7 +189,22 @@ pub fn createMapper(rom: Rom) MapperError!Mapper {
                 return MapperError.InvalidRomGeometry;
             if (rom.chr_rom.len > 0x20000 or rom.chr_rom.len % 0x2000 != 0)
                 return MapperError.InvalidRomGeometry;
-            break :blk Mapper{ .mmc1 = Mmc1.init(rom.prg_rom, rom.chr_rom) };
+            var mm = Mmc1.init(rom.prg_rom, rom.chr_rom);
+            // Real MMC1 boards (SNROM/SKROM/SUROM included) conventionally
+            // carry 8KB of PRG-RAM even when a header declares none -- see
+            // docs/adr/0005-cartridge-owns-its-memory.md and
+            // ATTRIBUTION.md's "A note on headers": the vendored NES 2.0
+            // holy-mapperel ROMs for those boards declare 0 in bytes 10-11,
+            // yet their own self-test measures and exercises real WRAM.
+            // Falling back to the historical 8KB default when the header
+            // says "none", rather than trusting it literally, is what keeps
+            // that WRAM working; a header that *does* declare a size (the
+            // S8K/S32K boards) is honored as-is. Clamped to `Mmc1`'s 32KB
+            // storage ceiling (SXROM's own maximum) against a malformed or
+            // wildly oversized declaration.
+            const declared_prg_ram = rom.header.prg_ram_size + rom.header.prg_nvram_size;
+            mm.prg_ram_size = @min(if (declared_prg_ram == 0) 0x2000 else declared_prg_ram, 0x8000);
+            break :blk Mapper{ .mmc1 = mm };
         },
         4 => blk: {
             // MMC3: PRG-ROM in 8KB units (its banking granularity), 16KB to
@@ -558,5 +573,28 @@ test "parseHeader plain iNES defaults prg_ram_size to 8KB, matching Bus's histor
     try testing.expect(!h.is_nes20);
     try testing.expectEqual(@as(usize, 0x2000), h.prg_ram_size);
     try testing.expectEqual(@as(usize, 0), h.prg_nvram_size);
+}
+
+test "createMapper honors an NES 2.0 header's declared PRG-RAM size for MMC1" {
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x10; // mapper 1 (MMC1)
+    buf[7] = 0x08; // NES 2.0 marker
+    buf[10] = 0x90; // high nibble 9 -> 64<<9 = 32768 battery-backed
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expectEqual(@as(usize, 0x8000), m.mmc1.prg_ram_size);
+}
+
+test "createMapper defaults MMC1 PRG-RAM to 8KB when an NES 2.0 header declares none" {
+    // Mirrors the real vendored SNROM/SKROM/SUROM ROMs, whose headers leave
+    // byte 10 at 0 despite the board genuinely carrying 8KB of WRAM -- see
+    // ATTRIBUTION.md's "A note on headers".
+    var buf = buildMinimalNrom(2, 1);
+    buf[6] = 0x10;
+    buf[7] = 0x08;
+    buf[10] = 0x00;
+    const rom = try Rom.load(&buf);
+    const m = try createMapper(rom);
+    try testing.expectEqual(@as(usize, 0x2000), m.mmc1.prg_ram_size);
 }
 
