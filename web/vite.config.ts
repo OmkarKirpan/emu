@@ -60,8 +60,10 @@ export default defineConfig({
     // Unit tests only -- anything needing the real wasm module or a real
     // browser (the ABI wrapper, the rAF loop, frame pacing) lives in
     // `e2e/` under Playwright instead, run against the actual compiled
-    // module rather than a hand-maintained mock of its exports.
-    include: ['src/**/*.test.ts'],
+    // module rather than a hand-maintained mock of its exports. `.tsx` is
+    // included for React component tests under `@testing-library/react`
+    // (ENG-77's `RomPicker.test.tsx`), which need jsdom but nothing else.
+    include: ['src/**/*.test.{ts,tsx}'],
     environment: 'jsdom',
     alias: {
       // `wgsl_reflect` (used by `shader.test.ts`) is mis-packaged: its

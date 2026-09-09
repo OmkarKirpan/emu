@@ -43,7 +43,12 @@ export class RomLoadError extends Error {
       case RomStatus.InvalidHeader:
         return 'Not a valid iNES ROM file.'
       case RomStatus.UnsupportedMapper:
-        return `Unsupported mapper ${context} (only NROM/mapper 0 is supported so far).`
+        // Kept in step with `core/src/rom.zig`'s `createMapper` switch,
+        // which is the closed set this message describes. It said "only
+        // NROM/mapper 0" until M7 added the other four; ENG-77 is what put
+        // this string in front of an actual user, since an unsupported
+        // mapper is the expected outcome for plenty of real ROMs.
+        return `Unsupported mapper ${context} (supported: 0 NROM, 1 MMC1, 2 UxROM, 3 CNROM, 4 MMC3).`
       case RomStatus.TruncatedData:
         return `ROM file is truncated (only ${context} bytes were readable).`
       case RomStatus.RomTooLarge:
