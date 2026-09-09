@@ -183,13 +183,18 @@ pub fn build(b: *std.Build) void {
     // `debugger.zig`'s own doc comment). Its own module rather than reusing
     // `nes_core`/`test_mod`: it needs neither the vendored test-ROM fixtures
     // nor to be importable as a library, just the library modules it imports
-    // directly plus its own `main`. Its *tests* are not compiled from this
-    // module, though -- see `root.zig`'s test block, which pulls them into
-    // `mod_tests` above instead. A second `addTest` here compiled fine but
-    // hung mid-run ("test runner failed to respond"), almost certainly from
-    // redundantly re-running every library module's own inline tests a
-    // second time in a second test binary; one shared test binary is also
-    // just the existing convention every other native test file follows.
+    // directly plus its own `main`.
+    //
+    // Its *tests* are deliberately not compiled from this module -- see
+    // `root.zig`'s test block, which pulls them into `mod_tests` above
+    // instead. A second `addTest` on this module cannot work: test mode
+    // discovers `test {}` blocks transitively, `debugger.zig` reaches
+    // `rom.zig` through `machine.zig`, and `rom.zig`'s own tests
+    // `@embedFile` vendored fixtures (e.g. `mapperel_M1_P512K_CR8K_S8K`)
+    // that exist only as `test_mod`'s anonymous imports above -- so it fails
+    // to compile with `unable to open '<fixture>'`. One shared test binary
+    // is the existing convention every other native test file here follows
+    // anyway.
     const debug_mod = b.createModule(.{
         .root_source_file = b.path("src/debugger.zig"),
         .target = target,

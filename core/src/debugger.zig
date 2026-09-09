@@ -60,6 +60,9 @@ pub fn main(init: std.process.Init) !void {
 /// grow without limit.
 const max_breakpoints = 32;
 
+/// Sprites in OAM. `Ppu.oam` is 256 bytes = 64 sprites x 4 bytes.
+const sprite_count = 64;
+
 const Debugger = struct {
     machine: *Machine,
     breakpoints: [max_breakpoints]?u16 = @splat(null),
@@ -123,13 +126,27 @@ const Debugger = struct {
     /// Run until a set breakpoint's PC is reached. Always steps at least once
     /// first, so `continue` from a PC that is itself a breakpoint makes
     /// forward progress instead of reporting immediately.
+    ///
+    /// Deliberately unbounded otherwise (Ctrl-C is the way out), the same as
+    /// any other debugger's `continue` -- a breakpoint on an address the ROM
+    /// never reaches is a question about the ROM, not an error here. The one
+    /// exception is a JAM: one of the twelve opcodes that halt the core with
+    /// PC frozen (see `Cpu.jammed`), after which no breakpoint can ever be
+    /// reached, so spinning would be a hang with nothing to report.
     fn continueRun(self: *Debugger) void {
         if (!self.hasAnyBreakpoint()) {
             std.debug.print("no breakpoints set -- use 'b <addr>' first, or 's' to single-step\n", .{});
             return;
         }
         self.cpu().step();
-        while (!self.hasBreakpoint(self.cpu().pc)) self.cpu().step();
+        while (!self.hasBreakpoint(self.cpu().pc)) {
+            if (self.cpu().jammed) {
+                std.debug.print("CPU jammed at ${X:0>4} -- only a reset recovers; breakpoint unreachable\n", .{self.cpu().pc});
+                self.printTraceLine();
+                return;
+            }
+            self.cpu().step();
+        }
         std.debug.print("hit breakpoint ${X:0>4}\n", .{self.cpu().pc});
         self.printTraceLine();
     }
@@ -185,18 +202,27 @@ const Debugger = struct {
 
     /// CPU-address-space memory viewer, through `Bus.peek` -- never
     /// perturbs PPU/controller state the way a live read would.
+    ///
+    /// A range running past $FFFF **wraps to $0000** rather than stopping or
+    /// erroring, because that is what the address it is showing you actually
+    /// means: the 6502 has a 16-bit address bus and no address above $FFFF
+    /// exists. `m ff00 200` is the ordinary way to look at the interrupt
+    /// vectors ($FFFA-$FFFF), so this range is the common case, not an edge
+    /// one -- an earlier version of this function computed the end address in
+    /// `u32` and panicked (`integer does not fit in destination type`)
+    /// casting back down.
     fn printMem(self: *Debugger, start: u16, len: u16) void {
-        var addr: u32 = start;
-        const end: u32 = @as(u32, start) + len;
-        while (addr < end) {
-            std.debug.print("${X:0>4}: ", .{@as(u16, @intCast(addr))});
-            const row_end = @min(addr + 16, end);
-            var col = addr;
-            while (col < row_end) : (col += 1) {
-                std.debug.print("{X:0>2} ", .{self.machine.bus.peek(@intCast(col))});
+        var addr: u16 = start;
+        var remaining: u32 = len;
+        while (remaining > 0) {
+            const row = @min(remaining, 16);
+            std.debug.print("${X:0>4}: ", .{addr});
+            for (0..row) |_| {
+                std.debug.print("{X:0>2} ", .{self.machine.bus.peek(addr)});
+                addr +%= 1;
             }
             std.debug.print("\n", .{});
-            addr = row_end;
+            remaining -= row;
         }
     }
 
@@ -227,6 +253,14 @@ const Debugger = struct {
     fn printOam(self: *Debugger, index: ?u8) void {
         const oam = &self.machine.bus.ppu.oam;
         if (index) |i| {
+            // OAM holds exactly 64 sprites; every argument here is parsed as
+            // hex, so `oam 40` means sprite 64 and is one keystroke away from
+            // the valid `oam 3f`. Unchecked, that read ran off the end of the
+            // 256-byte array and panicked.
+            if (i >= sprite_count) {
+                std.debug.print("sprite index out of range: ${X:0>2} (OAM holds {d}, $00-$3F)\n", .{ i, sprite_count });
+                return;
+            }
             const base = @as(u16, i) * 4;
             std.debug.print(
                 "sprite {d}: Y:{d} tile:${X:0>2} attr:${X:0>2} X:{d}\n",
@@ -236,7 +270,7 @@ const Debugger = struct {
         }
         std.debug.print(" # Y   tile attr X\n", .{});
         var i: u16 = 0;
-        while (i < 64) : (i += 1) {
+        while (i < sprite_count) : (i += 1) {
             const base = i * 4;
             std.debug.print(
                 "{d:>2} {d:>3} ${X:0>2}  ${X:0>2}  {d:>3}\n",
@@ -377,7 +411,17 @@ const testing = std.testing;
 /// which is what makes it a deterministic target for `continueRun` tests
 /// below: a breakpoint on $C000 is guaranteed to be hit on the very next
 /// step, never "run forever" the way an arbitrary guessed address could.
-fn testRomBytes() [16 + 0x8000]u8 {
+/// **Static storage, deliberately.** `Nrom` borrows its PRG-ROM rather than
+/// copying it (`mapper.zig`: "the caller must keep the original ROM buffer
+/// alive for as long as this `Mapper` is in use"), so a `Machine` outlives
+/// the buffer it was booted from only if that buffer outlives it too. This
+/// used to be a local inside the helper below, which returned -- leaving
+/// every mapper read pointed at a dead stack frame. The tests passed anyway,
+/// which is exactly what makes that shape worth naming: nothing had
+/// overwritten the frame yet.
+const test_rom: [16 + 0x8000]u8 = buildTestRom();
+
+fn buildTestRom() [16 + 0x8000]u8 {
     var bytes: [16 + 0x8000]u8 = [_]u8{0} ** (16 + 0x8000);
     bytes[0] = 'N';
     bytes[1] = 'E';
@@ -396,8 +440,7 @@ fn testRomBytes() [16 + 0x8000]u8 {
 }
 
 fn testDebugger(m: *Machine) !Debugger {
-    const rom_bytes = testRomBytes();
-    try m.init(&rom_bytes);
+    try m.init(&test_rom);
     return Debugger{ .machine = m };
 }
 
@@ -463,6 +506,34 @@ test "continueRun with no breakpoints set is a no-op" {
     const cycles_before = dbg.cpu().cycles;
     dbg.continueRun();
     try testing.expectEqual(cycles_before, dbg.cpu().cycles);
+}
+
+// The two tests below assert absence of a panic, not printed output (these
+// viewers write through `std.debug.print`). That is the exact property that
+// was broken: both inputs are ordinary things to type, and both crashed the
+// debugger outright.
+
+test "printMem wraps at \\$FFFF instead of panicking on a range that runs past it" {
+    var m: Machine = undefined;
+    var dbg = try testDebugger(&m);
+    // Two rows: $FFF0-$FFFF (the interrupt vectors, and the reason this range
+    // is routine rather than exotic) then the wrap into $0000. Kept
+    // deliberately small -- these viewers print, and a test dumping thousands
+    // of rows into the build log floods the test runner's pipe.
+    dbg.printMem(0xFFF0, 0x20);
+    dbg.printMem(0xFFFF, 1); // single byte at the very top
+    dbg.printMem(0, 0); // empty range prints nothing and terminates
+}
+
+test "printOam rejects an out-of-range sprite index instead of reading past OAM" {
+    var m: Machine = undefined;
+    var dbg = try testDebugger(&m);
+    dbg.printOam(0x3F); // last valid sprite
+    dbg.printOam(0x40); // first invalid one -- used to index byte 256 of a 256-byte array
+    dbg.printOam(0xFF);
+    // `printOam(null)` (the full 64-row table) is deliberately not exercised
+    // here: it is the same indexing path, and 64 rows per test run is log
+    // noise for no extra coverage.
 }
 
 test "stripHexPrefix strips both '$' and '0x'/'0X' spellings, and leaves bare hex alone" {
