@@ -25,6 +25,13 @@
 // subresource is still broken. Discovery reads the deployment rather than
 // the local `dist/` so this is correct against a URL this machine didn't
 // build; see `discoverAssetPaths` for why that distinction bites.
+//
+// Two failure modes, deliberately kept apart -- see `checkResponse`. A
+// missing header means the host isn't applying `dist/_headers` and the app
+// will not start. A 404 means the asset isn't being served, which says
+// nothing about headers at all. Reporting the second as the first is how
+// this check twice told us cross-origin isolation was broken when it was
+// perfectly fine (see `PROPAGATION_RETRIES`).
 
 import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -33,6 +40,31 @@ const REQUIRED = {
   'cross-origin-opener-policy': 'same-origin',
   'cross-origin-embedder-policy': 'require-corp',
 }
+
+/**
+ * `wrangler deploy` returns once the Worker *version* exists, but
+ * Cloudflare's static-asset store is eventually consistent: for a few
+ * seconds afterwards an edge PoP can serve the new document while still
+ * 404ing an asset that document references. The deploy workflow runs this
+ * check immediately, so it kept losing that race -- twice in one day, on a
+ * different asset each time (the JS on one deploy, the CSS on the next),
+ * with the very same build passing minutes later.
+ *
+ * Retried, not slept-on unconditionally: a healthy deployment never enters
+ * this path, so `ci.yml`'s run against `wrangler dev` -- where there is no
+ * propagation delay -- pays nothing for it.
+ */
+const PROPAGATION_RETRIES = 5
+const PROPAGATION_BACKOFF_MS = 1500
+
+/** Exit codes. `2` is a usage error (see the argv check below). `1` stays
+ * reserved for the thing this script is named for -- headers -- so that a
+ * red deploy always means what its failure message says it means, and a
+ * missing asset gets a code of its own rather than borrowing that one. */
+const EXIT_HEADERS_WRONG = 1
+const EXIT_ASSET_MISSING = 3
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const baseUrl = process.argv[2]
 if (!baseUrl) {
@@ -43,8 +75,16 @@ if (!baseUrl) {
 /** Response header names are case-insensitive; `Headers.get` already
  * normalizes, so this only has to normalize the expectation side. */
 function checkResponse(url, response) {
+  // Checked first and returned on, rather than folded in with the header
+  // failures below: a response that isn't there has no headers to be wrong
+  // about, and calling that a cross-origin-isolation failure is a
+  // confidently incorrect diagnosis of a completely different problem.
+  if (!response.ok) {
+    console.error(`FAIL ${url}`)
+    console.error(`  - HTTP ${response.status} -- not served`)
+    return 'missing'
+  }
   const failures = []
-  if (!response.ok) failures.push(`HTTP ${response.status}`)
   for (const [name, expected] of Object.entries(REQUIRED)) {
     const actual = response.headers.get(name)
     if (actual !== expected) {
@@ -54,10 +94,10 @@ function checkResponse(url, response) {
   if (failures.length > 0) {
     console.error(`FAIL ${url}`)
     for (const failure of failures) console.error(`  - ${failure}`)
-    return false
+    return 'headers'
   }
   console.log(`ok   ${url}`)
-  return true
+  return 'ok'
 }
 
 /** Same-origin build assets referenced by a document or script body. Assets
@@ -128,30 +168,57 @@ const MAX_CRAWL_DEPTH = 3
  * per response, so a couple of subresources demonstrate it as well as ten. */
 const MAX_OTHER_ASSETS_CHECKED = 2
 
-let allPassed = true
+let headersWrong = false
+let assetMissing = false
 
-async function check(url, { allowMissing = false } = {}) {
-  try {
-    // `redirect: 'manual'`: a host that redirects (e.g. to a canonical
-    // domain) would otherwise have its *final* response checked while the
-    // browser-visible one goes unchecked.
-    const response = await fetch(url, { redirect: 'manual' })
-    // A locally-derived path that isn't on the deployment says nothing about
-    // headers -- it says this machine's `dist/` is stale. Report that as
-    // itself rather than as an isolation failure.
-    if (allowMissing && response.status === 404) {
-      console.log(`skip ${url}`)
-      console.log('  - not on this deployment (stale local build?) -- not a header problem')
-      return response
+/**
+ * @param allowMissing  A 404 is reported and tolerated rather than failing
+ *   the run. For locally-derived paths only, where a miss means this
+ *   machine's `dist/` is stale -- see `findLocalWasmPath`.
+ * @param retryMissing  A 404 is retried before being believed. For paths
+ *   discovered from the deployment itself, where a miss is far more likely
+ *   to be the propagation race than a genuinely absent file.
+ */
+async function check(url, { allowMissing = false, retryMissing = false } = {}) {
+  let response = null
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      // `redirect: 'manual'`: a host that redirects (e.g. to a canonical
+      // domain) would otherwise have its *final* response checked while the
+      // browser-visible one goes unchecked.
+      response = await fetch(url, { redirect: 'manual' })
+    } catch (err) {
+      console.error(`FAIL ${url}`)
+      console.error(`  - request failed: ${err instanceof Error ? err.message : String(err)}`)
+      headersWrong = true
+      return null
     }
-    allPassed = checkResponse(url, response) && allPassed
-    return response
-  } catch (err) {
-    console.error(`FAIL ${url}`)
-    console.error(`  - request failed: ${err instanceof Error ? err.message : String(err)}`)
-    allPassed = false
-    return null
+
+    const isLastAttempt = attempt >= PROPAGATION_RETRIES
+    if (response.status !== 404 || !retryMissing || isLastAttempt) break
+
+    // Only a 404 waits, and only on a discovered path. A wrong header is
+    // wrong immediately and for good -- retrying it would just make a real
+    // failure take longer to report.
+    console.log(`...  ${url}`)
+    console.log(`  - HTTP 404; retrying in ${PROPAGATION_BACKOFF_MS}ms (${attempt + 1}/${PROPAGATION_RETRIES})`)
+    await sleep(PROPAGATION_BACKOFF_MS)
   }
+
+  // A locally-derived path that isn't on the deployment says nothing about
+  // headers -- it says this machine's `dist/` is stale. Report that as
+  // itself rather than as an isolation failure.
+  if (allowMissing && response.status === 404) {
+    console.log(`skip ${url}`)
+    console.log('  - not on this deployment (stale local build?) -- not a header problem')
+    return response
+  }
+
+  const verdict = checkResponse(url, response)
+  if (verdict === 'headers') headersWrong = true
+  if (verdict === 'missing') assetMissing = true
+  return response
 }
 
 const documentUrl = new URL('/', baseUrl).toString()
@@ -165,7 +232,10 @@ const wasmPaths = [...discovered].filter((path) => path.endsWith('.wasm'))
 const otherPaths = [...discovered].filter((path) => !path.endsWith('.wasm')).slice(0, MAX_OTHER_ASSETS_CHECKED)
 
 for (const path of [...wasmPaths, ...otherPaths]) {
-  await check(new URL(path, baseUrl).toString())
+  // Discovered from the live deployment moments ago, so a 404 here means the
+  // asset went missing between the document naming it and this request --
+  // which is the propagation race, not a broken build.
+  await check(new URL(path, baseUrl).toString(), { retryMissing: true })
 }
 
 if (discovered.size === 0) {
@@ -177,9 +247,19 @@ if (discovered.size === 0) {
   else console.log('note: no subresources discovered and no local dist/ -- checked the document only')
 }
 
-if (!allPassed) {
+// Order matters: a wrong header is the more serious diagnosis and the one
+// this script is named for, so it wins the exit code when both are true.
+if (headersWrong) {
   console.error('\ncross-origin isolation is NOT correctly configured -- SharedArrayBuffer will be unavailable')
   console.error('and the shared-memory wasm module will fail to instantiate. See web/vite.config.ts.')
-  process.exit(1)
+  process.exit(EXIT_HEADERS_WRONG)
 }
+
+if (assetMissing) {
+  console.error(`\nan asset this deployment references is not being served, after ${PROPAGATION_RETRIES} retries.`)
+  console.error('cross-origin isolation itself checked out on everything that DID respond -- this is not a')
+  console.error('header problem, and re-running the deploy is likelier to help than editing vite.config.ts.')
+  process.exit(EXIT_ASSET_MISSING)
+}
+
 console.log('\ncross-origin isolation headers verified')
