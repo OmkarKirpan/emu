@@ -2,6 +2,8 @@
 
 A cycle-accurate NES emulator, written from scratch in Zig and compiled to WebAssembly, with a React/TypeScript/Vite host shell rendering via WebGPU (Canvas 2D fallback). Learning project — depth over shortcuts.
 
+Runs in the browser on a phone, a laptop or a desktop. Keyboard and gamepad on machines that have them; an on-screen pad on anything with a touchscreen — see [`web/README.md`](web/README.md) for the control map and the shape of the host shell.
+
 Planning is tracked as a wayfinder map on Linear (workspace: OmkarKirpan, team: Engineering) — see `docs/agents/issue-tracker.md`. The map is complete; implementation follows the milestone roadmap it produced, starting from `core/` (Zig, native + wasm32) and `web/` (React+TS+Vite).
 
 ## Deployment
