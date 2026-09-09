@@ -25,12 +25,20 @@ const std = @import("std");
 const Machine = @import("machine.zig").Machine;
 const cpu_mod = @import("cpu.zig");
 
-pub fn main(init: std.process.Init) !void {
+/// Returns an exit code rather than an error union: a bad ROM path is a
+/// user's typo, and returning the error would make Zig print its own
+/// `error: FileNotFound` plus a stack trace *underneath* the readable
+/// message already printed here -- twice the output, none of the extra half
+/// useful to someone who just misspelled a filename.
+pub fn main(init: std.process.Init) u8 {
     const gpa = init.gpa;
-    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch |err| {
+        std.debug.print("could not read command line: {t}\n", .{err});
+        return 1;
+    };
     if (argv.len < 2) {
         std.debug.print("usage: {s} <rom.nes>\n", .{if (argv.len > 0) argv[0] else "nes-debugger"});
-        return error.MissingRomPath;
+        return 2;
     }
     const rom_path = argv[1];
 
@@ -40,18 +48,22 @@ pub fn main(init: std.process.Init) !void {
     // checks rather than silently truncating.
     const rom_bytes = std.Io.Dir.cwd().readFileAlloc(init.io, rom_path, gpa, .limited(16 * 1024 * 1024)) catch |err| {
         std.debug.print("could not read '{s}': {t}\n", .{ rom_path, err });
-        return err;
+        return 1;
     };
     defer gpa.free(rom_bytes);
 
     var machine: Machine = undefined;
     machine.init(rom_bytes) catch |err| {
         std.debug.print("could not load '{s}' as an iNES ROM: {t}\n", .{ rom_path, err });
-        return err;
+        return 1;
     };
 
     var dbg = Debugger{ .machine = &machine };
-    try dbg.run(init.io);
+    dbg.run(init.io) catch |err| {
+        std.debug.print("input error: {t}\n", .{err});
+        return 1;
+    };
+    return 0;
 }
 
 /// Bounded rather than growable: a handful of breakpoints is the realistic
@@ -63,6 +75,9 @@ const max_breakpoints = 32;
 /// Sprites in OAM. `Ppu.oam` is 256 bytes = 64 sprites x 4 bytes.
 const sprite_count = 64;
 
+/// Console-side nametable VRAM: 2KB (`Ppu.vram`).
+const vram_size = 0x0800;
+
 const Debugger = struct {
     machine: *Machine,
     breakpoints: [max_breakpoints]?u16 = @splat(null),
@@ -73,11 +88,15 @@ const Debugger = struct {
 
     fn addBreakpoint(self: *Debugger, addr: u16) void {
         for (self.breakpoints) |slot| {
-            if (slot == addr) return; // already set
+            if (slot == addr) {
+                std.debug.print("breakpoint already set at ${X:0>4}\n", .{addr});
+                return;
+            }
         }
         for (&self.breakpoints) |*slot| {
             if (slot.* == null) {
                 slot.* = addr;
+                std.debug.print("breakpoint set at ${X:0>4}\n", .{addr});
                 return;
             }
         }
@@ -85,8 +104,19 @@ const Debugger = struct {
     }
 
     fn removeBreakpoint(self: *Debugger, addr: u16) void {
+        var removed = false;
         for (&self.breakpoints) |*slot| {
-            if (slot.* == addr) slot.* = null;
+            if (slot.* == addr) {
+                slot.* = null;
+                removed = true;
+            }
+        }
+        // Silence here read as success, which is the wrong thing to believe
+        // about a breakpoint you think you just cleared.
+        if (removed) {
+            std.debug.print("breakpoint cleared at ${X:0>4}\n", .{addr});
+        } else {
+            std.debug.print("no breakpoint at ${X:0>4}\n", .{addr});
         }
     }
 
@@ -232,12 +262,18 @@ const Debugger = struct {
     /// PPU physically holds regardless of the cartridge's mirroring mode.
     fn printVram(self: *Debugger, start: u16, len: u16) void {
         const vram = &self.machine.bus.ppu.vram;
-        const clamped_start = @min(start, vram.len);
-        const clamped_end = @min(@as(u32, clamped_start) + len, vram.len);
-        var addr: u32 = clamped_start;
-        while (addr < clamped_end) {
-            std.debug.print("{X:0>4}: ", .{addr});
-            const row_end = @min(addr + 16, clamped_end);
+        // Out of range says so rather than printing nothing: a silent empty
+        // response to `vram 800` is indistinguishable from "this region is
+        // all zeroes", which is a real and different answer.
+        if (start >= vram.len) {
+            std.debug.print("VRAM offset out of range: ${X:0>4} (2KB, $0000-${X:0>4})\n", .{ start, vram.len - 1 });
+            return;
+        }
+        const end = @min(@as(u32, start) + len, vram.len);
+        var addr: u32 = start;
+        while (addr < end) {
+            std.debug.print("${X:0>4}: ", .{addr});
+            const row_end = @min(addr + 16, end);
             var col = addr;
             while (col < row_end) : (col += 1) {
                 std.debug.print("{X:0>2} ", .{vram[col]});
@@ -250,18 +286,16 @@ const Debugger = struct {
     /// OAM (sprite RAM) viewer -- acceptance criteria's "OAM ... state".
     /// With no index, tabulates all 64 sprites decoded into Y/tile/attr/X;
     /// with one, dumps that single sprite's 4 raw bytes plus its decode.
-    fn printOam(self: *Debugger, index: ?u8) void {
+    fn printOam(self: *Debugger, index: ?u16) void {
         const oam = &self.machine.bus.ppu.oam;
         if (index) |i| {
-            // OAM holds exactly 64 sprites; every argument here is parsed as
-            // hex, so `oam 40` means sprite 64 and is one keystroke away from
-            // the valid `oam 3f`. Unchecked, that read ran off the end of the
-            // 256-byte array and panicked.
+            // OAM holds exactly 64 sprites. Unchecked, an index past that ran
+            // off the end of the 256-byte array and panicked outright.
             if (i >= sprite_count) {
-                std.debug.print("sprite index out of range: ${X:0>2} (OAM holds {d}, $00-$3F)\n", .{ i, sprite_count });
+                std.debug.print("sprite index out of range: {d} (OAM holds {d}, 0-{d})\n", .{ i, sprite_count, sprite_count - 1 });
                 return;
             }
-            const base = @as(u16, i) * 4;
+            const base = i * 4;
             std.debug.print(
                 "sprite {d}: Y:{d} tile:${X:0>2} attr:${X:0>2} X:{d}\n",
                 .{ i, oam[base], oam[base + 1], oam[base + 2], oam[base + 3] },
@@ -295,17 +329,20 @@ const Debugger = struct {
             \\commands:
             \\  s [n]        single-step n instructions (default 1)
             \\  c            run until a breakpoint is hit
-            \\  b <addr>     set a breakpoint at $addr (hex, e.g. b c000)
-            \\  d <addr>     delete the breakpoint at $addr
+            \\  b <addr>     set a breakpoint at addr (e.g. b c000)
+            \\  d <addr>     delete the breakpoint at addr
             \\  bl           list breakpoints
             \\  r            print CPU registers/flags
             \\  pr           print PPU registers + scroll/scanline/dot state
             \\  m <addr> [len]     dump CPU-space memory (default len 64)
-            \\  vram [addr] [len]  dump raw nametable VRAM (default whole 2KB)
+            \\  vram [off] [len]   dump raw nametable VRAM (default whole 2KB)
             \\  oam [index]        dump OAM, all 64 sprites or just one
             \\  pal          dump palette RAM
             \\  h            this help
             \\  q            quit
+            \\
+            \\addresses are hex, counts are decimal; prefix either with
+            \\'$' or '0x' to force hex ($40 = 64).
             \\
         , .{});
     }
@@ -336,15 +373,15 @@ const Debugger = struct {
             } else if (std.mem.eql(u8, command, "h") or std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "?")) {
                 printHelp();
             } else if (std.mem.eql(u8, command, "s") or std.mem.eql(u8, command, "step")) {
-                const n = parseArgOr(u32, &it, 1);
+                const n = countOr(u32, &it, 1) orelse continue;
                 var i: u32 = 0;
                 while (i < n) : (i += 1) self.stepOnce();
             } else if (std.mem.eql(u8, command, "c") or std.mem.eql(u8, command, "continue")) {
                 self.continueRun();
             } else if (std.mem.eql(u8, command, "b") or std.mem.eql(u8, command, "break")) {
-                if (parseAddrArg(&it)) |addr| self.addBreakpoint(addr) else invalidAddr();
+                self.addBreakpoint(requiredAddr(&it) orelse continue);
             } else if (std.mem.eql(u8, command, "d") or std.mem.eql(u8, command, "delete")) {
-                if (parseAddrArg(&it)) |addr| self.removeBreakpoint(addr) else invalidAddr();
+                self.removeBreakpoint(requiredAddr(&it) orelse continue);
             } else if (std.mem.eql(u8, command, "bl")) {
                 self.listBreakpoints();
             } else if (std.mem.eql(u8, command, "r") or std.mem.eql(u8, command, "regs")) {
@@ -352,18 +389,22 @@ const Debugger = struct {
             } else if (std.mem.eql(u8, command, "pr") or std.mem.eql(u8, command, "ppuregs")) {
                 self.printPpuRegs();
             } else if (std.mem.eql(u8, command, "m") or std.mem.eql(u8, command, "mem")) {
-                const addr = parseAddrArg(&it) orelse {
-                    invalidAddr();
-                    continue;
-                };
-                const len = parseArgOr(u16, &it, 64);
+                const addr = requiredAddr(&it) orelse continue;
+                const len = countOr(u16, &it, 64) orelse continue;
                 self.printMem(addr, len);
             } else if (std.mem.eql(u8, command, "vram")) {
-                const addr = parseArgOr(u16, &it, 0);
-                const len = parseArgOr(u16, &it, 0x0800);
+                // Both optional here: bare `vram` dumps the whole 2KB.
+                const addr = (optionalArg(u16, &it, hex_radix) catch {
+                    std.debug.print("not a valid VRAM offset -- hex, e.g. '400'\n", .{});
+                    continue;
+                }) orelse 0;
+                const len = countOr(u16, &it, vram_size) orelse continue;
                 self.printVram(addr, len);
             } else if (std.mem.eql(u8, command, "oam")) {
-                const index = parseOptionalArg(u8, &it);
+                const index = optionalArg(u16, &it, dec_radix) catch {
+                    std.debug.print("not a valid sprite index -- decimal 0-{d}\n", .{sprite_count - 1});
+                    continue;
+                };
                 self.printOam(index);
             } else if (std.mem.eql(u8, command, "pal") or std.mem.eql(u8, command, "palette")) {
                 self.printPalette();
@@ -374,30 +415,64 @@ const Debugger = struct {
     }
 };
 
-fn invalidAddr() void {
-    std.debug.print("expected a hex address, e.g. 'b c000' or 'b $C000'\n", .{});
+const TokenIt = std.mem.TokenIterator(u8, .scalar);
+
+/// **Addresses are hex, counts are decimal.** Both are what a 6502 debugger's
+/// user expects (`b c000` addresses a location; `s 10` means ten steps, the
+/// way `gdb`'s own count arguments read), and getting this backwards is not a
+/// cosmetic problem: every argument here used to parse as hex, so `s 10`
+/// silently ran *sixteen* instructions. An explicit `$`/`0x` prefix forces
+/// hex either way, so a count can still be written `$40` when that reads
+/// better.
+const hex_radix = 16;
+const dec_radix = 10;
+
+/// Strips an optional `$`/`0x` prefix, reporting the radix it implies. Both
+/// spellings show up across NES tooling.
+fn splitRadix(token: []const u8, default_radix: u8) struct { []const u8, u8 } {
+    if (std.mem.startsWith(u8, token, "$")) return .{ token[1..], hex_radix };
+    if (std.mem.startsWith(u8, token, "0x") or std.mem.startsWith(u8, token, "0X")) {
+        return .{ token[2..], hex_radix };
+    }
+    return .{ token, default_radix };
 }
 
-/// Strips an optional `$`/`0x` prefix -- 6502 debugger convention is hex by
-/// default, and both prefix spellings show up across NES tooling.
-fn stripHexPrefix(token: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, token, "$")) return token[1..];
-    if (std.mem.startsWith(u8, token, "0x") or std.mem.startsWith(u8, token, "0X")) return token[2..];
-    return token;
-}
-
-fn parseAddrArg(it: *std.mem.TokenIterator(u8, .scalar)) ?u16 {
+/// Absent -> `null`, so the caller's default applies. Present but
+/// unparseable -> `error.BadArg`.
+///
+/// That error case is the point of this function existing rather than a
+/// `catch null`: a typo used to be indistinguishable from an omitted
+/// argument, so `s xyz` stepped once and `oam zz` dumped all 64 sprites,
+/// neither saying anything was wrong.
+fn optionalArg(comptime T: type, it: *TokenIt, default_radix: u8) error{BadArg}!?T {
     const token = it.next() orelse return null;
-    return std.fmt.parseInt(u16, stripHexPrefix(token), 16) catch null;
+    const stripped, const radix = splitRadix(token, default_radix);
+    if (stripped.len == 0) return error.BadArg;
+    return std.fmt.parseInt(T, stripped, radix) catch error.BadArg;
 }
 
-fn parseOptionalArg(comptime T: type, it: *std.mem.TokenIterator(u8, .scalar)) ?T {
-    const token = it.next() orelse return null;
-    return std.fmt.parseInt(T, stripHexPrefix(token), 16) catch null;
+/// An address argument the command cannot run without. Returns null once it
+/// has reported why (absent, or unparseable), so callers just skip the
+/// command.
+fn requiredAddr(it: *TokenIt) ?u16 {
+    const parsed = optionalArg(u16, it, hex_radix) catch {
+        std.debug.print("not a valid address -- hex, e.g. 'c000' or '$C000'\n", .{});
+        return null;
+    };
+    return parsed orelse {
+        std.debug.print("this command needs an address, e.g. 'b c000'\n", .{});
+        return null;
+    };
 }
 
-fn parseArgOr(comptime T: type, it: *std.mem.TokenIterator(u8, .scalar), default: T) T {
-    return parseOptionalArg(T, it) orelse default;
+/// An optional count/length. Returns null once it has reported a bad value;
+/// an *absent* value yields `default`, which is not an error.
+fn countOr(comptime T: type, it: *TokenIt, default: T) ?T {
+    const parsed = optionalArg(T, it, dec_radix) catch {
+        std.debug.print("not a valid count -- decimal, or '$'/'0x' prefixed for hex\n", .{});
+        return null;
+    };
+    return parsed orelse default;
 }
 
 // ============================== tests ==============================
@@ -525,45 +600,85 @@ test "printMem wraps at \\$FFFF instead of panicking on a range that runs past i
     dbg.printMem(0, 0); // empty range prints nothing and terminates
 }
 
+test "printVram reports an out-of-range offset rather than printing nothing" {
+    var m: Machine = undefined;
+    var dbg = try testDebugger(&m);
+    dbg.printVram(vram_size - 16, 16); // last row, in range
+    dbg.printVram(vram_size, 16); // past the end -- used to print nothing at all
+    dbg.printVram(0, 16);
+    dbg.printVram(vram_size - 8, 0xFFFF); // length clamps to the end of VRAM
+}
+
 test "printOam rejects an out-of-range sprite index instead of reading past OAM" {
     var m: Machine = undefined;
     var dbg = try testDebugger(&m);
-    dbg.printOam(0x3F); // last valid sprite
-    dbg.printOam(0x40); // first invalid one -- used to index byte 256 of a 256-byte array
-    dbg.printOam(0xFF);
+    dbg.printOam(63); // last valid sprite
+    dbg.printOam(64); // first invalid one -- used to index byte 256 of a 256-byte array
+    dbg.printOam(0xFFFF);
     // `printOam(null)` (the full 64-row table) is deliberately not exercised
     // here: it is the same indexing path, and 64 rows per test run is log
     // noise for no extra coverage.
 }
 
-test "stripHexPrefix strips both '$' and '0x'/'0X' spellings, and leaves bare hex alone" {
-    try testing.expectEqualStrings("C000", stripHexPrefix("$C000"));
-    try testing.expectEqualStrings("c000", stripHexPrefix("0xc000"));
-    try testing.expectEqualStrings("C000", stripHexPrefix("0XC000"));
-    try testing.expectEqualStrings("C000", stripHexPrefix("C000"));
+fn tokens(s: []const u8) TokenIt {
+    return std.mem.tokenizeScalar(u8, s, ' ');
 }
 
-test "parseAddrArg parses hex with or without a prefix, and rejects garbage or a missing token" {
-    var with_prefix = std.mem.tokenizeScalar(u8, "$C000", ' ');
-    try testing.expectEqual(@as(?u16, 0xC000), parseAddrArg(&with_prefix));
-
-    var bare = std.mem.tokenizeScalar(u8, "c000", ' ');
-    try testing.expectEqual(@as(?u16, 0xC000), parseAddrArg(&bare));
-
-    var garbage = std.mem.tokenizeScalar(u8, "not-hex", ' ');
-    try testing.expectEqual(@as(?u16, null), parseAddrArg(&garbage));
-
-    var empty = std.mem.tokenizeScalar(u8, "", ' ');
-    try testing.expectEqual(@as(?u16, null), parseAddrArg(&empty));
+test "splitRadix honours '$' and '0x'/'0X', and otherwise keeps the caller's radix" {
+    {
+        const text, const radix = splitRadix("$C000", dec_radix);
+        try testing.expectEqualStrings("C000", text);
+        try testing.expectEqual(@as(u8, hex_radix), radix);
+    }
+    {
+        const text, const radix = splitRadix("0xc000", dec_radix);
+        try testing.expectEqualStrings("c000", text);
+        try testing.expectEqual(@as(u8, hex_radix), radix);
+    }
+    {
+        const text, const radix = splitRadix("0XC000", dec_radix);
+        try testing.expectEqualStrings("C000", text);
+        try testing.expectEqual(@as(u8, hex_radix), radix);
+    }
+    {
+        // Unprefixed: the caller's default decides, which is the whole point.
+        const text, const radix = splitRadix("10", dec_radix);
+        try testing.expectEqualStrings("10", text);
+        try testing.expectEqual(@as(u8, dec_radix), radix);
+    }
 }
 
-test "parseArgOr falls back to the default on a missing or unparseable token" {
-    var empty = std.mem.tokenizeScalar(u8, "", ' ');
-    try testing.expectEqual(@as(u32, 7), parseArgOr(u32, &empty, 7));
+test "counts read as decimal, addresses as hex, and '$' overrides either" {
+    // `s 10` means ten steps, not sixteen. This is the regression: every
+    // argument used to parse as hex.
+    var count = tokens("10");
+    try testing.expectEqual(@as(?u32, 10), try optionalArg(u32, &count, dec_radix));
 
-    var garbage = std.mem.tokenizeScalar(u8, "garbage", ' ');
-    try testing.expectEqual(@as(u16, 64), parseArgOr(u16, &garbage, 64));
+    var addr = tokens("10");
+    try testing.expectEqual(@as(?u16, 0x10), try optionalArg(u16, &addr, hex_radix));
 
-    var present = std.mem.tokenizeScalar(u8, "20", ' ');
-    try testing.expectEqual(@as(u16, 0x20), parseArgOr(u16, &present, 64));
+    var forced_hex = tokens("$10");
+    try testing.expectEqual(@as(?u32, 0x10), try optionalArg(u32, &forced_hex, dec_radix));
+}
+
+test "an absent argument is null, but an unparseable one is an error rather than the default" {
+    var absent = tokens("");
+    try testing.expectEqual(@as(?u32, null), try optionalArg(u32, &absent, dec_radix));
+
+    // The bug this pins: `s xyz` stepped once and `oam zz` dumped all 64
+    // sprites, because a failed parse was indistinguishable from no argument.
+    var garbage = tokens("xyz");
+    try testing.expectError(error.BadArg, optionalArg(u32, &garbage, dec_radix));
+
+    // Decimal-by-default means hex letters are a typo, not a silent value.
+    var hex_letters_in_a_count = tokens("ff");
+    try testing.expectError(error.BadArg, optionalArg(u32, &hex_letters_in_a_count, dec_radix));
+
+    // Out of the type's range is a bad argument too, not a wrap.
+    var too_big = tokens("70000");
+    try testing.expectError(error.BadArg, optionalArg(u16, &too_big, dec_radix));
+
+    // A bare prefix has no digits after it.
+    var bare_prefix = tokens("$");
+    try testing.expectError(error.BadArg, optionalArg(u16, &bare_prefix, hex_radix));
 }
