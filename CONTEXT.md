@@ -90,7 +90,14 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   `docs/research/test-rom-licensing.md`). `scripts/sync-core.mjs` runs `zig
   build wasm` and copies its output (plus the vendored demo ROM) into
   `web/` before `dev`/`build` — nothing under `web/src/wasm/*.wasm` is
-  committed; `core/` stays the single source of truth.
+  committed; `core/` stays the single source of truth. `src/persistence/saveStore.ts` owns
+  IndexedDB and is imported by the **Worker**, not the main thread: a save
+  never crosses `postMessage` as bytes, and the UI
+  (`SaveStates.tsx`) only ever sees per-slot metadata. Slots are keyed on
+  the ROM's hash, so ENG-77's runtime ROM picker and M8's save-states are
+  coupled: `adoptRom` re-keys the browser and re-restores the battery on
+  every swap, and emulation is held for the length of that restore so a
+  swapped-in game never boots against the wrong save file.
 - **`docs/adr/`** — one file per architecture decision that's reached
   code, numbered in decision order. `docs/reference/external-resources.md`
   indexes the outside material this project builds against (reference
@@ -149,6 +156,7 @@ is built on (`Cpu.trace`, `Bus.peek`, `Ppu.peekRegister`) had existed since
 M1/M2 with no caller outside the tests, which is the whole reason the tool
 was a small job by the time it was written.
 
+<<<<<<< HEAD
 M8 (ENG-76) is in progress. `savestate.zig` and the ABI it needs
 (`save_state`/`load_state`/`get_rom_hash_ptr`/`load_sram` and friends, plus
 `NesCore`'s typed wrapper for them) exist and round-trip against every M7
@@ -157,6 +165,22 @@ mapper's vendored cartridge; the IndexedDB persistence keyed on
 remaining half. See
 `docs/adr/0006-save-state-format-doubles-as-the-determinism-hash.md` for
 why that format is also the determinism hash.
+=======
+M8 (ENG-76) closes M0-M8: `savestate.zig` plus the ABI it needs
+(`save_state`/`load_state`/`get_rom_hash_ptr`/`load_sram` and friends, and
+`NesCore`'s typed wrapper for them), round-tripped digest-exact against
+every M7 mapper's vendored cartridge; `web/src/persistence/saveStore.ts`
+persisting both numbered slots and the reserved `"sram"` slot in IndexedDB
+under `(rom_hash, slot)`; and `SaveStates.tsx`'s slot browser. See
+`docs/adr/0005-save-state-format-doubles-as-the-determinism-hash.md` for why
+that format is also the determinism hash, and what it deliberately omits.
+One acceptance criterion is verified indirectly and worth naming: SRAM
+*persistence* is covered by the core's round-trip test and
+`saveStore.test.ts`, but not end to end in a browser, because no ROM this
+repo may vendor writes to $6000-$7FFF -- the demo ROM's battery stays blank,
+which the e2e suite asserts as the correct visible outcome rather than
+skipping.
+>>>>>>> 03f4cec (ENG-76 (M8): IndexedDB persistence and the save-state slot browser)
 
 ## Conventions worth knowing before touching either side
 

@@ -55,6 +55,39 @@ export function readFramebuffer(page: Page): Promise<number[]> {
   })
 }
 
+/**
+ * `findSpriteCol` computed *inside the page*, returning one number instead
+ * of a framebuffer.
+ *
+ * `readFramebuffer` ships all 245,760 components across the CDP boundary,
+ * which measures at over a second per call -- fine for a spec that reads
+ * one frame and asserts several things about it, ruinous for anything that
+ * polls. Scanning in the page and returning a single integer takes
+ * milliseconds, which is what makes "wait until the sprite stops moving"
+ * (see `savestates.spec.ts`) a practical thing to do.
+ */
+export function readSpriteCol(page: Page, row: number, background: readonly number[]): Promise<number> {
+  return page.evaluate(
+    ({ row, background }) => {
+      const read = (window as unknown as { __frameDebug__?: () => number[] }).__frameDebug__
+      if (!read) throw new Error('__frameDebug__ not installed yet -- the video-ready message never arrived')
+      const framebuffer = read()
+      for (let col = 0; col < 256; col++) {
+        const o = (row * 256 + col) * 4
+        if (
+          framebuffer[o] !== background[0] ||
+          framebuffer[o + 1] !== background[1] ||
+          framebuffer[o + 2] !== background[2]
+        ) {
+          return col
+        }
+      }
+      return -1
+    },
+    { row, background: [...background] },
+  )
+}
+
 export function pixelAt(framebuffer: number[], row: number, col: number): number[] {
   const o = (row * 256 + col) * 4
   return framebuffer.slice(o, o + 4)

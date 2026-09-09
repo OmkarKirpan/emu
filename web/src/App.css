@@ -210,3 +210,99 @@ kbd {
   border: 1px solid currentColor;
   cursor: pointer;
 }
+
+/* Save-state slot browser (M8, ENG-76). Laid out as a fixed 4-row grid
+   rather than a list that grows: `SAVE_SLOTS` is fixed, and a stable
+   height means saving into a slot never reflows the page under the
+   pointer that just clicked it. */
+.save-states {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 512px;
+  max-width: 100%;
+
+  h2 {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text);
+    opacity: 0.75;
+    margin: 0;
+  }
+}
+
+.slot-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.slot {
+  display: grid;
+  /* name | timestamp | Save | Load | delete -- the timestamp column takes
+     the slack so the three controls stay in one vertical line across rows. */
+  grid-template-columns: 4.5em 1fr auto auto auto;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+
+  button {
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 4px 12px;
+    border-radius: 6px;
+    color: var(--text-h);
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    cursor: pointer;
+
+    &:hover:not(:disabled) {
+      border-color: var(--text);
+    }
+    &:disabled {
+      opacity: 0.4;
+      cursor: default;
+    }
+  }
+}
+
+.slot-name {
+  color: var(--text-h);
+}
+
+.slot-when {
+  color: var(--text);
+  opacity: 0.7;
+}
+
+.slot-delete {
+  padding: 4px 10px;
+}
+
+.battery,
+.slot-error {
+  font-family: var(--mono);
+  font-size: 12px;
+  margin: 0;
+}
+
+.battery {
+  color: var(--text);
+  opacity: 0.75;
+}
+
+/* The same `#ffb3b3` ENG-77's `.rom-error` settled on, for the same reason
+   it gives: on this page's dark ground `.audio-error`'s darker `#c0392b`
+   is barely legible. A failed save is also the same *kind* of error as a
+   rejected file pick -- something went wrong while a perfectly good game
+   keeps running -- so it should read the same way. */
+.slot-error {
+  color: #ffb3b3;
+}

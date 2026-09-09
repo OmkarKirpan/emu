@@ -6,6 +6,11 @@
  * lib conflicting with the other's (see `tsconfig.worker.json`'s own
  * comment for why those two libs can't both be active in one project).
  */
+import type { SaveSlot, SlotSummary } from '../persistence/saveStore'
+
+// Re-exported so the Worker and its callers can name a slot without either
+// of them reaching into the persistence layer directly.
+export type { SaveSlot, SlotSummary }
 
 /** Which backend `renderer.ts` stood up. Reported back so the UI (and
  * `e2e/renderer.spec.ts`) can state it rather than infer it -- WebGPU
@@ -38,6 +43,13 @@ export type EmulatorWorkerInbound =
    * and the audio ring is a module-level global outside `Machine`, so
    * samples keep flowing across the swap with no second handshake. */
   | { type: 'load-rom'; romBytes: ArrayBuffer }
+  // Save-states (M8, ENG-76). The Worker owns both the wasm instance and
+  // the IndexedDB store, so these carry a slot number and nothing else --
+  // no state bytes ever cross this boundary in either direction.
+  | { type: 'save-state'; slot: SaveSlot }
+  | { type: 'load-state'; slot: SaveSlot }
+  | { type: 'delete-state'; slot: SaveSlot }
+  | { type: 'list-states' }
   | { type: 'audio-start'; sampleRate: number; port: MessagePort }
   | { type: 'audio-resync' }
 
@@ -66,3 +78,13 @@ export type EmulatorWorkerOutbound =
   | { type: 'rom-loaded'; ok: false; message: string }
   | ({ type: 'audio-ready' } & RingHandshake)
   | { type: 'stats'; fill: number; underrunCount: number; peak: number; rms: number }
+  /** The full slot listing for the loaded ROM, pushed after every save,
+   * load, delete and explicit `'list-states'`. A full listing rather than a
+   * delta: it is a handful of small records, and a self-correcting snapshot
+   * cannot drift out of sync with the database the way applied deltas can. */
+  | { type: 'slots'; slots: SlotSummary[] }
+  /** A save-state operation that failed -- a rejected blob, a full disk, a
+   * slot the user cleared in another tab. Reported rather than thrown into
+   * the Worker's `onerror`, which `EmulatorScreen` treats as "the emulator
+   * died" and would blank the screen over a failed save. */
+  | { type: 'slot-error'; slot: SaveSlot; message: string }
