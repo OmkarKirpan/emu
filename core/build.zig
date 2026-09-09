@@ -178,6 +178,36 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // ENG-67 (M2b): the author-facing introspection tool -- a native CLI
+    // debugger, deliberately outside the wasm delivery graph (see
+    // `debugger.zig`'s own doc comment). Its own module rather than reusing
+    // `nes_core`/`test_mod`: it needs neither the vendored test-ROM fixtures
+    // nor to be importable as a library, just the library modules it imports
+    // directly plus its own `main`.
+    //
+    // Its *tests* are deliberately not compiled from this module -- see
+    // `root.zig`'s test block, which pulls them into `mod_tests` above
+    // instead. A second `addTest` on this module cannot work: test mode
+    // discovers `test {}` blocks transitively, `debugger.zig` reaches
+    // `rom.zig` through `machine.zig`, and `rom.zig`'s own tests
+    // `@embedFile` vendored fixtures (e.g. `mapperel_M1_P512K_CR8K_S8K`)
+    // that exist only as `test_mod`'s anonymous imports above -- so it fails
+    // to compile with `unable to open '<fixture>'`. One shared test binary
+    // is the existing convention every other native test file here follows
+    // anyway.
+    const debug_mod = b.createModule(.{
+        .root_source_file = b.path("src/debugger.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const debug_exe = b.addExecutable(.{ .name = "nes-debugger", .root_module = debug_mod });
+    const run_debug_exe = b.addRunArtifact(debug_exe);
+    // `zig build debug -- path/to.nes` -- everything after `--` is the ROM
+    // path (and, in future, any other CLI args `debugger.zig` grows).
+    if (b.args) |args| run_debug_exe.addArgs(args);
+    const debug_step = b.step("debug", "Run the native CLI debugger against a ROM: zig build debug -- path/to.nes");
+    debug_step.dependOn(&run_debug_exe.step);
+
     // The wasm32-freestanding build: `src/wasm.zig` (not `root.zig` — see
     // its own doc comment) is the actual delivery artifact as of ENG-69
     // (M4), exporting the ABI ENG-60 designed. Still no shared_memory/

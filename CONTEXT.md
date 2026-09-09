@@ -28,7 +28,15 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   surface, the palette→RGBA8 resolve) live in `wasm.zig` and must never
   leak into `root.zig`; native-only concerns (`Cpu.trace`, the
   vendored-ROM test suite) must never leak into `wasm.zig`. Both share one
-  implementation, not one entry point. **Nametable mirroring belongs to
+  implementation, not one entry point. `src/debugger.zig` is a *third*
+  root, native-only: `zig build debug -- path/to.nes` gives an interactive
+  CPU/PPU inspector (breakpoints, single-step, memory/VRAM/OAM/palette
+  viewers) for the author's own debugging, built on the side-effect-free
+  `Cpu.trace`/`Bus.peek`/`Ppu.peekRegister` entry points. It deliberately
+  adds nothing to the wasm ABI (ENG-67), and its tests ride in `root.zig`'s
+  test block rather than a module of their own — a separate `addTest` can't
+  compile, because `rom.zig`'s tests `@embedFile` fixtures that exist only as
+  `build.zig`'s `test_mod` anonymous imports. **Nametable mirroring belongs to
   `mapper.zig`, not `rom.zig` or `Ppu`** — as of M7a the cartridge answers
   `Mapper.mirroring()` per access, because MMC1 rewrites it at runtime and
   can select single-screen modes the iNES header cannot express; the header
@@ -124,6 +132,13 @@ two interface changes MMC1 forced,
 design and the PPU fix it forced, and
 `docs/adr/0005-cartridge-owns-its-memory.md` for the cartridge-memory
 follow-on.
+
+M2b (ENG-67, the native CLI debugger described under `core/` above) landed
+after all of the above rather than at its scheduled PPU-milestone slot. It
+needed nothing that wasn't already there — the introspection entry points it
+is built on (`Cpu.trace`, `Bus.peek`, `Ppu.peekRegister`) had existed since
+M1/M2 with no caller outside the tests, which is the whole reason the tool
+was a small job by the time it was written.
 
 ## Conventions worth knowing before touching either side
 
