@@ -68,6 +68,9 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
     case 'reset':
       nesCore?.reset()
       break
+    case 'load-rom':
+      loadRom(message.romBytes)
+      break
     case 'audio-start':
       // `nesCore` not existing yet is a real (if narrow) race -- a click
       // fast enough to beat this Worker's own async boot -- not a bug to
@@ -82,6 +85,47 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       audioPort?.postMessage({ type: 'resync' })
       break
   }
+}
+
+/**
+ * ENG-77's runtime ROM swap: re-loads the *running* core in place.
+ *
+ * Safe to call on a live machine because `wasm.zig`'s `load_rom` parses
+ * and mapper-checks into a throwaway `validate` pass before it touches
+ * `rom_storage` -- a rejected ROM cannot partially overwrite the cartridge
+ * currently playing, which is what lets the main thread report the failure
+ * as a dismissible line instead of a fatal overlay. A *successful* one
+ * runs `Machine.init`, so it is a genuine cold boot (fresh bus, mapper,
+ * WRAM and CPU), not the RESET line `'reset'` drives.
+ *
+ * Nothing else is torn down: the renderer, the transferred canvas and the
+ * input SAB all belong to the session rather than the ROM, and the audio
+ * ring lives outside `Machine` (see `audio_ring.zig`), so `stepAudioFrame`
+ * keeps feeding the same ring the worklet is already reading.
+ */
+function loadRom(romBytes: ArrayBuffer): void {
+  if (!nesCore) {
+    // Only reachable by picking a file before the Worker finished booting;
+    // an honest "not yet" beats silently dropping the message.
+    post({ type: 'rom-loaded', ok: false, message: 'The emulator is still starting up -- try again in a moment.' })
+    return
+  }
+
+  try {
+    nesCore.loadRom(new Uint8Array(romBytes))
+  } catch (err: unknown) {
+    // `RomLoadError extends Error`, so one check covers both.
+    const message = err instanceof Error ? err.message : String(err)
+    post({ type: 'rom-loaded', ok: false, message })
+    return
+  }
+
+  // The ring still holds ~50ms of the *previous* game's samples, primed
+  // ahead of the worklet's read index. Without this they play over the new
+  // game's first frames. Same forward-to-the-worklet path `'audio-resync'`
+  // uses, and for the same reason: `read_index` is the worklet's own field.
+  audioPort?.postMessage({ type: 'resync' })
+  post({ type: 'rom-loaded', ok: true })
 }
 
 async function start(

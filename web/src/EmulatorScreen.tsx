@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
+import { RomLoadReadout, RomPicker } from './RomPicker'
+import { useRomLoader } from './useRomLoader'
 import { FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from './wasm/core'
 // The one original, license-clean NROM ROM this repo vendors -- see
 // `core/tests/roms/nrom_demo/README.md` for why it stands in for a real
@@ -66,6 +68,10 @@ export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
   const [worker, setWorker] = useState<Worker | null>(null)
+  /** ENG-77's runtime ROM loading. Owns its own Worker listener and state
+   * (see `useRomLoader.ts`); this component only places the controls and
+   * hands the drop handlers to the canvas wrapper. */
+  const { romLoad, dismiss, loadFile, dragging, dropHandlers } = useRomLoader(worker)
   /** The one emulator session for this canvas, held across remounts --
    * see the effect below for why it cannot simply be rebuilt. */
   const sessionRef = useRef<EmulatorSession | null>(null)
@@ -215,7 +221,11 @@ export function EmulatorScreen() {
 
   return (
     <>
-      <div className="screen">
+      {/* The drop target is the canvas wrapper, not the canvas itself:
+          the canvas is an inert placeholder once transferred to the Worker
+          (ENG-57), and a wrapper-level highlight can outline the whole
+          screen without fighting the canvas's own border. */}
+      <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
         <canvas
           ref={canvasRef}
           width={FRAMEBUFFER_WIDTH}
@@ -226,9 +236,13 @@ export function EmulatorScreen() {
         {status.kind === 'loading' && <p className="screen-overlay">Loading…</p>}
         {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
       </div>
-      <button type="button" className="reset" onClick={handleReset} disabled={status.kind !== 'running'}>
-        Reset
-      </button>
+      <div className="screen-controls">
+        <button type="button" className="reset" onClick={handleReset} disabled={status.kind !== 'running'}>
+          Reset
+        </button>
+        <RomPicker onPick={loadFile} disabled={status.kind !== 'running'} />
+      </div>
+      <RomLoadReadout romLoad={romLoad} onDismiss={dismiss} />
       {/* Which backend actually engaged isn't inferable from the browser
           (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
           `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}

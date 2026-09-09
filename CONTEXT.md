@@ -52,7 +52,15 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   exports in a typed, memory-safety-aware `NesCore` class (framebuffer
   views go stale across `memory.grow`; every fallible call maps its
   status code to a real exception). `src/wasm/controller.ts` /
-  `src/wasm/gamepad.ts` read input. `scripts/sync-core.mjs` runs `zig
+  `src/wasm/gamepad.ts` read input. `useRomLoader.ts` / `RomPicker.tsx`
+  load a ROM at runtime (ENG-77) over a `'load-rom'` Worker message rather
+  than a second `'start'` -- `'start'` carries the one-shot
+  `OffscreenCanvas`, while `wasm.zig`'s `load_rom` is safely re-entrant on a
+  live core and the audio ring lives outside `Machine`, so a swap needs
+  neither a new canvas nor a second audio handshake. The picked file is
+  never fetched, stored or served: that is what keeps a real commercial
+  game outside the repo's ROM policy entirely (see
+  `docs/research/test-rom-licensing.md`). `scripts/sync-core.mjs` runs `zig
   build wasm` and copies its output (plus the vendored demo ROM) into
   `web/` before `dev`/`build` — nothing under `web/src/wasm/*.wasm` is
   committed; `core/` stays the single source of truth.

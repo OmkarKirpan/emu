@@ -28,6 +28,16 @@ export type EmulatorWorkerInbound =
       preferredRenderer?: RendererKind
     }
   | { type: 'reset' }
+  /** Swap the ROM in the *already running* core (ENG-77's file picker).
+   * Deliberately not a second `'start'`: that message carries the
+   * `OffscreenCanvas`, and `transferControlToOffscreen` is one-shot and
+   * irreversible per canvas element (ENG-57), so the handle is detached
+   * after the first send. Nothing else about the session needs rebuilding
+   * anyway -- `wasm.zig`'s `load_rom` re-inits the whole `Machine`, the
+   * renderer and input SAB are bound to the session rather than the ROM,
+   * and the audio ring is a module-level global outside `Machine`, so
+   * samples keep flowing across the swap with no second handshake. */
+  | { type: 'load-rom'; romBytes: ArrayBuffer }
   | { type: 'audio-start'; sampleRate: number; port: MessagePort }
   | { type: 'audio-resync' }
 
@@ -46,5 +56,13 @@ export type EmulatorWorkerOutbound =
   | { type: 'video-ready'; sab: SharedArrayBuffer; framebufferPtr: number; width: number; height: number }
   | { type: 'status'; status: 'running'; renderer: RendererKind }
   | { type: 'status'; status: 'error'; message: string }
+  /** Result of a `'load-rom'`. Deliberately *not* folded into the
+   * `'status'` error above: that one means "the emulator never came up"
+   * and earns a permanent overlay over a dead screen. A rejected ROM pick
+   * leaves a working emulator running -- `load_rom` validates into a
+   * throwaway parse before it touches `rom_storage`, so the previous
+   * cartridge is genuinely untouched -- and must not read as fatal. */
+  | { type: 'rom-loaded'; ok: true }
+  | { type: 'rom-loaded'; ok: false; message: string }
   | ({ type: 'audio-ready' } & RingHandshake)
   | { type: 'stats'; fill: number; underrunCount: number; peak: number; rms: number }
