@@ -69,4 +69,11 @@ test {
     _ = @import("mmc3_test.zig");
     _ = @import("uxrom_test.zig");
     _ = @import("cnrom_test.zig");
+    // ENG-67 (M2b): the native CLI debugger's own tests (breakpoint
+    // bookkeeping, command parsing, step/continue against a synthetic ROM).
+    // `debugger.zig` is also its own `zig build debug` executable root (see
+    // its doc comment) -- pulling its tests in here, the same way every test
+    // file above is, is what lets them run without a second `addTest`/module
+    // in `build.zig`.
+    _ = @import("debugger.zig");
 }
