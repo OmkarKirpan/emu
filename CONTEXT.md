@@ -66,6 +66,15 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   tests too (where nothing drains it). Only its pointer-exposing exports
   (`get_audio_ring_ptr` and friends) stay wasm-only. See
   `docs/adr/0002-apu-mixing-and-filtering.md`.
+  **`savestate.zig` (M8) is the one definition of "what is machine
+  state"** — ENG-61's TLV save-state format, written as a single
+  direction-generic codec so each field is named once and the writer and
+  reader cannot drift apart. `determinism.zig` no longer keeps its own
+  field lists: the determinism digest is SHA-256 over exactly this
+  serializer's output, which is what ENG-61 specified from the start. What
+  the format excludes (PRG/CHR-ROM, the APU's RC filter cascade, the
+  framebuffer) and why is in
+  `docs/adr/0006-save-state-format-doubles-as-the-determinism-hash.md`.
 - **`web/`** — the host app. `src/wasm/core.ts` wraps `wasm.zig`'s raw
   exports in a typed, memory-safety-aware `NesCore` class (framebuffer
   views go stale across `memory.grow`; every fallible call maps its
@@ -139,6 +148,15 @@ needed nothing that wasn't already there — the introspection entry points it
 is built on (`Cpu.trace`, `Bus.peek`, `Ppu.peekRegister`) had existed since
 M1/M2 with no caller outside the tests, which is the whole reason the tool
 was a small job by the time it was written.
+
+M8 (ENG-76) is in progress. `savestate.zig` and the ABI it needs
+(`save_state`/`load_state`/`get_rom_hash_ptr`/`load_sram` and friends, plus
+`NesCore`'s typed wrapper for them) exist and round-trip against every M7
+mapper's vendored cartridge; the IndexedDB persistence keyed on
+`(rom_hash, slot)` and the save-state slot browser in `web/` are the
+remaining half. See
+`docs/adr/0006-save-state-format-doubles-as-the-determinism-hash.md` for
+why that format is also the determinism hash.
 
 ## Conventions worth knowing before touching either side
 

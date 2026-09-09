@@ -7,6 +7,7 @@ pub const apu = @import("apu.zig");
 pub const controller = @import("controller.zig");
 pub const palette = @import("palette.zig");
 pub const machine = @import("machine.zig");
+pub const savestate = @import("savestate.zig");
 
 pub const Rom = rom.Rom;
 pub const Header = rom.Header;
@@ -25,6 +26,7 @@ pub const Status = ppu.Status;
 pub const Apu = apu.Apu;
 pub const Controller = controller.Controller;
 pub const Machine = machine.Machine;
+pub const RomHash = savestate.RomHash;
 
 // No force-analysis block here, deliberately. One used to live at this spot,
 // forcing codegen of the whole public surface because `root.zig` was itself
@@ -48,6 +50,7 @@ test {
     _ = apu;
     _ = controller;
     _ = palette;
+    _ = savestate;
     // `audio_ring.zig` is deliberately absent here: it was reachable only
     // from this block while it was a wasm-only subsystem (ENG-62, M5), but
     // as of M6 `apu` imports it directly (every `Apu.tick` pushes a sample
@@ -76,4 +79,5 @@ test {
     // file above is, is what lets them run without a second `addTest`/module
     // in `build.zig`.
     _ = @import("debugger.zig");
+    _ = @import("savestate_mapper_test.zig");
 }

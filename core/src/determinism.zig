@@ -1,70 +1,48 @@
-//! Native-test-only determinism gate for ENG-65.
+//! Native-test-only determinism gate for ENG-65: boot the same ROM twice
+//! from power-on, run both for the same number of cycles, and assert the
+//! two machines are bit-identical.
 //!
-//! The *full* save-state format (ENG-61) and IndexedDB persistence (M8) are
-//! both out of scope here. What this hashes is deliberately just "the
-//! currently-implemented slice of the ENG-61 state enumeration": CPU
-//! architectural + interrupt-latch state, all of WRAM, and the PPU state a
-//! mid-scanline resume would actually need -- registers, loopy `v`/`t`/`x`/
-//! `w`, OAM + secondary OAM, nametables, palette RAM, and the background
-//! shift-register/fetch-latch pipeline. Per ENG-65 itself: "the hash is
-//! mostly CPU+WRAM ... naturally growing to cover more" as later milestones
-//! add state -- this is that first, deliberately narrow slice, not an
-//! oversight.
+//! **What "bit-identical" means is not decided here.** It is exactly
+//! `savestate.zig`'s ENG-61 save-state blob, hashed. ENG-61 specified that
+//! from the start ("this format's serializer is the hashing mechanism
+//! `assert_deterministic()` uses in the native test suite from day one"),
+//! and until M8 this file carried a hand-written stand-in for it -- one
+//! `hashCpu`/`hashPpu`/`hashApu`/`hashMapper` field list that had to be
+//! extended by hand at every milestone, in lockstep with a serializer that
+//! did not exist yet. Now there is only the serializer, and this file is
+//! the two-runs-and-compare harness on top of it.
 //!
-//! **APU section (M6, ENG-71)**: `hashApu` covers every field of every
-//! channel and of the frame sequencer that a mid-stream resume would have
-//! to restore to keep producing bit-identical audio -- each channel's
-//! enable bit, timer/period, length counter and full envelope state; both
-//! pulses' complete sweep configuration; the triangle's linear counter and
-//! reload latch; the noise LFSR and mode; the DMC's playback position,
-//! output level, sample buffer and IRQ configuration; and the frame
-//! sequencer's mode, cycle, pending-reset/deferred-half-frame latches and
-//! IRQ state.
+//! The practical consequence is that the *state enumeration* -- what counts
+//! as state, what is excluded as re-derivable (PRG/CHR-ROM, the APU's RC
+//! filter cascade, the framebuffer), and why -- is documented in
+//! `savestate.zig`'s module doc comment, not here. A field added to the
+//! serializer is covered by this gate automatically, which is the drift
+//! this collapse exists to make impossible.
 //!
-//! Two deliberate omissions, both named rather than silent. **The RC
-//! filter cascade's state** (`Apu.hpf1`/`hpf2`/`lpf`, and `output_sample`)
-//! is not hashed: it is a pure function of the mixed channel outputs this
-//! section already covers, so two runs that agree here cannot disagree
-//! there, and hashing three `f32` pairs would make the digest sensitive to
-//! floating-point rounding across targets for no gain in what it proves.
-//! **`FrameSequencer.total_cycles`** is likewise skipped -- it only ever
-//! feeds the even/odd parity of the next `$4017` write, and `cycle`
-//! (hashed) already moves in lockstep with it. **Mapper section is CHR-RAM
-//! only**: NROM has no bank-switch registers or IRQ counter, but per ENG-61
-//! ("CHR-RAM contents where the mapper provides writable CHR (mutable;
-//! CHR-ROM is not serialized -- static, reloadable from the ROM file)") its
-//! CHR *is* mutable when the cartridge shipped no CHR-ROM (`Nrom.chr_is_ram`)
-//! -- `Ppu.writeRegister`'s PPUDATA path can write pattern-table bytes into
-//! it via `Mapper.chrWrite`. Hashed only in that case; CHR-ROM is skipped, as
-//! ENG-61 specifies. A future mapper with bank-switch/IRQ state (MMC1/MMC3,
-//! M7) will need its own section here too.
-//!
-//! **Controller state (ENG-68, M3)**: `hashControllers` now covers each
-//! port's shift-register/strobe/latched-buttons state, on the same
-//! "grows to cover more" basis. There is still no recorded input-log/replay
-//! harness -- `assertDeterministic`'s two power-on runs never drive any
-//! controller input, so "given identical inputs" stays trivially satisfied
-//! by there being no inputs at all in either run. Building an event-log
-//! replay mechanism remains future work this milestone doesn't need; what's
-//! hashed here is just the architectural register state itself.
+//! **Still no input log.** `assertDeterministic`'s two runs never drive any
+//! controller input, so ENG-65's "given identical inputs" stays trivially
+//! satisfied by there being no inputs in either run. A recorded
+//! input-log/replay harness remains future work; the controllers'
+//! architectural register state is hashed regardless, because the
+//! serializer carries it.
 
 const std = @import("std");
 const testing = std.testing;
 
-const bus_mod = @import("bus.zig");
-const cpu_mod = @import("cpu.zig");
-const ppu_mod = @import("ppu.zig");
-const apu_mod = @import("apu.zig");
-const mapper_mod = @import("mapper.zig");
-const controller_mod = @import("controller.zig");
+const savestate = @import("savestate.zig");
 const Machine = @import("machine.zig").Machine;
 
-const Sha256 = std.crypto.hash.sha2.Sha256;
-pub const Digest = [Sha256.digest_length]u8;
+pub const Digest = savestate.RomHash;
 
-/// Boot two independent `Bus`+`Cpu` pairs from power-on against the same ROM
-/// bytes, run each for exactly `cycles` CPU cycles, hash the state slice
-/// described above, and assert the two hashes match.
+/// Scratch space for the serialized blob a digest is taken over. File-scope
+/// rather than a local so a `hashState` call costs no 64KB stack frame, and
+/// safe as a shared buffer because Zig's test runner is single-threaded and
+/// nothing here retains a reference past the `Sha256` it feeds.
+var scratch: [savestate.max_state_bytes]u8 = undefined;
+
+/// Boot two independent machines from power-on against the same ROM bytes,
+/// run each for exactly `cycles` CPU cycles, and assert their save-states
+/// hash identically.
 pub fn assertDeterministic(rom_bytes: []const u8, cycles: u64) !void {
     const a = try runAndHash(rom_bytes, cycles);
     const b = try runAndHash(rom_bytes, cycles);
@@ -75,270 +53,17 @@ fn runAndHash(rom_bytes: []const u8, cycles: u64) !Digest {
     var m: Machine = undefined;
     try m.init(rom_bytes);
     while (m.cpu.cycles < cycles) m.cpu.step();
-    return hashState(&m.cpu, &m.bus);
+    return hashState(&m);
 }
 
 /// Factored out of `runAndHash` so tests can hash two independently-built
-/// `Cpu`+`Bus` pairs directly -- e.g. to prove a specific field (PRG-RAM,
-/// CHR-RAM) actually changes the digest, without needing two full power-on
-/// runs that would otherwise stay bit-for-bit identical.
-fn hashState(cpu: *const cpu_mod.Cpu, bus: *const bus_mod.Bus) Digest {
-    var hasher = Sha256.init(.{});
-    hashCpu(&hasher, cpu);
-    hasher.update(&bus.wram);
-    // Cartridge PRG-RAM. It lives on `Bus` rather than inside the `Mapper`
-    // union for performance (see `Bus.prg_ram`), but it is still cartridge
-    // state a save-state has to carry -- `hashMapper` covers the registers
-    // that decide how it is addressed, this covers the bytes.
-    hasher.update(&bus.prg_ram);
-    hashPpu(&hasher, &bus.ppu);
-    hashMapper(&hasher, &bus.mapper);
-    hashControllers(&hasher, &bus.controllers);
-    hashApu(&hasher, &bus.apu);
-
-    var digest: Digest = undefined;
-    hasher.final(&digest);
-    return digest;
-}
-
-fn hashCpu(hasher: *Sha256, cpu: *const cpu_mod.Cpu) void {
-    hasher.update(&[_]u8{ cpu.a, cpu.x, cpu.y, cpu.s, cpu.p.toByte() });
-    hasher.update(std.mem.asBytes(&cpu.pc));
-    hasher.update(&[_]u8{
-        @intFromBool(cpu.nmi_line),
-        @intFromBool(cpu.nmi_pending),
-        @intFromBool(cpu.irq_line),
-        @intFromBool(cpu.jammed),
-        @intFromBool(cpu.irq_ready),
-    });
-}
-
-fn hashPpu(hasher: *Sha256, p: *const ppu_mod.Ppu) void {
-    hasher.update(&[_]u8{
-        @as(u8, @bitCast(p.ctrl)),
-        @as(u8, @bitCast(p.mask)),
-        p.status.toByte(),
-        p.oam_addr,
-        @intFromBool(p.w),
-        @as(u8, p.fine_x),
-        @intFromBool(p.suppress_vbl_this_frame),
-        p.read_buffer,
-        p.data_bus,
-        p.bg_next_tile_id,
-        p.bg_next_tile_attr,
-        p.bg_next_tile_lo,
-        p.bg_next_tile_hi,
-    });
-    // The one-dot PPUCTRL/PPUMASK latch delay (`Ppu.applyPendingLatches`)
-    // is real mid-cycle state a resume would have to restore: `$FF` here
-    // stands for "nothing pending", distinct from a pending write of any
-    // real byte value.
-    hasher.update(&[_]u8{
-        p.pending_ctrl orelse 0xFF,
-        @intFromBool(p.pending_ctrl != null),
-        p.pending_mask orelse 0xFF,
-        @intFromBool(p.pending_mask != null),
-    });
-    hasher.update(std.mem.asBytes(&p.v));
-    hasher.update(std.mem.asBytes(&p.t));
-    hasher.update(std.mem.asBytes(&p.bg_shift_pattern_lo));
-    hasher.update(std.mem.asBytes(&p.bg_shift_pattern_hi));
-    hasher.update(std.mem.asBytes(&p.bg_shift_attr_lo));
-    hasher.update(std.mem.asBytes(&p.bg_shift_attr_hi));
-    hasher.update(std.mem.asBytes(&p.scanline));
-    hasher.update(std.mem.asBytes(&p.dot));
-    hasher.update(std.mem.asBytes(&p.frame));
-    hasher.update(&p.vram);
-    // The four-screen board's own 2KB chip, held here rather than in each
-    // `Mapper` variant (see `Ppu.cart_vram`). Zero on every other board,
-    // so hashing it unconditionally costs nothing observable.
-    hasher.update(&p.cart_vram);
-    hasher.update(&p.palette);
-    hasher.update(&p.oam);
-    hasher.update(&p.secondary_oam);
-    // ENG-68 (M3): the sprite pipeline's per-scanline derived state. Purely
-    // a deterministic function of OAM+registers+scanline, so two power-on
-    // runs would already hash identically without this -- included anyway
-    // for ENG-61's "mid-scanline-resumable state" completeness, same spirit
-    // as `secondary_oam` above.
-    hasher.update(&[_]u8{
-        p.sprite_count,
-        p.secondary_count,
-        @intFromBool(p.secondary_has_sprite0),
-        @intFromBool(p.overflow_dot != null),
-    });
-    hasher.update(std.mem.asBytes(&(p.overflow_dot orelse @as(u16, 0))));
-    for (p.sprite_units[0..p.sprite_count]) |su| {
-        hasher.update(&[_]u8{
-            su.x,
-            su.pattern_lo,
-            su.pattern_hi,
-            @as(u8, su.palette),
-            @intFromBool(su.behind_bg),
-            @intFromBool(su.is_sprite0),
-        });
-    }
-}
-
-/// ENG-68 (M3): controller shift-register state. Per `determinism.zig`'s
-/// own module doc comment, there is still no recorded input-log/replay
-/// harness (that remains future work) -- `assertDeterministic`'s two
-/// power-on runs never drive controller input, so `buttons` stays 0 in
-/// both -- but the architectural *register* state introduced this
-/// milestone belongs in the hash on the same "grows to cover more as later
-/// milestones add state" basis every other section here does.
-fn hashControllers(hasher: *Sha256, controllers: *const [2]controller_mod.Controller) void {
-    for (controllers) |c| {
-        hasher.update(&[_]u8{ c.buttons, c.shift, @intFromBool(c.strobe) });
-    }
-}
-
-/// ENG-71 (M6): APU channel/frame-sequencer state. See the module doc
-/// comment for the two deliberate omissions (filter state, `total_cycles`).
-fn hashApu(hasher: *Sha256, a: *const apu_mod.Apu) void {
-    hashPulse(hasher, &a.pulse1);
-    hashPulse(hasher, &a.pulse2);
-
-    hasher.update(&[_]u8{
-        @intFromBool(a.triangle.enabled),            a.triangle.length_counter,
-        a.triangle.linear_counter,                   a.triangle.linear_reload_value,
-        @intFromBool(a.triangle.linear_reload_flag), @intFromBool(a.triangle.control_flag),
-        @as(u8, a.triangle.sequence_pos),
-    });
-    hasher.update(std.mem.asBytes(&a.triangle.timer_period));
-    hasher.update(std.mem.asBytes(&a.triangle.timer));
-
-    hasher.update(&[_]u8{ @intFromBool(a.noise.enabled), a.noise.length_counter });
-    hashEnvelope(hasher, &a.noise.envelope);
-    hasher.update(&[_]u8{ @intFromBool(a.noise.mode), a.noise.period_index });
-    hasher.update(std.mem.asBytes(&a.noise.shift_register));
-    hasher.update(std.mem.asBytes(&a.noise.timer));
-
-    hasher.update(&[_]u8{
-        @intFromBool(a.dmc.enabled),  @intFromBool(a.dmc.irq_enabled),
-        @intFromBool(a.dmc.loop),     a.dmc.rate_index,
-        a.dmc.output_level,           @intFromBool(a.dmc.silence),
-        a.dmc.bits_remaining,         a.dmc.shift_register,
-        @intFromBool(a.dmc.irq_flag),
-        // `?u8`: a byte waiting in the 1-byte sample buffer is real
-        // resume-critical state, and "empty" has to hash differently from
-        // "holding $00" -- hence the presence flag alongside the value.
-        @intFromBool(a.dmc.sample_buffer != null),
-        a.dmc.sample_buffer orelse 0,
-    });
-    hasher.update(std.mem.asBytes(&a.dmc.sample_address));
-    hasher.update(std.mem.asBytes(&a.dmc.sample_length));
-    hasher.update(std.mem.asBytes(&a.dmc.current_address));
-    hasher.update(std.mem.asBytes(&a.dmc.bytes_remaining));
-    hasher.update(std.mem.asBytes(&a.dmc.timer));
-
-    hasher.update(&[_]u8{
-        a.frame.mode,                   @intFromBool(a.frame.irq_inhibit),
-        @intFromBool(a.frame.irq_flag), @intFromBool(a.frame.half_frame_pending),
-        @intFromBool(a.even_cycle),
-    });
-    hasher.update(std.mem.asBytes(&a.frame.cycle));
-    hasher.update(std.mem.asBytes(&a.frame.reset_delay));
-    hasher.update(std.mem.asBytes(&a.frame.irq_reassert_remaining));
-}
-
-/// Shared by the two pulses and the noise channel -- all three carry the
-/// identical envelope unit (`apu.zig`'s `Envelope`), and a resume that
-/// restored only its decay level would resume at the wrong point in the
-/// decay ramp.
-fn hashEnvelope(hasher: *Sha256, e: *const apu_mod.Envelope) void {
-    hasher.update(&[_]u8{
-        @intFromBool(e.start),           @intFromBool(e.loop_flag),
-        @intFromBool(e.constant_volume), e.volume_or_period,
-        e.divider,                       e.decay,
-    });
-}
-
-fn hashPulse(hasher: *Sha256, p: *const apu_mod.Pulse) void {
-    hasher.update(&[_]u8{
-        @intFromBool(p.enabled), p.length_counter,
-        p.duty,                  @as(u8, p.sequence_pos),
-    });
-    hashEnvelope(hasher, &p.envelope);
-    // The whole sweep unit, not just its divider: the shift/negate/period
-    // fields decide the next target period, so a resume missing them
-    // resumes onto a different pitch slide.
-    hasher.update(&[_]u8{
-        @intFromBool(p.sweep_enabled), p.sweep_period,
-        @intFromBool(p.sweep_negate),  p.sweep_shift,
-        p.sweep_divider,               @intFromBool(p.sweep_reload),
-    });
-    hasher.update(std.mem.asBytes(&p.timer_period));
-    hasher.update(std.mem.asBytes(&p.timer));
-}
-
-/// See the module doc comment: CHR-RAM, PRG-RAM, and (ENG-80) cartridge
-/// nametable VRAM are the mutable-storage state worth hashing here, plus
-/// each cartridge's own bank/IRQ registers. `TestStub` is a CPU-test-only
-/// double (see `mapper.zig`), never reachable from a real ROM, so it isn't
-/// handled here.
-///
-/// **PRG-RAM (ENG-79)**: every variant now owns its own $6000-$7FFF storage
-/// instead of `Bus` owning one shared array, so it moved from `hashState`'s
-/// top level into this per-variant hash -- two runs differing only in WRAM
-/// contents, or (MMC1/MMC3) only in the state of a PRG-RAM disable/protect
-/// register, would otherwise hash identically. **Cartridge nametable VRAM
-/// (ENG-80)** is hashed on every variant for the same reason `Nrom.chr` is
-/// hashed unconditionally when it's RAM: it's live storage a four-screen
-/// board writes into, even though no variant here can currently select
-/// `.four_screen` mirroring from its own registers (`Mmc1`/`Mmc3`) or has a
-/// vendored four-screen ROM to exercise it (`Nrom`/`Uxrom`/`Cnrom`) -- see
-/// `docs/adr/0005-cartridge-owns-its-memory.md`.
-fn hashMapper(hasher: *Sha256, mapper: *const mapper_mod.Mapper) void {
-    switch (mapper.*) {
-        .nrom => |*n| {
-            if (n.chr_is_ram) hasher.update(&n.chr);
-        },
-        // MMC1 adds the first *registers* any cartridge here has had. They
-        // are as much emulation state as CHR-RAM is: two runs that diverge
-        // only in which bank is mapped would otherwise hash identically.
-        // `shift` and `last_write_cycle` are included because a
-        // half-completed 5-write sequence, and the consecutive-write rule's
-        // memory of the last write, both survive into the next instruction.
-        .mmc1 => |*m| {
-            if (m.chr_rom.len == 0) hasher.update(&m.chr_ram);
-            hasher.update(&[_]u8{ m.shift, m.control, m.chr_bank0, m.chr_bank1, m.prg_bank });
-            hasher.update(std.mem.asBytes(&m.cycle));
-            hasher.update(std.mem.asBytes(&m.last_write_cycle));
-            hasher.update(std.mem.asBytes(&m.prg_ram_size));
-        },
-        // MMC3 (M7d) adds a scanline IRQ with real timing state: two runs
-        // that diverge only in counter phase, A12 filter progress, or which
-        // bank is mapped would otherwise hash identically.
-        .mmc3 => |*m| {
-            if (m.chr_rom.len == 0) hasher.update(&m.chr_ram);
-            hasher.update(&m.bank_data);
-            hasher.update(&[_]u8{
-                m.bank_select,                         @intFromBool(m.mirror_horizontal),
-                m.irq_latch,                           m.irq_counter,
-                @intFromBool(m.irq_reload_pending),    @intFromBool(m.irq_enabled),
-                @intFromBool(m.irq_pending),           @intFromBool(m.a12),
-                @intFromBool(m.prg_ram_write_protect),
-            });
-            hasher.update(std.mem.asBytes(&m.a12_low_ticks));
-        },
-        // UxROM's CHR is always RAM (unlike NROM/MMC1, which can be either),
-        // and `prg_bank` is its one register -- both are emulation state two
-        // otherwise-identical runs could diverge in.
-        .uxrom => |*u| {
-            hasher.update(&u.chr_ram);
-            hasher.update(&[_]u8{u.prg_bank});
-        },
-        // CNROM has exactly one register (which CHR-ROM bank is selected)
-        // and no CHR-RAM to speak of -- see `mapper.zig`'s `Cnrom` doc
-        // comment. Two runs differing only in the selected bank would
-        // otherwise hash identically, same reasoning as MMC1's registers
-        // above.
-        .cnrom => |*c| {
-            hasher.update(&[_]u8{c.chr_bank});
-        },
-        .test_stub => {},
-    }
+/// machines directly -- e.g. to prove a specific field (PRG-RAM, CHR-RAM,
+/// an APU latch) actually moves the digest, without needing two full
+/// power-on runs that would otherwise stay bit-for-bit identical.
+fn hashState(m: *const Machine) Digest {
+    // The only failure mode is `NoSpace`, and `scratch` is `max_state_bytes`
+    // -- the size the format is defined not to exceed.
+    return savestate.hash(m, &scratch) catch unreachable;
 }
 
 test "assertDeterministic passes for a trivial NROM ROM run for a few thousand cycles" {
@@ -388,7 +113,11 @@ fn minimalNromBuf() [16 + 0x4000]u8 {
 }
 
 test "the hash changes if the cartridge's PRG-RAM (the vendored ROMs' \\$6000 result-code RAM) differs" {
-    // ENG-79: PRG-RAM moved from `Bus.prg_ram` onto the mapper itself.
+    // ENG-79 moved the *addressing* of $6000-$7FFF onto the mapper while
+    // leaving the bytes in `Bus.prg_ram`; `savestate.zig` carries the bytes
+    // in its `sram` section and the mapper's own addressing registers in
+    // its mapper section, so poking a byte here still has to move the
+    // digest.
     const buf = minimalNromBuf();
     var a_machine: Machine = undefined;
     try a_machine.init(&buf);
@@ -397,8 +126,8 @@ test "the hash changes if the cartridge's PRG-RAM (the vendored ROMs' \\$6000 re
     try b_machine.init(&buf);
     b_machine.bus.prg_ram[0] = 0xFF; // the only difference from a_machine
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -411,8 +140,8 @@ test "the hash changes if a CHR-RAM cartridge's CHR contents differ" {
     try b_machine.init(&buf);
     b_machine.bus.mapper.nrom.chr[0] = 0xFF; // the only difference from a_machine
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -428,8 +157,8 @@ test "the hash does NOT change if a CHR-ROM cartridge's CHR contents differ (ENG
     try b_machine.init(&full);
     b_machine.bus.mapper.nrom.chr[0] = 0xFF; // CHR-ROM: mutating the copy must not move the hash
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(std.mem.eql(u8, &a, &b));
 }
 
@@ -442,8 +171,8 @@ test "the hash changes if controller state (ENG-68) differs" {
     try b_machine.init(&buf);
     b_machine.bus.controllers[0].setButtons(0x01); // the only difference from a_machine
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -456,8 +185,8 @@ test "the hash changes if APU channel state (ENG-71) differs" {
     try b_machine.init(&buf);
     b_machine.bus.apu.pulse1.envelope.volume_or_period = 5; // the only difference
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -470,8 +199,8 @@ test "the APU hash covers sweep configuration, not just the sweep divider (ENG-7
     try b_machine.init(&buf);
     b_machine.bus.apu.pulse1.sweep_shift = 3; // decides the next target period
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -484,8 +213,8 @@ test "the APU hash distinguishes an empty DMC sample buffer from one holding 0x0
     try b_machine.init(&buf);
     b_machine.bus.apu.dmc.sample_buffer = 0x00; // was null
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 }
 
@@ -498,13 +227,31 @@ test "the APU hash covers the frame sequencer's pending-reset and deferred-half-
     try b_machine.init(&buf);
     b_machine.bus.apu.frame.half_frame_pending = true;
 
-    const a = hashState(&a_machine.cpu, &a_machine.bus);
-    const b = hashState(&b_machine.cpu, &b_machine.bus);
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
     try testing.expect(!std.mem.eql(u8, &a, &b));
 
     var c_machine: Machine = undefined;
     try c_machine.init(&buf);
     c_machine.bus.apu.frame.reset_delay = 3;
-    const c = hashState(&c_machine.cpu, &c_machine.bus);
+    const c = hashState(&c_machine);
     try testing.expect(!std.mem.eql(u8, &a, &c));
+}
+
+test "the hash does NOT change if only the APU's RC filter state differs (savestate.zig's one deliberate omission)" {
+    const buf = minimalNromBuf();
+    var a_machine: Machine = undefined;
+    try a_machine.init(&buf);
+
+    var b_machine: Machine = undefined;
+    try b_machine.init(&buf);
+    // A pure function of the mixed channel output both machines already
+    // agree on -- see `savestate.zig`'s module doc comment for why keeping
+    // `f32`s out of the digest is the point, not an oversight.
+    b_machine.bus.apu.lpf.prev_out = 0.25;
+    b_machine.bus.apu.output_sample = 0.5;
+
+    const a = hashState(&a_machine);
+    const b = hashState(&b_machine);
+    try testing.expect(std.mem.eql(u8, &a, &b));
 }
