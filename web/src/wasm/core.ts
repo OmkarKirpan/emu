@@ -4,9 +4,9 @@
 // wraps that instance's raw exports in a typed, memory-safety-aware
 // surface.
 import initCore from './nes_core.wasm?init'
-import { RomLoadError, RomStatus } from './errors'
+import { RomLoadError, RomStatus, SaveStateError, StateStatus } from './errors'
 
-export { RomLoadError, RomStatus }
+export { RomLoadError, RomStatus, SaveStateError, StateStatus }
 
 /** Framebuffer dimensions `get_framebuffer_ptr` (ENG-60) always describes. */
 export const FRAMEBUFFER_WIDTH = 256
@@ -33,7 +33,18 @@ interface CoreExports {
   get_audio_ring_control_ptr(): number
   get_audio_ring_capacity(): number
   step_audio_frame(): void
+  save_state(): number
+  get_state_ptr(): number
+  get_state_len(): number
+  load_state(ptr: number, len: number): number
+  get_rom_hash_ptr(): number
+  get_sram_ptr(): number
+  get_sram_len(): number
+  load_sram(ptr: number, len: number): number
 }
+
+/** SHA-256, so 32 bytes -- mirrors `savestate.zig`'s `rom_hash_len`. */
+const ROM_HASH_BYTES = 32
 
 /**
  * One instantiated core module, wrapping ENG-60's raw ABI. Two things this
@@ -151,6 +162,74 @@ export class NesCore {
    * them needing their own copy of the wasm export surface. */
   get memory(): WebAssembly.Memory {
     return this.exports.memory
+  }
+
+  // ------------------------------------------ save-states & SRAM (M8)
+
+  /** Serializes the whole machine and returns a copy of ENG-61's blob,
+   * ready to hand to IndexedDB. A copy for the same two reasons
+   * `viewFramebuffer` makes one -- a view over wasm memory can be detached
+   * by a later `alloc`, and `memory.buffer` is a `SharedArrayBuffer`, which
+   * `structuredClone` (and therefore IndexedDB) refuses to store. */
+  saveState(): Uint8Array<ArrayBuffer> {
+    this.check(this.exports.save_state())
+    const len = this.exports.get_state_len()
+    return new Uint8Array(new Uint8Array(this.exports.memory.buffer, this.exports.get_state_ptr(), len))
+  }
+
+  /** Restores a blob previously produced by `saveState`. Throws
+   * `SaveStateError` if it belongs to another ROM or mapper, or isn't a
+   * state this build can read -- see `wasm.zig`'s `load_state` for what a
+   * rejected state leaves the machine in. */
+  loadState(blob: Uint8Array): void {
+    this.withStaged(blob, (ptr, len) => this.check(this.exports.load_state(ptr, len)))
+  }
+
+  /** SHA-256 of the loaded ROM: the `rom_hash` half of ENG-61's
+   * `(rom_hash, slot)` persistence key, computed in the core so exactly one
+   * definition of ROM identity exists across Zig, this ABI and IndexedDB.
+   * Hex rather than raw bytes because it is used as a database key, where a
+   * string is directly comparable and inspectable. */
+  romHash(): string {
+    const bytes = new Uint8Array(this.exports.memory.buffer, this.exports.get_rom_hash_ptr(), ROM_HASH_BYTES)
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  }
+
+  /** A copy of the cartridge's battery-backed RAM ($6000-$7FFF), for the
+   * reserved `"sram"` slot. Copied for the same reasons `saveState` copies.
+   * Empty before any ROM is loaded (there is no cartridge to have RAM). */
+  sram(): Uint8Array<ArrayBuffer> {
+    const ptr = this.exports.get_sram_ptr()
+    if (ptr === 0) return new Uint8Array(0)
+    return new Uint8Array(new Uint8Array(this.exports.memory.buffer, ptr, this.exports.get_sram_len()))
+  }
+
+  /** Restores previously-persisted SRAM. Call right after `loadRom` and
+   * before the first `stepFrame`, mirroring a real cartridge's battery
+   * being present from power-on. A record of the wrong length is rejected
+   * rather than partially applied. */
+  loadSram(bytes: Uint8Array): void {
+    this.withStaged(bytes, (ptr, len) => this.check(this.exports.load_sram(ptr, len)))
+  }
+
+  private check(status: number): void {
+    if (status !== StateStatus.Ok) {
+      throw new SaveStateError(status as StateStatus, this.exports.get_last_error_context())
+    }
+  }
+
+  /** ENG-60's `alloc`/copy-in/`free` staging dance, shared by everything
+   * that hands the core a byte buffer -- `loadRom` predates it and keeps
+   * its own copy only because its error type differs. */
+  private withStaged(bytes: Uint8Array, consume: (ptr: number, len: number) => void): void {
+    const ptr = this.exports.alloc(bytes.length)
+    if (ptr === 0) throw new Error('wasm alloc() failed (out of memory)')
+    try {
+      new Uint8Array(this.exports.memory.buffer, ptr, bytes.length).set(bytes)
+      consume(ptr, bytes.length)
+    } finally {
+      this.exports.free(ptr, bytes.length)
+    }
   }
 
   /** A copy, not a live view, of the wasm-side framebuffer -- for two

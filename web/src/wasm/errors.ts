@@ -63,3 +63,63 @@ export class RomLoadError extends Error {
     }
   }
 }
+
+/**
+ * The save-state and SRAM half of the same `i32` status table (M8, ENG-76)
+ * -- `core/src/wasm.zig`'s doc comment remains the source of truth for both.
+ *
+ * Kept separate from `RomStatus` rather than merged into one union because
+ * the two describe different operations: nothing that loads a ROM can
+ * return `StateMapperMismatch`, and nothing that loads a state can return
+ * `UnsupportedMapper`. A single table would let a caller `switch` on a code
+ * the call it made cannot produce.
+ */
+export const StateStatus = {
+  Ok: 0,
+  /** A save-state or SRAM call arrived before any ROM was loaded. */
+  NoRom: -5,
+  /** Wrong magic, a `format_version` from the future, or truncated. */
+  BadState: -6,
+  /** Saved under a different mapper than the loaded ROM uses; `context` is
+   * the mapper id the *state* named. */
+  MapperMismatch: -7,
+  /** Saved against a different ROM entirely. */
+  RomMismatch: -8,
+  /** The state exceeded the core's static buffer -- unreachable for any
+   * cartridge this core supports; `context` is the cap. */
+  TooLarge: -9,
+} as const
+export type StateStatus = (typeof StateStatus)[keyof typeof StateStatus]
+
+/** Thrown by `NesCore.saveState`/`loadState`/`loadSram` for any non-`Ok`
+ * status, carrying the raw code and `get_last_error_context()`'s reading,
+ * exactly like `RomLoadError` does for ROM loading. */
+export class SaveStateError extends Error {
+  readonly status: StateStatus
+  readonly context: number
+
+  constructor(status: StateStatus, context: number) {
+    super(SaveStateError.describe(status, context))
+    this.name = 'SaveStateError'
+    this.status = status
+    this.context = context
+  }
+
+  private static describe(status: StateStatus, context: number): string {
+    switch (status) {
+      case StateStatus.NoRom:
+        return 'No ROM is loaded, so there is no machine to save or restore.'
+      case StateStatus.BadState:
+        return `Not a save-state this build can read (or a ${context}-byte record was expected).`
+      case StateStatus.MapperMismatch:
+        return `This save-state was made on a mapper-${context} cartridge, which is not the one loaded.`
+      case StateStatus.RomMismatch:
+        return 'This save-state belongs to a different ROM.'
+      case StateStatus.TooLarge:
+        return `The machine state exceeded the core's ${context}-byte buffer.`
+      default:
+        // See `RomLoadError.describe`'s matching comment.
+        return `Save-state operation failed (status ${status}).`
+    }
+  }
+}

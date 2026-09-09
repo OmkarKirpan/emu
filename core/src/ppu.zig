@@ -117,7 +117,7 @@ pub fn physicalNametable(mirroring: Mirroring, logical: u2) PhysicalNametable {
 /// static column and `outputPixel` computes `col - x` directly each dot,
 /// which is behaviorally identical to shifting for a value nothing re-reads
 /// mid-scanline.
-const SpriteUnit = struct {
+pub const SpriteUnit = struct {
     /// Screen column of the sprite's leftmost pixel.
     x: u8 = 0,
     /// This sprite's two pattern-table bitplanes for the current scanline's

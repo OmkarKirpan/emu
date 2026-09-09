@@ -35,9 +35,37 @@
 //!     bytes were actually supplied)
 //!   * `-4` -- `RomTooLarge` (`get_last_error_context()` is `max_rom_bytes`,
 //!     the cap that was exceeded)
+//!   * `-5` -- `NoRom` (a save-state or SRAM call arrived before any
+//!     successful `load_rom` -- `get_last_error_context()` is `0`)
+//!   * `-6` -- `BadState` (the blob is not a save-state this build can
+//!     read: wrong magic, a `format_version` from the future, or truncated
+//!     -- `get_last_error_context()` is `0`)
+//!   * `-7` -- `StateMapperMismatch` (the state was saved under a different
+//!     mapper than the loaded ROM uses -- `get_last_error_context()` is the
+//!     mapper id the *state* named)
+//!   * `-8` -- `StateRomMismatch` (the state was saved against a different
+//!     ROM; PRG/CHR-ROM are not in the state, so applying it would resume a
+//!     CPU into unrelated code -- `get_last_error_context()` is `0`)
+//!   * `-9` -- `StateTooLarge` (a state did not fit `savestate.max_state_bytes`;
+//!     unreachable for any cartridge this core supports, returned rather
+//!     than asserted so a future oversized mapper is a host-visible error
+//!     instead of a trap -- `get_last_error_context()` is the cap)
+//!
+//! ## Save-states and SRAM (M8, ENG-76)
+//! `save_state`/`get_state_ptr`/`get_state_len`/`load_state` move ENG-61's
+//! TLV blob across the boundary through one static buffer, the same shape
+//! as the framebuffer: the host never sizes anything, it reads
+//! `(ptr, len)` after a successful `save_state`. `get_rom_hash_ptr` exposes
+//! the SHA-256 of the currently-loaded ROM -- ENG-61 keys IndexedDB on
+//! `(rom_hash, slot)`, and computing it here rather than in JS keeps one
+//! definition of ROM identity across the Zig core, this ABI and the host's
+//! database. `get_sram_ptr`/`get_sram_len`/`load_sram` are the battery-
+//! backed cartridge RAM on its own, for the reserved `"sram"` slot, which
+//! is persisted on a different schedule from a whole save-state.
 
 const std = @import("std");
 const core = @import("root.zig");
+const savestate = @import("savestate.zig");
 const palette = @import("palette.zig");
 const audio_ring = @import("audio_ring.zig");
 
@@ -46,6 +74,11 @@ const status_invalid_header: i32 = -1;
 const status_unsupported_mapper: i32 = -2;
 const status_truncated_data: i32 = -3;
 const status_rom_too_large: i32 = -4;
+const status_no_rom: i32 = -5;
+const status_bad_state: i32 = -6;
+const status_state_mapper_mismatch: i32 = -7;
+const status_state_rom_mismatch: i32 = -8;
+const status_state_too_large: i32 = -9;
 
 /// Generously above NROM's own ~40KB ceiling (16-byte header + 32KB PRG +
 /// 8KB CHR) to leave headroom for M7's MMC1/UxROM/CNROM/MMC3 without this
@@ -72,6 +105,22 @@ var g_machine: core.Machine = undefined;
 var g_loaded: bool = false;
 
 var g_last_error_context: u32 = 0;
+
+/// How much of `rom_storage` the loaded ROM occupies. `savestate.load`
+/// re-boots the machine from these exact bytes (that is how PRG/CHR-ROM come
+/// back), so the slice has to be recoverable, not just the buffer.
+var g_rom_len: u32 = 0;
+
+/// SHA-256 of the loaded ROM -- ENG-61's persistence key half. Refreshed by
+/// `load_rom`, read by the host through `get_rom_hash_ptr`.
+var g_rom_hash: savestate.RomHash = [_]u8{0} ** savestate.rom_hash_len;
+
+/// The one staging buffer save-states cross the boundary in, in both
+/// directions. Static rather than `alloc`'d for the same reason
+/// `rgba_framebuffer` is: the host reads `(get_state_ptr, get_state_len)`
+/// after a successful `save_state` and never has to size anything itself.
+var g_state: [savestate.max_state_bytes]u8 = undefined;
+var g_state_len: u32 = 0;
 
 const pixel_count = @typeInfo(@FieldType(core.Ppu, "framebuffer")).array.len;
 
@@ -150,6 +199,8 @@ export fn load_rom(ptr: u32, len: u32) i32 {
     if (validate(src)) |err_status| return err_status;
 
     @memcpy(rom_storage[0..len], src);
+    g_rom_len = len;
+    g_rom_hash = savestate.romHash(rom_storage[0..len]);
     // Byte-identical to what `validate` just proved parses cleanly.
     g_machine.init(rom_storage[0..len]) catch unreachable;
     g_loaded = true;
@@ -255,4 +306,124 @@ fn resolveFramebuffer() void {
     for (&g_machine.bus.ppu.framebuffer, &rgba_framebuffer) |index, *out| {
         out.* = palette.rgba[index & 0x3F];
     }
+}
+
+// ------------------------------------------- save-states & SRAM (M8)
+
+/// Serializes the whole machine into this module's static state buffer.
+/// On success the host reads the blob at `(get_state_ptr, get_state_len)`
+/// and persists it under `(get_rom_hash_ptr, slot)` -- see ENG-61.
+///
+/// The buffer is overwritten by the next `save_state`, so a host that wants
+/// two states at once copies the first out before asking for the second.
+export fn save_state() i32 {
+    if (!g_loaded) {
+        g_last_error_context = 0;
+        return status_no_rom;
+    }
+    const n = savestate.save(&g_machine, g_rom_hash, &g_state) catch {
+        g_state_len = 0;
+        g_last_error_context = savestate.max_state_bytes;
+        return status_state_too_large;
+    };
+    g_state_len = @intCast(n);
+    return status_ok;
+}
+
+export fn get_state_ptr() u32 {
+    return @intCast(@intFromPtr(&g_state));
+}
+
+/// Valid only after a `save_state` that returned `0`; zero otherwise.
+export fn get_state_len() u32 {
+    return g_state_len;
+}
+
+/// Restores a previously-saved blob, staged in via `alloc` like `load_rom`.
+///
+/// **A rejected state does not leave the machine half-restored, but a
+/// rejected-late one does leave it power-on reset.** `savestate.load`
+/// checks the ROM hash before touching anything, then re-boots from
+/// `rom_storage` (that is what puts PRG/CHR-ROM back) before applying
+/// sections -- so the two failures that can still occur past that point, a
+/// forged mapper id and a truncated body, land on a freshly-booted console
+/// rather than a corrupted one. Documented rather than papered over: the
+/// alternative (snapshotting the live machine first, to roll back to) costs
+/// a second `Machine` in linear memory to defend against a blob no honest
+/// host produces.
+export fn load_state(ptr: u32, len: u32) i32 {
+    if (!g_loaded) {
+        g_last_error_context = 0;
+        return status_no_rom;
+    }
+    const blob = @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    savestate.load(&g_machine, rom_storage[0..g_rom_len], blob) catch |err| switch (err) {
+        error.MapperMismatch => {
+            // The id the *state* named -- the useful half of the mismatch,
+            // since the host can already see which ROM it loaded.
+            g_last_error_context = if (len > 8) blob[8] else 0;
+            return status_state_mapper_mismatch;
+        },
+        error.RomMismatch => {
+            g_last_error_context = 0;
+            return status_state_rom_mismatch;
+        },
+        // `BadMagic`, `UnsupportedVersion`, `Truncated`, and `Machine.init`'s
+        // own errors -- which cannot fire here, since `rom_storage` already
+        // parsed cleanly in `load_rom`. All of them mean the same thing to a
+        // host: this blob is not a state this build can apply.
+        else => {
+            g_last_error_context = 0;
+            return status_bad_state;
+        },
+    };
+    return status_ok;
+}
+
+/// SHA-256 of the loaded ROM: 32 bytes, the `rom_hash` half of ENG-61's
+/// `(rom_hash, slot)` persistence key. Zero-filled before the first
+/// successful `load_rom`.
+export fn get_rom_hash_ptr() u32 {
+    return @intCast(@intFromPtr(&g_rom_hash));
+}
+
+/// Battery-backed cartridge RAM ($6000-$7FFF), exposed directly rather than
+/// copied: the host reads these bytes to persist ENG-61's reserved `"sram"`
+/// slot, on its own schedule, without serializing a whole machine. `0`
+/// before any ROM is loaded, since there is no cartridge to have RAM.
+export fn get_sram_ptr() u32 {
+    if (!g_loaded) return 0;
+    return @intCast(@intFromPtr(&g_machine.bus.prg_ram));
+}
+
+/// The *addressable* size, not the whole `Bus.prg_ram` buffer: ENG-79 sized
+/// that at a flat 32KB for access speed, while all but MMC1's SOROM/SXROM
+/// boards carry 8KB. Persisting the buffer would store 24KB of guaranteed
+/// zeroes per cartridge. `0` before any ROM is loaded, matching
+/// `get_sram_ptr`.
+export fn get_sram_len() u32 {
+    if (!g_loaded) return 0;
+    return @intCast(savestate.prgRamBytes(&g_machine.bus.mapper));
+}
+
+/// Restores previously-persisted SRAM, staged in via `alloc`. Called right
+/// after `load_rom` and before the first `step_frame`, mirroring a real
+/// cartridge's battery being present from power-on.
+///
+/// A `len` other than the full 8KB is rejected rather than partially
+/// applied: a short record means the stored data is not this cartridge's
+/// SRAM, and half-restoring a save file is worse than not restoring it.
+export fn load_sram(ptr: u32, len: u32) i32 {
+    if (!g_loaded) {
+        g_last_error_context = 0;
+        return status_no_rom;
+    }
+    const expected = get_sram_len();
+    if (len != expected) {
+        g_last_error_context = expected;
+        return status_bad_state;
+    }
+    const src = @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    @memcpy(&g_machine.bus.prg_ram, src);
+    return status_ok;
 }
