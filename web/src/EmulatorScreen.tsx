@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
+import { SaveStates } from './SaveStates'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
 import { useRomLoader } from './useRomLoader'
@@ -252,6 +253,10 @@ export function EmulatorScreen() {
         </p>
       )}
       <AudioOutput worker={worker} />
+      {/* Rendered unconditionally, enabled only once the ROM is running:
+          the panel is part of the page's shape, and having it appear late
+          would reflow everything below it mid-boot. */}
+      <SaveStates worker={worker} enabled={status.kind === 'running'} />
     </>
   )
 }
