@@ -18,6 +18,8 @@
     "verify-headers:local": "node scripts/verify-headers-local.mjs"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

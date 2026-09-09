@@ -80,21 +80,28 @@ export function SaveStates({ worker, enabled }: SaveStatesProps) {
             <li key={slot} className="slot" data-slot={slot} data-occupied={saved ? 'yes' : 'no'}>
               <span className="slot-name">Slot {slot}</span>
               <span className="slot-when">{saved ? formatWhen(saved.savedAt) : 'empty'}</span>
-              <button type="button" onClick={() => send('save-state', slot)} disabled={!enabled}>
-                Save
-              </button>
-              <button type="button" onClick={() => send('load-state', slot)} disabled={!enabled || !saved}>
-                Load
-              </button>
-              <button
-                type="button"
-                className="slot-delete"
-                aria-label={`Delete slot ${slot}`}
-                onClick={() => send('delete-state', slot)}
-                disabled={!enabled || !saved}
-              >
-                ×
-              </button>
+              {/* Grouped rather than three loose grid children: below the
+                  narrow breakpoint the row has to break between the labels
+                  and the controls, and a wrapper is what lets the three of
+                  them move to a second line together instead of the grid
+                  shrinking each tap target to fit. */}
+              <span className="slot-actions">
+                <button type="button" onClick={() => send('save-state', slot)} disabled={!enabled}>
+                  Save
+                </button>
+                <button type="button" onClick={() => send('load-state', slot)} disabled={!enabled || !saved}>
+                  Load
+                </button>
+                <button
+                  type="button"
+                  className="slot-delete"
+                  aria-label={`Delete slot ${slot}`}
+                  onClick={() => send('delete-state', slot)}
+                  disabled={!enabled || !saved}
+                >
+                  ×
+                </button>
+              </span>
             </li>
           )
         })}

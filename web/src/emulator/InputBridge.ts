@@ -1,8 +1,9 @@
 import { KeyboardController } from '../wasm/controller'
 import { GamepadController } from '../wasm/gamepad'
+import { TouchController } from '../wasm/touch'
 
 /**
- * Publishes the merged keyboard | gamepad button byte into a shared
+ * Publishes the merged keyboard | gamepad | touch button byte into a shared
  * `Int32Array` via `Atomics.store`, polled once per `requestAnimationFrame`
  * tick on the main thread -- the same lock-free-shared-memory idiom the
  * audio ring buffer uses (ENG-62), reused here so a keypress reaches
@@ -17,6 +18,10 @@ import { GamepadController } from '../wasm/gamepad'
 export class InputBridge {
   private readonly keyboard = new KeyboardController()
   private readonly gamepad = new GamepadController()
+  /** Public, unlike its two siblings: this one has no event source of its
+   * own to listen to, so `TouchControls.tsx` pushes pointer state straight
+   * into it. See `wasm/touch.ts`. */
+  readonly touch = new TouchController()
   private readonly shared: Int32Array
   private rafHandle: number
 
@@ -28,7 +33,7 @@ export class InputBridge {
   constructor(shared: Int32Array) {
     this.shared = shared
     const tick = () => {
-      Atomics.store(this.shared, 0, this.keyboard.read() | this.gamepad.read())
+      Atomics.store(this.shared, 0, this.keyboard.read() | this.gamepad.read() | this.touch.read())
       this.rafHandle = requestAnimationFrame(tick)
     }
     this.rafHandle = requestAnimationFrame(tick)
@@ -37,5 +42,6 @@ export class InputBridge {
   dispose(): void {
     cancelAnimationFrame(this.rafHandle)
     this.keyboard.dispose()
+    this.touch.clear()
   }
 }
