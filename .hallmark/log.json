@@ -1,0 +1,13 @@
+[
+  {
+    "date": "2026-09-10",
+    "genre": "atmospheric",
+    "macrostructure": "Workbench",
+    "theme": "Terminal",
+    "theme_axes": "dark / mono / chromatic-other",
+    "nav": "N8 terminal command",
+    "footer": "Ft2 inline single line",
+    "enrichment": "none (typography only)",
+    "brief": "emu · NES emulator app shell, playable on iPhone / laptop / PC; adds on-screen touch gamepad"
+  }
+]

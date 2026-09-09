@@ -101,7 +101,7 @@ describe('the Worker reply', () => {
     fireEvent.change(pickerInput(), { target: { files: [romFile('zelda.nes', [1])] } })
     reply({ type: 'rom-loaded', ok: true })
 
-    expect(await screen.findByText('now playing: zelda.nes')).toBeTruthy()
+    expect(await screen.findByText('cartridge · zelda.nes')).toBeTruthy()
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
@@ -128,7 +128,7 @@ describe('the Worker reply', () => {
 
     await waitFor(() => {
       expect(screen.queryByRole('alert')).toBeNull()
-      expect(screen.queryByText(/now playing/)).toBeNull()
+      expect(screen.queryByText(/cartridge/)).toBeNull()
     })
   })
 })

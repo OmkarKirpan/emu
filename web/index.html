@@ -3,7 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- `viewport-fit=cover` so the layout can reach under the iPhone's
+         notch and home indicator; `env(safe-area-inset-*)` in `App.css`
+         keeps the controls out from under them. `user-scalable=no` is
+         deliberately absent -- pinch-zoom stays available, and the game
+         area defends itself with `touch-action: none` instead. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- The sRGB resolution of `--color-paper` (oklch(15% 0.012 148)).
+         Duplicated as a hex because `<meta>` takes no custom properties;
+         if the token moves, this moves with it. Without it iOS paints the
+         status bar and Android the system chrome in white above a dark
+         page. -->
+    <meta name="theme-color" content="#080d08" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="description" content="A cycle-accurate NES emulator compiled to WebAssembly. Runs in the browser on phone, laptop and desktop." />
     <title>NES emulator</title>
   </head>
   <body>

@@ -1,0 +1,102 @@
+/* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Terminal
+ * enrichment: none (typography only) · nav: N8 · footer: Ft2
+ * tone: technical · anchor hue: 148 (phosphor green)
+ * axes: paper=dark · display=mono · accent=chromatic-other
+ * pre-emit critique: P5 H5 E4 S5 R5 V4
+ *
+ * The portable token layer. Every colour, size, duration and easing in the
+ * app resolves through a name declared here -- nothing downstream inlines a
+ * raw value. Split out of `index.css` so the system can be lifted wholesale
+ * into another project.
+ */
+
+:root {
+  /* --- Colour ------------------------------------------------------ */
+  /* Dark paper is not a mood pick here. The emulator's whole output is a
+     256x240 framebuffer of saturated pixel art; a light surround raises the
+     eye's adaptation point and flattens the perceived contrast of the very
+     thing the page exists to show. The room goes dark so the screen can be
+     bright. */
+  --color-paper: oklch(15% 0.012 148);
+  --color-paper-2: oklch(19% 0.013 148); /* raised: rail, controls, pads */
+  --color-paper-3: oklch(24% 0.014 148); /* hover / pressed */
+  --color-rule: oklch(32% 0.012 148);
+  --color-neutral: oklch(60% 0.010 148); /* meta, timestamps */
+  --color-muted: oklch(74% 0.008 148); /* secondary copy */
+  --color-ink: oklch(93% 0.008 148); /* primary copy */
+
+  /* One accent, phosphor green, kept under ~3% of any viewport: the prompt
+     glyph, focus rings, pressed states, the occupied-slot marker, the bloom.
+     Never a fill on anything large -- a green wash next to a game's own
+     palette fights it. */
+  --color-accent: oklch(78% 0.17 148);
+  --color-accent-dim: oklch(55% 0.10 148);
+  --color-focus: oklch(82% 0.17 148);
+  /* The one non-anchor hue in the palette. Errors have to read as *not*
+     phosphor, or they disappear into the theme. */
+  --color-danger: oklch(74% 0.14 25);
+
+  /* Two alpha values, named. Transparency is a modifier here, not a colour
+     in the palette -- the scrim dims the framebuffer behind a fatal error,
+     the bloom is the light a CRT throws into the room. */
+  --color-scrim: oklch(15% 0.012 148 / 0.82);
+  --bloom: radial-gradient(
+    60% 45% at 50% 32%,
+    oklch(78% 0.17 148 / 0.07) 0%,
+    oklch(78% 0.17 148 / 0) 100%
+  );
+
+  /* --- Type -------------------------------------------------------- */
+  /* Two families, under the 2+1 ceiling. Mono carries display and every
+     machine-legible readout (slot times, byte counts, ring fill); the sans
+     carries anything a person reads as a sentence. */
+  --font-display: 'JetBrains Mono Variable', ui-monospace, monospace;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, monospace;
+  --font-body: 'Geist Variable', system-ui, sans-serif;
+
+  /* 1.25 major third off a 16px base. */
+  --text-xs: 0.64rem;
+  --text-sm: 0.8rem;
+  --text-base: 1rem;
+  --text-md: 1.25rem;
+  --text-lg: 1.5625rem;
+  --text-xl: 1.9531rem;
+  --text-2xl: 2.4414rem;
+
+  /* Light text on dark reads optically heavier; the body weight drops 50
+     units to compensate (400 -> 350). */
+  --weight-body: 350;
+  --weight-display: 700;
+
+  /* --- Space ------------------------------------------------------- */
+  --space-3xs: 0.125rem;
+  --space-2xs: 0.25rem;
+  --space-xs: 0.5rem;
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+
+  --page-gutter: clamp(1rem, 4vw, 2.5rem);
+
+  /* --- Line, radius ------------------------------------------------ */
+  --rule-hair: 1px;
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-pill: 999px;
+
+  /* --- Motion ------------------------------------------------------ */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long: 420ms;
+
+  /* --- Depth ------------------------------------------------------- */
+  --z-base: 1;
+  --z-raised: 10;
+  --z-sticky: 200;
+}

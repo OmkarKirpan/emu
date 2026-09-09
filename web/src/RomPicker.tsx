@@ -15,11 +15,15 @@ import type { RomLoad } from './useRomLoader'
  */
 export function RomPicker({ onPick, disabled }: { onPick: (file: File) => void; disabled: boolean }) {
   return (
-    <label className="rom-picker">
-      Load ROM…
+    <label className="rom-picker flag">
+      --rom
       <input
         type="file"
         accept=".nes"
+        // The visible label is the CLI flag the app bar is typeset around;
+        // `--rom` read aloud is not a label. The accessible name says what
+        // the control does, the visible text says where it lives.
+        aria-label="Load ROM"
         disabled={disabled}
         onChange={(event) => {
           const file = event.target.files?.[0]
@@ -37,7 +41,7 @@ export function RomPicker({ onPick, disabled }: { onPick: (file: File) => void; 
 /** The load readout: what's playing, or why the last pick didn't take. */
 export function RomLoadReadout({ romLoad, onDismiss }: { romLoad: RomLoad | null; onDismiss: () => void }) {
   if (!romLoad) return null
-  if (!romLoad.error) return <p className="rom-readout">now playing: {romLoad.name}</p>
+  if (!romLoad.error) return <p className="rom-readout">cartridge &#183; {romLoad.name}</p>
   return (
     <p className="rom-error" role="alert">
       <span>

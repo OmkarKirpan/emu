@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import { SaveStates } from './SaveStates'
+import { TouchControls } from './TouchControls'
+import type { TouchController } from './wasm/touch'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
 import { useRomLoader } from './useRomLoader'
@@ -69,6 +71,13 @@ export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [status, setStatus] = useState<Status>({ kind: 'loading' })
   const [worker, setWorker] = useState<Worker | null>(null)
+  /** The session's touch controller, surfaced as state (not read off
+   * `sessionRef`) so `TouchControls` re-renders once it exists -- a ref
+   * mutation wouldn't. */
+  const [touch, setTouch] = useState<TouchController | null>(null)
+  /** The element that goes fullscreen: the stage, so the on-screen pad
+   * comes with the canvas rather than being left behind outside it. */
+  const stageRef = useRef<HTMLDivElement>(null)
   /** ENG-77's runtime ROM loading. Owns its own Worker listener and state
    * (see `useRomLoader.ts`); this component only places the controls and
    * hands the drop handlers to the canvas wrapper. */
@@ -87,6 +96,16 @@ export function EmulatorScreen() {
     worker?.postMessage({ type: 'reset' })
     canvasRef.current?.focus()
   }, [worker])
+
+  /** Fullscreen the stage, or leave it. Rendered conditionally on
+   * `document.fullscreenEnabled` rather than offered-and-failing: iPhone
+   * Safari supports the Fullscreen API on no element at all, so on the
+   * device that would benefit most the honest move is to not show a button
+   * that cannot work, and let the layout fill the viewport instead. */
+  const toggleFullscreen = useCallback(() => {
+    if (document.fullscreenElement) void document.exitFullscreen()
+    else void stageRef.current?.requestFullscreen()
+  }, [])
 
   useEffect(() => {
     const canvas = canvasRef.current
@@ -165,6 +184,7 @@ export function EmulatorScreen() {
     // `startAudio`'s message queue on the Worker side (see
     // `emulatorWorker.ts`) already covers a click racing the boot sequence.
     setWorker(emulatorWorker)
+    setTouch(session.inputBridge.touch)
 
     // Guarded because a StrictMode remount re-runs this effect against a
     // Worker that already has the ROM: sending `'start'` twice would
@@ -222,41 +242,72 @@ export function EmulatorScreen() {
 
   return (
     <>
+      {/* N8 terminal-command nav. The flags are real controls, not links
+          styled to look like a CLI: `--rom` is the file input, `--reset`
+          drives the RESET line. Typeset as a command because this *is* a
+          developer tool and the vocabulary is honest here; the hit targets
+          underneath are ordinary buttons, sized for a thumb. */}
+      <header className="appbar">
+        <p className="appbar-line">
+          <span className="appbar-prompt" aria-hidden="true">&gt;</span>
+          <span className="appbar-name">nes</span>
+          <RomPicker onPick={loadFile} disabled={status.kind !== 'running'} />
+          <button type="button" className="flag reset" onClick={handleReset} disabled={status.kind !== 'running'}>
+            --reset
+          </button>
+          {document.fullscreenEnabled && (
+            <button type="button" className="flag" onClick={toggleFullscreen}>
+              --fullscreen
+            </button>
+          )}
+          <span className="appbar-caret" aria-hidden="true">
+            &#9612;
+          </span>
+        </p>
+      </header>
+
       {/* The drop target is the canvas wrapper, not the canvas itself:
           the canvas is an inert placeholder once transferred to the Worker
           (ENG-57), and a wrapper-level highlight can outline the whole
           screen without fighting the canvas's own border. */}
-      <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
-        <canvas
-          ref={canvasRef}
-          width={FRAMEBUFFER_WIDTH}
-          height={FRAMEBUFFER_HEIGHT}
-          className="screen-canvas"
-          aria-label="NES output"
-        />
-        {status.kind === 'loading' && <p className="screen-overlay">Loading…</p>}
-        {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
+      <div className="stage" ref={stageRef}>
+        <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
+          <canvas
+            ref={canvasRef}
+            width={FRAMEBUFFER_WIDTH}
+            height={FRAMEBUFFER_HEIGHT}
+            className="screen-canvas"
+            aria-label="NES output"
+          />
+          {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
+          {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
+        </div>
+        <TouchControls touch={touch} />
       </div>
-      <div className="screen-controls">
-        <button type="button" className="reset" onClick={handleReset} disabled={status.kind !== 'running'}>
-          Reset
-        </button>
-        <RomPicker onPick={loadFile} disabled={status.kind !== 'running'} />
-      </div>
-      <RomLoadReadout romLoad={romLoad} onDismiss={dismiss} />
-      {/* Which backend actually engaged isn't inferable from the browser
-          (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
-          `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}
-      {status.kind === 'running' && (
-        <p className="renderer-readout" data-renderer={status.renderer}>
-          renderer: {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
-        </p>
-      )}
-      <AudioOutput worker={worker} />
-      {/* Rendered unconditionally, enabled only once the ROM is running:
-          the panel is part of the page's shape, and having it appear late
-          would reflow everything below it mid-boot. */}
-      <SaveStates worker={worker} enabled={status.kind === 'running'} />
+
+      <aside className="rail">
+        {/* Audio leads the rail because on a phone it is a required
+            gesture, not a preference -- iOS will not start an AudioContext
+            without one, so the button has to be somewhere a thumb lands. */}
+        <AudioOutput worker={worker} />
+
+        <div className="status">
+          <RomLoadReadout romLoad={romLoad} onDismiss={dismiss} />
+          {/* Which backend actually engaged isn't inferable from the browser
+              (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
+              `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}
+          {status.kind === 'running' && (
+            <p className="renderer-readout" data-renderer={status.renderer}>
+              renderer &#183; {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
+            </p>
+          )}
+        </div>
+
+        {/* Rendered unconditionally, enabled only once the ROM is running:
+            the panel is part of the page's shape, and having it appear late
+            would reflow everything below it mid-boot. */}
+        <SaveStates worker={worker} enabled={status.kind === 'running'} />
+      </aside>
     </>
   )
 }

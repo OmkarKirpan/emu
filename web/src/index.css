@@ -1,79 +1,111 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
+/* Hallmark · genre: atmospheric · macrostructure: Workbench · theme: Terminal
+ * Base layer: reset, document ground, element defaults. Component styling
+ * lives in `App.css`; every value here resolves through `tokens.css`.
+ */
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/* Self-hosted, not the Google Fonts CDN. This app ships COEP
+   `require-corp` (see `vite.config.ts`) so it can hold a `SharedArrayBuffer`;
+   under that policy every cross-origin subresource has to carry CORP, which
+   fonts.gstatic.com does not reliably do -- a CDN webfont here is a font
+   that silently fails to load in production and a subresource
+   `scripts/check-headers.mjs` would flag. Bundling them makes them
+   same-origin and the question disappears. */
+@import '@fontsource-variable/jetbrains-mono';
+@import '@fontsource-variable/geist';
+@import './tokens.css';
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-  }
-}
-
-#root {
-  width: 100%;
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+}
+
+html,
+body {
+  /* `clip`, not `hidden`: `hidden` would open a scroll container and break
+     `position: sticky` on the app bar. */
+  overflow-x: clip;
+  /* Stops iOS rubber-band bounce dragging the console out from under a
+     thumb that was aiming for the D-pad. */
+  overscroll-behavior: none;
 }
 
 body {
   margin: 0;
+  background: var(--color-paper);
+  color: var(--color-muted);
+  font: var(--weight-body) var(--text-base) / 1.55 var(--font-body);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color-scheme: dark;
+}
+
+/* The one atmospheric move on the page, and it has a referent: a CRT emits
+   light into the room around it. A single fixed radial, sat behind the
+   stage, no animation. Not a decorative aurora blob -- it is positioned
+   where the screen is and nowhere else. */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: var(--bloom);
+}
+
+#root {
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
 }
 
 h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-  text-align: center;
-}
-
-h1 {
-  font-size: 40px;
-  letter-spacing: -1.2px;
-  margin: 8px 0;
-  @media (max-width: 1024px) {
-    font-size: 28px;
-  }
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: var(--weight-display);
+  font-style: normal;
+  color: var(--color-ink);
+  margin: 0;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 p {
   margin: 0;
 }
 
-code {
-  font-family: var(--mono);
-  font-size: 15px;
-  line-height: 135%;
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-  padding: 4px 8px;
-  background: var(--code-bg);
+/* Clickable text is a single-line object. The parent reflows; the label
+   does not wrap. */
+button,
+.rom-picker,
+.colophon a {
+  white-space: nowrap;
+}
+
+:focus-visible {
+  /* Never transitioned -- a ring that fades in leaves a keyboard user with
+     no indicator for the length of the fade. */
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Numbers that sit in columns -- slot timestamps, ring fill, byte counts --
+   have to align vertically or the readout reads as noise. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 150ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 150ms !important;
+  }
 }
