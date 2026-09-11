@@ -66,35 +66,59 @@ fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
 }
 
 /// The three `dmc_dma_during_read4` ROMs and both `sprdma_and_dmc_dma`
-/// ROMs that this model does not yet satisfy, each with what it actually
-/// reports. They are vendored, wired up and run here deliberately rather
-/// than left out: the gap is now a measured number instead of the
-/// unmeasured "not implemented" `apu.zig` carried since M6, and whoever
-/// closes it gets the failing output without re-deriving the setup.
+/// ROMs this model does not yet satisfy. They are vendored, wired up and
+/// run here deliberately rather than left out: the gap is now a measured
+/// number instead of the unmeasured "not implemented" `apu.zig` carried
+/// since M6.
 ///
-/// What is left is small and specific -- a one-clock offset, not a missing
-/// mechanism:
+/// What each reports today:
 ///
-///   * `dma_4016_read` expects `08 08 07 08 08` and gets `08 08 08 07 08`.
+///   * `dma_4016_read` wants `08 08 07 08 08` and gets `08 08 08 07 08`.
 ///     The lost controller bit is real and lands on exactly one of the five
-///     alignments, as hardware does; it is one alignment late, meaning the
-///     halt takes one CPU cycle earlier than hardware's. Shifting when the
-///     request is raised does not move it, because the ROM re-synchronizes
-///     to the DMC timer at the top of every iteration and the shift cancels
-///     out -- so the remaining error is in the shape of the stall, not its
-///     phase.
+///     alignments, as hardware does -- one alignment late.
 ///   * `dma_2007_read` differs on one of five rows (`22 33` where the other
-///     four read `11 22`), and `double_2007_read` on the same kind of
-///     boundary. Same one-clock story against the PPU read buffer.
+///     four read `11 22`); `double_2007_read` on the same kind of boundary.
 ///   * Both `sprdma_and_dmc_dma` ROMs report 526-529 clocks where the
-///     collision cost should be constant across alignments; ours splits
-///     into two groups two cycles apart at `T+05`, which points at DMC
-///     requests landing just *outside* the OAM DMA taking the full
-///     four-cycle `Cpu.read` path instead of the two-cycle one.
+///     collision cost should be constant across alignments. Ours splits
+///     into two groups two cycles apart at `T+05`.
 ///
 /// `dma_2007_write` and `read_write_2007` pass, which is what establishes
-/// that the mechanism itself -- halt on a read cycle, dummy, alignment,
-/// get, re-issue -- is right.
+/// that the mechanism -- halt on a read cycle, dummy, alignment, get,
+/// re-issue -- is right.
+///
+/// **What the offset is not.** It is not a phase that can be dialed in.
+/// The search is recorded here because the obvious knobs are a dead end
+/// and re-trying them costs a three-minute build each:
+///
+///   * Sampling the DMA request before the cycle rather than after (the
+///     more faithful RDY model) moves nothing. Neither does raising the
+///     request a cycle earlier or later. Both cancel out: `sync_dmc.s`
+///     re-locks the code to the DMC timer at the top of every iteration,
+///     so any shift applied to both the lock and the DMA disappears.
+///   * Moving the halt without moving the get -- one fewer no-op before
+///     the get, one more after -- reproduces the previous run *bit for
+///     bit*, same CRC. Only the total stall is observable, not its shape.
+///   * The sync loop locks on the **load** DMA (its `sta $4015` restarts a
+///     one-byte sample and its `bit $4015` looks for the DMA to have
+///     finished in the six cycles between), while the glitch under test is
+///     a **reload** DMA. Those are separate events, so their costs do not
+///     cancel -- but sweeping them independently only walks the result in
+///     steps of two. Load costing 4 gives the fourth alignment; 5 gives the
+///     sixth or later, i.e. no glitch in the window at all; 3 makes the
+///     sync loop's period exactly the DMC's 3424 cycles, so it never drifts
+///     and every ROM hangs. Hardware wants the third. The reachable answers
+///     are even and the answer is odd.
+///
+/// So the residue is a parity, not a phase, and no integer stall length
+/// reaches it. That points at the shape of the duplicated access rather
+/// than its timing -- most likely that the extra read is not the halt
+/// cycle re-running the CPU's read at all, but the *get* cycle spuriously
+/// selecting the register, which https://www.nesdev.org/wiki/DMA describes
+/// as a partial address decode: bits 4-0 taken from the 2A03 bus (the DMA's
+/// own address) and bits 15-5 from the 6502 core. That trigger fires on a
+/// different condition than "the CPU was halted mid-read", and modeling it
+/// would need the DMA's sample address to reach the decode, which nothing
+/// here currently plumbs.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;

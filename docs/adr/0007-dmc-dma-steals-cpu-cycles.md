@@ -72,10 +72,30 @@ protocol and report as console text in nametable 0, so this also grew
 
 `dma_2007_write` and `read_write_2007` pass. The remaining five do not yet,
 and are wired up and marked as a measured gap rather than left out --
-`dmc_dma_test.zig` records exactly what each one reports. The residue is a
-one-clock offset in the shape of the stall, not a missing mechanism:
-`dma_4016_read` loses exactly one controller bit on exactly one of its five
-alignments, as hardware does, one alignment later than hardware does it.
+`dmc_dma_test.zig` records exactly what each one reports, and the search
+already done for the residue, so the dead ends are not re-walked.
+
+The residue is one alignment, not a missing mechanism: `dma_4016_read`
+loses exactly one controller bit on exactly one of its five alignments, as
+hardware does, one alignment later than hardware does it. It is not a phase
+that can be dialed in. Shifting when the request is raised, or when it is
+sampled, cancels out, because the ROM re-locks the code to the DMC timer
+every iteration. Moving the halt without moving the get reproduces the run
+bit for bit -- only the total stall is observable, not its shape. The one
+lever that does not cancel is that the ROM's synchronization loop locks on
+a *load* DMA while the glitch under test is a *reload* DMA, but sweeping
+those independently walks the result in steps of two: load costing four
+cycles gives the fourth alignment, five gives none in the window, three
+makes the loop's period exactly the DMC's and every ROM hangs. The
+reachable answers are even and the wanted one is odd.
+
+That parity points at the shape of the duplicated access rather than its
+timing -- most plausibly that the extra read is the get cycle spuriously
+selecting the register through the partial address decode the wiki
+describes (bits 4-0 from the 2A03 bus, bits 15-5 from the 6502 core),
+rather than the halt cycle re-running the CPU's own read. Modeling that
+needs the DMA's sample address to reach the decode, which nothing here
+plumbs today.
 
 ## Consequences
 
