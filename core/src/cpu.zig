@@ -518,6 +518,36 @@ pub const Cpu = struct {
     /// serviced the moment `step` is next called, matching real hardware
     /// (which halts only the CPU's own bus activity, never the rest of the
     /// console).
+    /// How many of a DMC DMA's preparation cycles are still owed once an
+    /// OAM DMA it overlapped has finished, given how long the request had
+    /// already been up.
+    ///
+    /// The DMA unit's run-up is halt, dummy, and an alignment cycle. While
+    /// the CPU is halted for an OAM DMA those overlap it and cost nothing,
+    /// and the halt is free even on the copy's very last cycle, because the
+    /// CPU was still halted for it. Whatever has not elapsed by the time the
+    /// copy ends is paid in real time, and then the get:
+    ///
+    ///     elapsed   owed   total cost
+    ///     2+        0      1   the run-up finished under cover; just the get
+    ///     1         1      2
+    ///     0         2      3
+    ///
+    /// The two ends of that are hardware's "1 on the next-to-next-to-last
+    /// OAM DMA cycle, 3 on the last" (https://www.nesdev.org/wiki/DMA).
+    /// None of them carries a realignment cycle: the copy is over, so there
+    /// is nothing left to realign, unlike the two-cycle mid-copy case.
+    ///
+    /// **No conformance ROM pins this.** Both `sprdma_and_dmc_dma` ROMs
+    /// sweep sixteen offsets and reach this path only twice in an entire
+    /// run, so they neither confirm nor refute it -- see `dmc_dma_test.zig`.
+    /// It is here because the alternative, charging the full four, is what
+    /// happens without it and contradicts documented hardware. The unit test
+    /// below pins the table so it cannot drift unnoticed.
+    fn dmcTailPrepCycles(elapsed: u64) u64 {
+        return 2 - @min(elapsed, 2);
+    }
+
     fn runOamDma(self: *Cpu, page: u8) void {
         self.oam_dma_active = true;
         defer self.oam_dma_active = false;
@@ -527,6 +557,11 @@ pub const Cpu = struct {
         // even/odd phase every time regardless of when $4014 was written.
         if (self.cycles % 2 == 1) self.idleCycle();
         self.idleCycle(); // the halt/"get" cycle -- always happens
+        // When a DMC request goes up mid-copy: the CPU cycle it was first
+        // observed on, so the tail below can tell how much of the DMA
+        // unit's run-up overlapped the copy for free. Cleared whenever a
+        // request is serviced inside the loop.
+        var pending_since: ?u64 = null;
         var i: u16 = 0;
         while (i < 256) : (i += 1) {
             // When both DMAs want the same cycle, DMC wins and OAM DMA
@@ -539,9 +574,19 @@ pub const Cpu = struct {
             if (self.bus.apu.dmc.dma_pending) {
                 self.dmcGetCycle();
                 self.idleCycle();
+                pending_since = null;
             }
             const value = self.read((@as(u16, page) << 8) | i);
+            if (pending_since == null and self.bus.apu.dmc.dma_pending) pending_since = self.cycles;
             self.write(0x2004, value);
+            if (pending_since == null and self.bus.apu.dmc.dma_pending) pending_since = self.cycles;
+        }
+        // A request the copy's own last cycles raised has nowhere left to be
+        // absorbed. See `dmcTailPrepCycles`.
+        if (self.bus.apu.dmc.dma_pending) {
+            var remaining = dmcTailPrepCycles(self.cycles - (pending_since orelse self.cycles));
+            while (remaining > 0) : (remaining -= 1) self.idleCycle();
+            self.dmcGetCycle();
         }
     }
 
@@ -2404,4 +2449,16 @@ test "the decode table covers all 256 opcodes with sane lengths" {
         const len = entry.mode.length();
         try testing.expect(len >= 1 and len <= 3);
     }
+}
+
+test "a DMC DMA left over at the end of an OAM DMA pays only the run-up it did not already get" {
+    // The table in `dmcTailPrepCycles`. Total cost is the owed cycles plus
+    // the get, so 1 / 2 / 3 as the request goes up later and later in the
+    // copy -- hardware's "1 on the next-to-next-to-last OAM DMA cycle, 3 on
+    // the last".
+    try testing.expectEqual(@as(u64, 2), Cpu.dmcTailPrepCycles(0)); // raised on the last cycle
+    try testing.expectEqual(@as(u64, 1), Cpu.dmcTailPrepCycles(1));
+    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(2));
+    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(3)); // saturates
+    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(500));
 }
