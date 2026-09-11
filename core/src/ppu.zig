@@ -213,6 +213,20 @@ pub const Ppu = struct {
     /// that sits "underneath" the palette mirror, per hardware.
     read_buffer: u8 = 0,
 
+    /// The byte a `$2007` read has fetched but not yet committed to
+    /// `read_buffer`, with the number of PPU dots still to wait.
+    ///
+    /// The fetch is not instantaneous: a second `$2007` read on the very
+    /// next CPU cycle -- three dots later -- still sees the *old* buffer.
+    /// That is what `double_2007_read` measures with its page-crossing
+    /// `lda $20F7,x`, where the 6502's discarded dummy read and the real
+    /// read land on consecutive cycles: the address advances twice and both
+    /// fetches happen, but the value handed back is the one from before the
+    /// first fetch landed. Committing on the read itself instead made this
+    /// core return a byte that is not among the four the ROM accepts.
+    read_buffer_pending: ?u8 = null,
+    read_buffer_delay: u8 = 0,
+
     /// The PPU's own internal data-bus latch: the last byte driven onto the
     /// 8-bit CPU<->PPU data bus by *any* register access, read or write.
     /// This is what a read of a write-only register (or PPUSTATUS's bottom
@@ -341,6 +355,8 @@ pub const Ppu = struct {
         self.pending_mask = null;
         self.w = false;
         self.read_buffer = 0;
+        self.read_buffer_pending = null;
+        self.read_buffer_delay = 0;
         self.t = 0;
         self.fine_x = 0;
     }
@@ -517,10 +533,10 @@ pub const Ppu = struct {
                     result = self.palette[paletteIndex(a)];
                     // Still refresh the buffer, from the nametable byte
                     // that the palette mirror sits on top of.
-                    self.read_buffer = self.vramRead(a - 0x1000, mapper);
+                    self.scheduleReadBuffer(self.vramRead(a - 0x1000, mapper));
                 } else {
                     result = self.read_buffer;
-                    self.read_buffer = self.vramRead(a, mapper);
+                    self.scheduleReadBuffer(self.vramRead(a, mapper));
                 }
                 self.incrementV();
             },
@@ -1012,7 +1028,31 @@ pub const Ppu = struct {
         }
     }
 
+    /// Hand a freshly-fetched byte to the read buffer, to land four dots
+    /// from now. Four rather than three so that a read on the very next CPU
+    /// cycle, which arrives exactly three dots later, still sees the old
+    /// value -- see `read_buffer_pending`. A second fetch arriving while one
+    /// is still in flight replaces it: the buffer has one storage cell, not
+    /// a queue, and the later fetch is the one that wins it.
+    fn scheduleReadBuffer(self: *Ppu, value: u8) void {
+        self.read_buffer_pending = value;
+        self.read_buffer_delay = 4;
+    }
+
+    /// Commit a pending `$2007` fetch once its dots have elapsed. Called
+    /// once per dot from `tick`.
+    fn advanceReadBuffer(self: *Ppu) void {
+        if (self.read_buffer_pending) |value| {
+            self.read_buffer_delay -= 1;
+            if (self.read_buffer_delay == 0) {
+                self.read_buffer = value;
+                self.read_buffer_pending = null;
+            }
+        }
+    }
+
     pub fn tick(self: *Ppu, mapper: *Mapper) void {
+        self.advanceReadBuffer();
         const on_render_line = self.scanline <= 239 or self.scanline == 261;
         if (on_render_line and self.renderingEnabled()) self.renderCycle(mapper);
 
@@ -1121,8 +1161,14 @@ test "PPUDATA reads are buffered by one access, except for palette addresses" {
     // Prime nametable byte at $2000 via a direct VRAM write.
     ppu.vram[0] = 0xAB;
     ppu.v = 0x2000;
-    const primer = ppu.readRegister(0x2007, &m); // returns stale buffer (0), latches 0xAB
+    const primer = ppu.readRegister(0x2007, &m); // returns stale buffer (0), fetches 0xAB
     try testing.expectEqual(@as(u8, 0x00), primer);
+    // Give the fetch its dots. A real CPU cannot issue two reads closer
+    // together than one CPU cycle anyway, and the fetch lands four dots
+    // after the read that started it -- see `read_buffer_pending`. Reading
+    // again with no dots in between is the *double*-read case, asserted
+    // separately below.
+    for (0..6) |_| ppu.tick(&m);
     const real = ppu.readRegister(0x2007, &m); // now at $2001 (buffer's turn)
     // v auto-incremented by 1 (PPUCTRL bit2 clear) between reads.
     try testing.expectEqual(@as(u15, 0x2002), ppu.v);
@@ -1133,6 +1179,30 @@ test "PPUDATA reads are buffered by one access, except for palette addresses" {
     ppu.palette[5] = 0x30;
     const pal = ppu.readRegister(0x2007, &m);
     try testing.expectEqual(@as(u8, 0x30), pal);
+}
+
+// ENG-87, the unit-level guard under `double_2007_read`: the vendored ROM
+// reaches this through a page-crossing `lda $20F7,x`, whose discarded dummy
+// read and real read land on consecutive CPU cycles.
+test "a second PPUDATA read before the first fetch lands still sees the old buffer" {
+    var ppu = testPpu();
+    var m = testMapper();
+    ppu.vram[0] = 0x11;
+    ppu.vram[1] = 0x22;
+    ppu.vram[2] = 0x33;
+    ppu.v = 0x2000;
+
+    try testing.expectEqual(@as(u8, 0x00), ppu.readRegister(0x2007, &m)); // fetches $11
+    for (0..3) |_| ppu.tick(&m); // one CPU cycle: three dots, not enough
+
+    // Both reads really happened -- v advanced twice and the later fetch is
+    // the one holding the buffer -- but this read was served the buffer as
+    // it stood before the first fetch landed.
+    try testing.expectEqual(@as(u8, 0x00), ppu.readRegister(0x2007, &m));
+    try testing.expectEqual(@as(u15, 0x2002), ppu.v);
+
+    for (0..6) |_| ppu.tick(&m);
+    try testing.expectEqual(@as(u8, 0x22), ppu.read_buffer); // the *second* fetch won the cell
 }
 
 test "PPUDATA increments v by 1 or 32 depending on PPUCTRL bit 2" {
