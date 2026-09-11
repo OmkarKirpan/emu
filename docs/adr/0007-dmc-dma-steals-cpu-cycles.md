@@ -105,12 +105,16 @@ lands on `dma_2007_read`'s three-extra-reads variant, `5E3DF9C4`.
 
 Three remain open, and one of them does not belong to this ADR at all:
 
-* Both `sprdma_and_dmc_dma` ROMs want a collision cost constant across the
-  sixteen alignments they sweep. Ours is now nearly constant, 526 clocks
-  for most and 528 for a run at the top end, where before this work it
-  scattered over 526-529. What is left is the boundary between a DMC
-  request serviced inside `runOamDma`'s two-cycle path and one serviced
-  just outside it by `Cpu.read`'s full halt sequence.
+* Both `sprdma_and_dmc_dma` ROMs sweep a DMC DMA across sixteen one-cycle
+  offsets around an OAM DMA. Hardware charges 4 cycles normally, 3 landing
+  on a CPU write, 2 landing on the `$4014` write or anywhere inside the
+  copy, 1 on the copy's next-to-next-to-last cycle and 3 on its last. Only
+  the 2 is implemented here. `sprdma`'s shape already comes out right --
+  the first five offsets land before the copy at 4, the rest inside it at
+  2 -- but `_512` sweeps the copy's *end*, where the 1 and 3 live, and a
+  request raised by the copy's own final cycles currently falls out of
+  `runOamDma` and gets charged the full 4. A tail case for it was tried
+  and not kept; `dmc_dma_test.zig` records why.
 * `double_2007_read` is **not a DMC DMA test**. It includes `shell.inc`
   directly rather than the suite's `common.inc`, never synchronizes to the
   DMC and never starts a sample. It reads `lda $20F7,x` with X of `$00`

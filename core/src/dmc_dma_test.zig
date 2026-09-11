@@ -95,23 +95,56 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 /// model does not yet satisfy. They are vendored, wired up and run rather
 /// than left out, so the gap stays a measured number.
 ///
-///   * Both `sprdma_and_dmc_dma` ROMs want a collision cost that is
-///     constant across the sixteen alignments they sweep. Ours is now
-///     almost constant -- 526 clocks for most of them, 528 for a run at
-///     the top end -- where before the halted-read modeling it scattered
-///     across 526-529. What is left is the boundary between a DMC request
-///     serviced inside `runOamDma`'s two-cycle path and one serviced just
-///     outside it by `Cpu.read`'s full halt sequence.
-///   * `double_2007_read` is **not a DMC DMA test at all**, which is worth
-///     knowing before anyone spends time on it here. It includes
-///     `shell.inc` directly rather than the suite's `common.inc`, never
-///     synchronizes to the DMC and never starts a sample. It reads
-///     `lda $20F7,x` with X of `$00` and `$10` -- the second crosses a
-///     page, so the 6502's discarded dummy read hits `$2007` and the real
-///     read hits it again. It is measuring what a double read does to the
-///     PPU's read buffer. Ours prints `D84F6815` against accepted
-///     `85CFD627` / `F018C287` / `440EF923` / `E52F41A5`. The fix belongs
-///     in the PPU, not here.
+/// **`sprdma_and_dmc_dma`.** Each ROM sweeps a DMC DMA across sixteen
+/// one-cycle offsets relative to an OAM DMA and prints how long the block
+/// took. Subtract the 524-clock baseline and what is left is what the DMC
+/// DMA cost at that offset. Hardware's rule set
+/// (https://www.nesdev.org/wiki/DMA and the nesdev "DMC/DMA timing and
+/// quirks" thread) is:
+///
+///     4   normally
+///     3   landing on a CPU write
+///     2   landing on the $4014 write, or anywhere inside OAM DMA
+///     1   on the next-to-next-to-last OAM DMA cycle
+///     3   on the last OAM DMA cycle
+///
+/// The 2 is the well-understood case and the one `runOamDma` implements:
+/// the CPU is already halted, so the halt, dummy and alignment cycles cost
+/// nothing, leaving one cycle for the DMC's get and one for OAM DMA to
+/// realign to a get of its own.
+///
+/// What this core prints today, against the 524 baseline:
+///
+///     sprdma      +4 on offsets 00-04, +2 on 05-0F
+///     sprdma_512  +2 on 00-06, +4 on 08-09 and 0B-0F, +2 on 0A
+///
+/// `sprdma`'s shape is right -- the first five offsets land before the
+/// copy and the rest inside it, exactly as the ROM is described. `_512`
+/// sweeps the *end* of the copy instead, and that is where the 1 and 3
+/// cases live. This core has no tail case at all: a request raised by the
+/// copy's own last cycles falls out of `runOamDma` and gets charged the
+/// full four by `Cpu.read`, which is the +4 plateau from 08 on, and the
+/// +2 at 0A is the boundary landing inside the loop instead.
+///
+/// A tail case was tried -- servicing such a request while the CPU is
+/// still halted, with no halt cycle to pay for and no OAM DMA left to
+/// realign. It moves the two transition offsets off the plateau, which is
+/// the right shape, but lands them on +0/+2 or +2/+2 depending on where
+/// the extra cycle goes, never hardware's +1/+3. The obstruction is that
+/// changing the copy's total length changes its exit parity, and the
+/// surrounding code re-synchronizes to the DMC timer, absorbing the
+/// difference. It was not kept: nothing in the suite proves it right, and
+/// it changes timing on a path every game with sprites takes.
+///
+/// **`double_2007_read` is not a DMC DMA test**, which is worth knowing
+/// before anyone spends time on it here. It includes `shell.inc` directly
+/// rather than the suite's `common.inc`, never synchronizes to the DMC and
+/// never starts a sample. It reads `lda $20F7,x` with X of `$00` and
+/// `$10` -- the second crosses a page, so the 6502's discarded dummy read
+/// hits `$2007` and the real read hits it again. It is measuring what a
+/// double read does to the PPU's read buffer. Ours prints `D84F6815`
+/// against accepted `85CFD627` / `F018C287` / `440EF923` / `E52F41A5`.
+/// The fix belongs in the PPU, not here.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
