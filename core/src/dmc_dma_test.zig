@@ -136,19 +136,34 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 ///     from its next-to-next-to-last. Telling them apart needs a finer
 ///     request clock than the APU gives, which is the part of hardware this
 ///     core does not reproduce.
-///   * **Offset 0A is the real anomaly and the best lead.** It prints +2
-///     while 08, 09 and 0B-0F all print +4, though all eight are serviced
-///     identically, outside the copy, by `Cpu.read`. Measuring the
-///     standalone DMC DMA directly confirms it is a one-off rather than a
-///     pattern: across a run, 28 of 29 cost four extra cycles and exactly
-///     one costs three. The three is `runDmcDma`'s alignment cycle
-///     declining to fire, and hardware's "4 normally" is uniform.
+///   * **Offset 0A is the alignment cycle, and where it happens is now
+///     pinned.** Histogramming every standalone DMC DMA over a full run
+///     gives 314 at four extra cycles and 14 at three. The threes are the
+///     alignment cycle declining to fire, against hardware's "4 normally".
 ///
-///     Note the obvious fix is not it. Making that alignment
-///     unconditional does give a uniform cost, but it turns both tables
-///     into alternating runs -- 528, 529, 528, 529 -- where hardware and
-///     this core both produce flat runs. So the alignment belongs, and
-///     what is wrong is the one phase where it decides differently.
+///     They are not scattered. Every one of the 14 halts on an opcode
+///     fetch at `$E213` or `$E285` -- two addresses inside the ROM's own
+///     synchronization loops -- and every one has the APU on the same half
+///     of its clock. `sync_dmc.s` budgets "4 DMC wait-states" for that
+///     loop, so if hardware really is uniform there, these threes are
+///     corrupting the very synchronization the measurement depends on,
+///     which would explain wrong values at every offset rather than just
+///     one.
+///
+///     Two candidate fixes are already excluded. Inverting the get-cycle
+///     polarity makes three the dominant cost and the ROM hangs outright,
+///     because the loop period then equals the DMC's 3424 and never
+///     drifts -- the same failure ENG-81 found. Making the alignment
+///     unconditional gives a uniform four but turns both tables into
+///     alternating 528/529 runs where hardware and this core both produce
+///     flat ones.
+///
+///     What is left needs hardware's answer, not more inference: whether
+///     the alignment is decided by the phase the *halt* lands on, as
+///     modeled here, or by the phase of the *request*, which in these
+///     loops would be fixed and would make the cost uniform. The two
+///     differ only when the CPU delays the halt, which is exactly what
+///     these two addresses do.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
