@@ -81,7 +81,7 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 
 /// Bumped only for a change that reinterprets bytes an older reader would
 /// misread -- see the module doc comment. Adding a section is not that.
-pub const format_version: u32 = 2;
+pub const format_version: u32 = 3;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -500,6 +500,11 @@ fn ppuBody(comptime dir: Dir, c: *Codec(dir), p: *ppu_mod.Ppu) CodecError!void {
     try c.scalar(&p.fine_x);
     try c.scalar(&p.w);
     try c.scalar(&p.read_buffer);
+    // ENG-87: a $2007 fetch in flight is real state -- it lands four dots
+    // after the read that started it, so a save taken in between has to
+    // carry it or the next read returns the wrong byte.
+    try c.scalar(&p.read_buffer_pending);
+    try c.scalar(&p.read_buffer_delay);
     try c.scalar(&p.data_bus);
     try c.scalar(&p.suppress_vbl_this_frame);
     // The one-dot PPUCTRL/PPUMASK write delay (`Ppu.applyPendingLatches`):

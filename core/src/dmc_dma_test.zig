@@ -179,8 +179,18 @@ test "dmc_dma_during_read4 dma_2007_read" {
     );
 }
 
+// Not a DMC DMA test at all despite living in this suite -- see ENG-87 and
+// `Ppu.read_buffer_pending`. It measures what a page-crossing double read
+// does to the PPU's read buffer: `lda $20F7,x` with X of `$10` puts the
+// 6502's discarded dummy read and the real read on consecutive cycles, and
+// the second one sees the buffer as it stood before the first fetch landed.
+// Four accepted checksums, one per power-on CPU-PPU alignment.
 test "dmc_dma_during_read4 double_2007_read" {
-    try expectKnownGap("dmc_dma/double_2007_read", @embedFile("dmc_dma_double_2007_read"));
+    try expectOneOfCrc(
+        "dmc_dma/double_2007_read",
+        @embedFile("dmc_dma_double_2007_read"),
+        &.{ "85CFD627", "F018C287", "440EF923", "E52F41A5" },
+    );
 }
 test "sprdma_and_dmc_dma" {
     try expectKnownGap("sprdma_and_dmc_dma", @embedFile("sprdma_dmc_sprdma_and_dmc_dma"));
