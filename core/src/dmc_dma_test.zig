@@ -164,6 +164,42 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 ///     loops would be fixed and would make the cost uniform. The two
 ///     differ only when the CPU delays the halt, which is exactly what
 ///     these two addresses do.
+/// **The checksum is invertible, and the machinery for it is proven.** The
+/// blocker on all of the above has been that a failing ROM reports only a
+/// CRC-32, so a wrong model looks like any other wrong model. That is no
+/// longer quite true, and whoever picks this up should not redo the
+/// following.
+///
+/// The ROM's CRC routine is at `$E78A` (its `reset` at `$E77B`), found by
+/// its inner-loop opcode signature rather than by a symbol, since this
+/// suite ships no source. Logging the accumulator at `$E78E` -- one
+/// instruction past the enable check, so disabled calls exclude themselves
+/// -- captures exactly the byte stream the ROM hashes. Dropping the last
+/// 24 bytes, which are fed while the checksum is frozen, makes
+/// `zlib.crc32` of that stream equal the value the ROM itself prints, for
+/// **both** ROMs. That is the proof the capture is right.
+///
+/// The stream turns out to be 4179 bytes: a 19-byte header, then sixteen
+/// 260-byte blocks, each holding the OAM contents that iteration produced
+/// followed by its clock count as three ASCII digits at offset +257. So
+/// the checksum covers **what the collision left in OAM as well as the
+/// timings** -- a timing-only fix cannot pass these ROMs on its own, which
+/// is worth knowing before starting.
+///
+/// What is missing is only the expected constant. It lives inline after
+/// the ROM's own `check_crc` call and neither the usual compare signature
+/// nor a read-trace around the verdict has located it yet. Two ways in:
+/// widen the read trace and stop it at the comparison rather than at the
+/// rendered verdict, or search value tables and test each candidate
+/// checksum for membership among the ROM's 4-byte literals. A
+/// distance-of-three search over the sixteen values already came back
+/// empty, so the expected table differs from this core's in more than
+/// three rows.
+///
+/// For that search, note CRC-32 is linear over XOR: the checksum of a
+/// table is the base checksum XORed with a per-position contribution, so
+/// candidates cost a handful of XORs each instead of rehashing 4179 bytes.
+/// That turns an otherwise hopeless space into a fast one.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
