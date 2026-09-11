@@ -16,4 +16,8 @@ Single-context (one `CONTEXT.md` + `docs/adr/` at the repo root). See [CONTEXT.m
 
 ## Planning status
 
-Planning is complete — see [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear for the full decision record. Execution is underway per the milestone roadmap in [Milestone roadmap & build sequencing](https://linear.app/okirpan/issue/ENG-63/milestone-roadmap-and-build-sequencing) (ENG-63): `core/` (Zig) and `web/` (React+TS+Vite) exist; M0-M4 (repo scaffolding through the single-threaded wasm host) are done, M5 ([ENG-70](https://linear.app/okirpan/issue/ENG-70/m5-migrate-to-full-threaded-pipeline-video-audio-plumbing)) is in progress.
+Planning is complete — see [NES Emulator — Implementation-Ready Spec](https://linear.app/okirpan/issue/ENG-54/nes-emulator-implementation-ready-spec) (ENG-54) on Linear for the full decision record.
+
+Execution has reached the end of the roadmap in [Milestone roadmap & build sequencing](https://linear.app/okirpan/issue/ENG-63/milestone-roadmap-and-build-sequencing) (ENG-63). **M0 through M8 are all done** — repo scaffolding, the CPU, PPU background and sprites, the single-threaded wasm host, the threaded Worker/SharedArrayBuffer pipeline, the APU, the MMC1/UxROM/CNROM/MMC3 mappers, and save-states/SRAM. M9 is deliberately unscoped polish, and the roadmap treats the destination as reached without it.
+
+What is left is individual issues rather than milestones. **Do not trust a list of them here** — it will go stale. Check the [project board](https://linear.app/okirpan/project/nes-emulator-webassembly-ce94d622c29f) for live status.
