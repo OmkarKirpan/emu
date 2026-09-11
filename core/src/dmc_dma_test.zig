@@ -120,13 +120,15 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 /// Three things a further attempt should know, each of which cost a build
 /// to establish:
 ///
-///   * **The printout is quantized to two clocks.** Across every variant
-///     tried -- tail costs of 1, 2, 3 and an exaggerated 21 -- no offset
-///     ever printed an odd number. Hardware's 1 and 3 therefore cannot be
-///     read off this output directly, and fitting the model until some
-///     offset prints +1 or +3 is chasing something the ROM does not
-///     report. A tail cost of 1 prints 524/526 for offsets 06/07, 2 prints
-///     526/526, 3 prints 526/528; the pair does not simply translate.
+///   * **The output is not quantized, and every value this core prints
+///     being even is a fact about this core, not the ROM.** Forcing
+///     `Cpu.runDmcDma`'s alignment cycle to fire unconditionally makes
+///     odd values appear immediately, all over both tables. So the ROM's
+///     timing routine does resolve single clocks, as its own source says,
+///     and a model that produced hardware's 1 and 3 would show them. An
+///     earlier note here claimed the opposite; it was wrong, and it was
+///     wrong because every variant tried happened to keep the standalone
+///     DMA at a uniform cost.
 ///   * **The two tail offsets are indistinguishable to this model.** Both
 ///     see the request go up on the same CPU cycle and both end the copy on
 ///     the same half of the APU clock, because the DMC raises a reload
@@ -136,12 +138,17 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 ///     core does not reproduce.
 ///   * **Offset 0A is the real anomaly and the best lead.** It prints +2
 ///     while 08, 09 and 0B-0F all print +4, though all eight are serviced
-///     identically, outside the copy, by `Cpu.read`. A monotonic sweep
-///     should not do that. The suspect is `Cpu.runDmcDma`'s conditional
-///     alignment cycle, which makes a standalone DMC DMA cost 3 or 4
-///     depending on the phase the halt lands on, where hardware's "4
-///     normally" is uniform. That is one cycle of difference, printed as
-///     two by the quantization above.
+///     identically, outside the copy, by `Cpu.read`. Measuring the
+///     standalone DMC DMA directly confirms it is a one-off rather than a
+///     pattern: across a run, 28 of 29 cost four extra cycles and exactly
+///     one costs three. The three is `runDmcDma`'s alignment cycle
+///     declining to fire, and hardware's "4 normally" is uniform.
+///
+///     Note the obvious fix is not it. Making that alignment
+///     unconditional does give a uniform cost, but it turns both tables
+///     into alternating runs -- 528, 529, 528, 529 -- where hardware and
+///     this core both produce flat runs. So the alignment belongs, and
+///     what is wrong is the one phase where it decides differently.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
