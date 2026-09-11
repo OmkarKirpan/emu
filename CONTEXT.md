@@ -36,7 +36,18 @@ A cycle-accurate NES emulator core written in Zig, compiled to
   adds nothing to the wasm ABI (ENG-67), and its tests ride in `root.zig`'s
   test block rather than a module of their own — a separate `addTest` can't
   compile, because `rom.zig`'s tests `@embedFile` fixtures that exist only as
-  `build.zig`'s `test_mod` anonymous imports. **Nametable mirroring belongs to
+  `build.zig`'s `test_mod` anonymous imports. `src/cpu_sweep.zig` is a
+  *fourth* root, also native-only and deliberately **outside** `zig build
+  test`: `zig build test-cpu-sweep` (ENG-78) runs the CPU against
+  SingleStepTests/65x02's per-cycle data set, which is 1.08GB, never
+  vendored, and fetched into a gitignored cache by
+  `core/tools/fetch-65x02.sh`. Being a root is what lets it declare
+  `nes_flat_bus`, the comptime switch `src/sweep_config.zig` reads to turn
+  `Bus` into the flat 64KB address space that data set assumes; a `zig
+  build test` binary could not, since its root is Zig's own test runner.
+  Every other build sees that flag as `false`, so the production
+  `Bus.read`/`Bus.write` hot path carries no test-only branch.
+  **Nametable mirroring belongs to
   `mapper.zig`, not `rom.zig` or `Ppu`** — as of M7a the cartridge answers
   `Mapper.mirroring()` per access, because MMC1 rewrites it at runtime and
   can select single-screen modes the iNES header cannot express; the header

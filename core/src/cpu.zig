@@ -8,6 +8,7 @@ const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mmc3 = mapper_mod.Mmc3;
 const TestStub = mapper_mod.TestStub;
+const sweep = @import("sweep_config.zig");
 
 /// The processor status register.
 ///
@@ -327,6 +328,12 @@ pub const Cpu = struct {
     /// which share the same underlying edge-timing logic) caught.
     fn tick(self: *Cpu) void {
         self.cycles += 1;
+        // ENG-78: under the flat-RAM bus there is no console around the CPU
+        // to advance -- no PPU to raise NMI, no APU to request a DMC DMA, no
+        // mapper to count scanlines -- and the sweep runs 2.56 million
+        // instructions, so ticking them would be both meaningless and the
+        // dominant cost. Comptime-known; see `sweep_config.zig`.
+        if (sweep.flat_bus) return;
         self.bus.ppu.tick(&self.bus.mapper);
         self.pollNmi();
         self.bus.ppu.tick(&self.bus.mapper);
@@ -477,7 +484,11 @@ pub const Cpu = struct {
         // this exact chokepoint (PPU ticking, NMI polling) like any other
         // cycle. Checked after the ordinary write above so `open_bus` still
         // updates first, same as every other write to this address.
-        if (addr == 0x4014) self.runOamDma(value);
+        // ENG-78: $4014 is an ordinary RAM address in the flat 64KB space
+        // the sweep runs in, not OAMDMA. Comptime-known, as above.
+        if (!sweep.flat_bus) {
+            if (addr == 0x4014) self.runOamDma(value);
+        }
     }
 
     /// Advance the clock by one CPU cycle with no bus access: `tick` plus

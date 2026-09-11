@@ -252,7 +252,10 @@ lost as prose:
    opcodes. Filed as
    [ENG-78](https://linear.app/okirpan/issue/ENG-78/opt-in-per-cycle-cpu-sweep-against-singlesteptests65x02-nes6502):
    a CPU-milestone improvement arriving after the CPU milestone, which is the
-   normal way this happens.
+   normal way this happens. **Built:** `zig build test-cpu-sweep`, with
+   `core/tools/fetch-65x02.sh` to populate the gitignored cache and
+   `core/src/cpu_sweep.zig` for how the flat bus is switched in without the
+   production build gaining a branch.
 3. **"Which emulator do I look at?" has a defensible answer** instead of a
    habit. LaiNES and fogleman/nes for reading; Mesen for running. That line
    is a licensing boundary, not a taste preference.

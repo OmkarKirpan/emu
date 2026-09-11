@@ -6,6 +6,7 @@ const rom_mod = @import("rom.zig");
 const ppu_mod = @import("ppu.zig");
 const apu_mod = @import("apu.zig");
 const controller_mod = @import("controller.zig");
+const sweep = @import("sweep_config.zig");
 const Mapper = mapper_mod.Mapper;
 const Nrom = mapper_mod.Nrom;
 const Mirroring = rom_mod.Mirroring;
@@ -133,6 +134,15 @@ pub const Bus = struct {
     /// nothing here targets that machine.
     joy_oe: u8 = 0,
 
+    /// ENG-78: the flat 64KB address space `SingleStepTests/65x02` assumes,
+    /// and the per-cycle bus log the sweep compares against its `cycles`
+    /// array. Both are `void` -- zero bytes, no initializer -- in every
+    /// build but `zig build test-cpu-sweep`; see `sweep_config.zig` for how
+    /// the flag is set and why the production `read`/`write` below gain no
+    /// branch from any of this.
+    flat: if (sweep.flat_bus) [0x10000]u8 else void = if (sweep.flat_bus) [_]u8{0} ** 0x10000 else {},
+    flat_log: if (sweep.flat_bus) sweep.FlatLog else void = if (sweep.flat_bus) .{} else {},
+
     /// Takes no mirroring: it lives on the cartridge now (`Mapper.mirroring`),
     /// which is where MMC1 changes it at runtime.
     pub fn init(m: Mapper) Bus {
@@ -140,6 +150,13 @@ pub const Bus = struct {
     }
 
     pub fn read(self: *Bus, addr: u16) u8 {
+        // ENG-78. Comptime-known, so this whole block is absent from every
+        // build that is not the sweep -- see `sweep_config.zig`.
+        if (sweep.flat_bus) {
+            const flat_value = self.flat[addr];
+            self.flat_log.record(addr, flat_value, false);
+            return flat_value;
+        }
         const contiguous_joy_read = self.joy_oe;
         self.joy_oe = switch (addr) {
             0x4016 => 1,
@@ -167,6 +184,11 @@ pub const Bus = struct {
     }
 
     pub fn write(self: *Bus, addr: u16, value: u8) void {
+        if (sweep.flat_bus) { // ENG-78, as in `read` above
+            self.flat[addr] = value;
+            self.flat_log.record(addr, value, true);
+            return;
+        }
         self.open_bus = value;
         self.joy_oe = 0; // a write drops both /OE lines -- see `joy_oe`
         switch (addr) {
