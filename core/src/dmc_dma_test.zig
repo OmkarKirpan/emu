@@ -91,60 +91,49 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
     return error.TestUnexpectedResult;
 }
 
-/// The two `sprdma_and_dmc_dma` ROMs, and `double_2007_read`, which this
-/// model does not yet satisfy. They are vendored, wired up and run rather
-/// than left out, so the gap stays a measured number.
+/// The two `sprdma_and_dmc_dma` ROMs, which this model does not yet
+/// satisfy. They are vendored, wired up and run rather than left out, so
+/// the gap stays a measured number.
 ///
-/// **`sprdma_and_dmc_dma`.** Each ROM sweeps a DMC DMA across sixteen
-/// one-cycle offsets relative to an OAM DMA and prints how long the block
-/// took. Subtract the 524-clock baseline and what is left is what the DMC
-/// DMA cost at that offset. Hardware's rule set
+/// Each sweeps a DMC DMA across sixteen one-cycle offsets relative to an
+/// OAM DMA and prints how long the block took. Subtract the 524-clock
+/// baseline for what the DMA cost at that offset. Hardware's rule set
 /// (https://www.nesdev.org/wiki/DMA and the nesdev "DMC/DMA timing and
-/// quirks" thread) is:
+/// quirks" thread):
 ///
 ///     4   normally
 ///     3   landing on a CPU write
-///     2   landing on the $4014 write, or anywhere inside OAM DMA
-///     1   on the next-to-next-to-last OAM DMA cycle
-///     3   on the last OAM DMA cycle
+///     2   landing on the $4014 write, or anywhere inside the copy
+///     1   on the copy's next-to-next-to-last cycle
+///     3   on the copy's last cycle
 ///
-/// The 2 is the well-understood case and the one `runOamDma` implements:
-/// the CPU is already halted, so the halt, dummy and alignment cycles cost
-/// nothing, leaving one cycle for the DMC's get and one for OAM DMA to
-/// realign to a get of its own.
-///
-/// What this core prints today, against the 524 baseline:
+/// What this core prints, against that baseline:
 ///
 ///     sprdma      +4 on offsets 00-04, +2 on 05-0F
-///     sprdma_512  +2 on 00-06, +4 on 08-09 and 0B-0F, +2 on 0A
+///     sprdma_512  +2 on 00-06 and 0A, +4 on the rest
 ///
-/// `sprdma`'s shape is right -- the first five offsets land before the
-/// copy and the rest inside it, exactly as the ROM is described. `_512`
-/// sweeps the *end* of the copy instead, and that is where the 1 and 3
-/// cases live. This core has no tail case at all: a request raised by the
-/// copy's own last cycles falls out of `runOamDma` and gets charged the
-/// full four by `Cpu.read`, which is the +4 plateau from 08 on, and the
-/// +2 at 0A is the boundary landing inside the loop instead.
+/// **Both shapes are right.** `sprdma` sweeps into the copy -- five offsets
+/// before it at 4, eleven inside at 2. `_512` sweeps out of it, which is
+/// the mirror. Instrumenting where each of the sixteen is serviced confirms
+/// it: eight land inside the copy and eight land outside it entirely.
 ///
-/// A tail case was tried -- servicing such a request while the CPU is
-/// still halted, with no halt cycle to pay for and no OAM DMA left to
-/// realign. It moves the two transition offsets off the plateau, which is
-/// the right shape, but lands them on +0/+2 or +2/+2 depending on where
-/// the extra cycle goes, never hardware's +1/+3. The obstruction is that
-/// changing the copy's total length changes its exit parity, and the
-/// surrounding code re-synchronizes to the DMC timer, absorbing the
-/// difference. It was not kept: nothing in the suite proves it right, and
-/// it changes timing on a path every game with sprites takes.
+/// **The 1 and 3 cases are barely reachable from these ROMs**, which is the
+/// thing worth knowing before picking this up. `Cpu.runOamDma`'s tail path,
+/// which implements them, is entered twice in an entire run of `_512` --
+/// and changing what it charges leaves all sixteen printed values
+/// unchanged. So the residue is not the tail: it is that eight offsets all
+/// come out at +2 where hardware wants six at +2, one at +1 and one at +3.
+/// The offsets that should differ are ones this core services inside the
+/// loop at a flat 2.
 ///
-/// **`double_2007_read` is not a DMC DMA test**, which is worth knowing
-/// before anyone spends time on it here. It includes `shell.inc` directly
-/// rather than the suite's `common.inc`, never synchronizes to the DMC and
-/// never starts a sample. It reads `lda $20F7,x` with X of `$00` and
-/// `$10` -- the second crosses a page, so the 6502's discarded dummy read
-/// hits `$2007` and the real read hits it again. It is measuring what a
-/// double read does to the PPU's read buffer. Ours prints `D84F6815`
-/// against accepted `85CFD627` / `F018C287` / `440EF923` / `E52F41A5`.
-/// The fix belongs in the PPU, not here.
+/// Two things stand in the way of fitting it further. The DMC raises a
+/// reload request on an APU tick, so adjacent one-cycle sweep offsets can
+/// land on the same CPU cycle and cannot be told apart by anything
+/// downstream. And no expected table is published -- the ROM checks a
+/// CRC-32 over its whole output and prints nothing when it fails, so a
+/// wrong guess is indistinguishable from a differently wrong guess.
+/// Getting further probably means a cycle-exact trace from hardware or an
+/// emulator known to pass, not more model-fitting from this side.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
