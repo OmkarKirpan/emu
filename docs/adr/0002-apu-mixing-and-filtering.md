@@ -53,8 +53,14 @@ boundary. At ~37 CPU cycles per output sample that is a 37-tap box filter
 whose nulls sit on multiples of the output rate -- cheap, and the actual
 reason the decimation does not alias.
 
-**DMC DMA stealing: not modeled.** Real hardware stalls the CPU 1-4 cycles
-per DMC sample fetch -- `Apu`'s `Dmc.tickTimer` instead reads straight
+**DMC DMA stealing: not modeled.** *(Superseded by
+[ADR 0007](0007-dmc-dma-steals-cpu-cycles.md), ENG-81, which implements it.
+The paragraph below is kept as written, for the record of why M6 deferred
+it -- and because its "Consequences" prediction, that closing this would
+mean a second DMA mechanism next to `runOamDma`, is exactly what
+happened.)*
+
+Real hardware stalls the CPU 1-4 cycles per DMC sample fetch -- `Apu`'s `Dmc.tickTimer` instead reads straight
 through the mapper with no CPU-side effect. This is a scoped, named gap:
 none of the vendored `apu_test/rom_singles` ROMs (`7-dmc_basics`,
 `8-dmc_rates`) exercise cycle-stealing (that requires the separate,

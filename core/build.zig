@@ -156,6 +156,27 @@ pub fn build(b: *std.Build) void {
         });
     }
 
+    // ENG-81: the DMC-DMA stage. Both suites predate the `$6000` protocol
+    // and report via nametable text (see `dmc_dma_test.zig`), like
+    // `sprite_hit_tests_2005.10.05`. All confirmed mapper 0/NROM --
+    // `dmc_dma_during_read4`'s five ROMs use CHR-RAM, `sprdma_and_dmc_dma`
+    // CHR-ROM. See each directory's `ATTRIBUTION.md`.
+    const dmc_dma_read4_names = [_][]const u8{
+        "dma_2007_read",  "dma_2007_write", "dma_4016_read",
+        "double_2007_read", "read_write_2007",
+    };
+    for (dmc_dma_read4_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("dmc_dma_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/dmc_dma_during_read4/{s}.nes", .{name})),
+        });
+    }
+    const sprdma_dmc_names = [_][]const u8{ "sprdma_and_dmc_dma", "sprdma_and_dmc_dma_512" };
+    for (sprdma_dmc_names) |name| {
+        test_mod.addAnonymousImport(b.fmt("sprdma_dmc_{s}", .{name}), .{
+            .root_source_file = b.path(b.fmt("tests/roms/sprdma_and_dmc_dma/{s}.nes", .{name})),
+        });
+    }
+
     // ENG-72 (M7a): the *combined* ppu_vbl_nmi ROM -- mapper 1, 256KB PRG,
     // the one this codebase could not run until MMC1 existed. Its ten
     // sub-tests are already vendored individually above as NROM singles, so

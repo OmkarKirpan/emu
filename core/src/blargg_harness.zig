@@ -102,3 +102,51 @@ pub fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
     }
     try testing.expectEqual(@as(u8, 0), status);
 }
+
+// ------------------------------------------- the nametable-text protocol
+
+/// Blargg's *other* result convention, older than `$6000`: the ROM prints
+/// its verdict to the screen through a text console whose font is loaded so
+/// that every tile ID is the character's own ASCII code, so the verdict can
+/// be read straight out of `Ppu.vram` with no rendering involved.
+///
+/// Two generations of it are vendored here and they word things
+/// differently -- `sprite_hit_tests_2005.10.05`/`sprite_overflow_tests` say
+/// `"PASSED"`/`"FAILED #n"`, while `dmc_dma_during_read4`/
+/// `sprdma_and_dmc_dma` say `"Passed"`/`"Failed"`/`"Error n"` -- so the
+/// marker matching stays with each suite's own test file and only the
+/// polling loop is shared. See `ppu_sprites_test.zig` and
+/// `dmc_dma_test.zig`.
+pub const NametableOutcome = union(enum) { passed, failed: u32 };
+
+/// Generous ceiling on total emulated CPU cycles (roughly 45 seconds of NES
+/// time). Every ROM using this protocol reports in well under a second of
+/// NES time in practice; this exists purely so a genuine hang fails the
+/// test instead of hanging CI.
+const max_text_cycles: u64 = 80_000_000;
+const text_poll_interval: u64 = 20_000;
+
+/// Nametable 0's tile grid always lives at `Ppu.vram` offset 0 regardless
+/// of mirroring mode (`physicalNametable` maps logical nametable 0 to
+/// physical bank 0 either way), so reading the first 960 bytes (32x30
+/// tiles, before the 64-byte attribute table at $3C0-$3FF) is valid for any
+/// of these ROMs' mirroring header.
+pub fn nametableText(m: *const Machine, buf: *[960]u8) []const u8 {
+    @memcpy(buf, m.bus.ppu.vram[0..960]);
+    return buf[0..960];
+}
+
+/// Step `m` until `match` reads a verdict out of nametable 0. `match`
+/// returns null for "still running".
+pub fn runToNametableOutcome(
+    m: *Machine,
+    match: *const fn ([]const u8) ?NametableOutcome,
+) !NametableOutcome {
+    var buf: [960]u8 = undefined;
+    while (m.cpu.cycles < max_text_cycles) {
+        const target = m.cpu.cycles + text_poll_interval;
+        while (m.cpu.cycles < target) m.cpu.step();
+        if (match(nametableText(m, &buf))) |outcome| return outcome;
+    }
+    return HarnessError.Timeout;
+}

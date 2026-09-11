@@ -5,9 +5,10 @@
 //! concern (see `docs/adr/0002-apu-mixing-and-filtering.md` for why that
 //! matters for `audio_ring.zig`).
 //!
-//! **Not implemented**: CPU-cycle-stealing DMA for DMC sample fetches (see
-//! `Dmc`'s doc comment) -- a deliberate, named gap, same footing as
-//! `bus.zig`'s unconditional PRG-RAM simplification.
+//! DMC sample fetches are CPU-cycle-stealing DMAs (ENG-81): the DMC only
+//! *requests* one here (`Dmc.dma_pending`), and `Cpu.read` runs the stall
+//! and feeds the byte back through `Dmc.completeDma`. The APU never
+//! touches the mapper itself, which is why `Apu.tick` takes no mapper.
 
 const std = @import("std");
 const testing = std.testing;
@@ -597,12 +598,15 @@ pub const dmc_rate_table = [16]u9{
     428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
 };
 
-/// **Known gap**: no CPU-cycle-stealing DMA is modeled for sample fetches
-/// (real hardware stalls the CPU 1-4 cycles per fetch). `tickTimer` reads
-/// the sample byte straight through the mapper with no CPU-side stall --
-/// see `docs/adr/0002-apu-mixing-and-filtering.md` for why that's an
-/// acceptable, explicitly-flagged simplification for this milestone's
-/// conformance ROMs.
+/// Sample fetches are **not** performed here: `tickTimer` only raises
+/// `dma_pending`, and `Cpu.read` -- the only place that can halt the CPU --
+/// runs the stall and hands the byte back through `completeDma` (ENG-81).
+/// That split is the whole point: on hardware the fetch is a DMA that
+/// freezes the 6502 for 3-4 cycles, and those cycles are observable (they
+/// duplicate the read the CPU was halted on, which is what perturbs
+/// `$4016` controller reads). See `Cpu.read`/`Cpu.runDmcDma` for the cycle
+/// sequence and `docs/adr/0002-apu-mixing-and-filtering.md` for the
+/// history.
 pub const Dmc = struct {
     enabled: bool = false,
     irq_enabled: bool = false,
@@ -623,6 +627,13 @@ pub const Dmc = struct {
     silence: bool = true,
 
     irq_flag: bool = false,
+
+    /// Raised by `tickTimer` when the 1-byte sample buffer runs dry with
+    /// bytes still to play, and cleared by `completeDma`. Between those two
+    /// points the DMA unit is asking for the bus; `Cpu.read` is what
+    /// actually stalls the CPU and services it.
+    dma_pending: bool = false,
+
 
     /// $4010: IL--.RRRR
     pub fn writeReg0(self: *Dmc, value: u8) void {
@@ -672,16 +683,22 @@ pub const Dmc = struct {
         }
     }
 
-    /// Called every APU cycle -- see `Apu.tick`. `mapper` is read directly
-    /// (no CPU cycle stealing, see the type doc comment) whenever the
-    /// 1-byte sample buffer is empty and a byte remains.
-    pub fn tickTimer(self: *Dmc, mapper: *const Mapper) void {
-        if (self.sample_buffer == null and self.bytes_remaining > 0) {
-            self.sample_buffer = mapper.prgRead(self.current_address);
-            self.current_address = if (self.current_address == 0xFFFF) 0x8000 else self.current_address + 1;
-            self.bytes_remaining -= 1;
-            self.checkCompletion();
-        }
+    /// Store the byte a DMC DMA just fetched, and retire the request.
+    /// Called only by `Cpu.runDmcDma`, which owns the stall cycles and the
+    /// bus access itself -- see the type doc comment.
+    pub fn completeDma(self: *Dmc, value: u8) void {
+        self.dma_pending = false;
+        self.sample_buffer = value;
+        self.current_address = if (self.current_address == 0xFFFF) 0x8000 else self.current_address + 1;
+        self.bytes_remaining -= 1;
+        self.checkCompletion();
+    }
+
+    /// Called every APU cycle -- see `Apu.tick`. An empty sample buffer with
+    /// bytes still to play raises `dma_pending` rather than reading the
+    /// mapper here; `Cpu.read` services it a few CPU cycles later.
+    pub fn tickTimer(self: *Dmc) void {
+        if (self.sample_buffer == null and self.bytes_remaining > 0) self.dma_pending = true;
 
         if (self.timer == 0) {
             // Table is in CPU cycles (halved for the APU-cycle domain, see
@@ -789,7 +806,12 @@ test "Dmc rate 0's output_level changes exactly every dmc_rate_table[0] CPU cycl
     while (i < 20000 and gaps_seen < 5) : (i += 1) {
         cpu_cycles += 1;
         even = !even;
-        if (even) d.tickTimer(&stub);
+        if (even) d.tickTimer();
+        // Stand in for `Cpu.runDmcDma`, which owns the real fetch (ENG-81).
+        // Serviced immediately rather than after the hardware stall: this
+        // test measures the *timer's* period, and the 3-4 stall cycles
+        // would only blur the gap it is asserting on.
+        if (d.dma_pending) d.completeDma(stub.prgRead(d.current_address));
         if (d.output_level != last_level) {
             if (gaps_seen > 0) try testing.expectEqual(@as(u32, dmc_rate_table[0]), cpu_cycles);
             gaps_seen += 1;
@@ -1122,6 +1144,15 @@ pub const Apu = struct {
             self.dmc.bytes_remaining = 0;
         } else if (self.dmc.bytes_remaining == 0) {
             self.dmc.restart();
+            // A *load* DMA: the request goes up on this very write cycle,
+            // not on the next APU tick the way the timer's *reload* request
+            // does. That asymmetry is the whole reason the two cost
+            // different numbers of cycles
+            // (https://www.nesdev.org/wiki/DMA) -- a write can land on
+            // either half of the APU clock, so a load's alignment cycle is
+            // there or not depending on when the game wrote, while a reload
+            // always starts from the same half and so always costs the same.
+            if (self.dmc.sample_buffer == null) self.dmc.dma_pending = true;
         }
     }
 
@@ -1173,7 +1204,7 @@ pub const Apu = struct {
     /// Called once per CPU cycle from `Cpu.tick`. `FrameSequencer.tick`
     /// owns its own cycle counting (see that type's doc comment) -- this
     /// does not pre-increment anything on its behalf.
-    pub fn tick(self: *Apu, mapper: *const Mapper) void {
+    pub fn tick(self: *Apu) void {
         self.applyFrameEvent(self.frame.tick());
 
         self.triangle.tickTimer();
@@ -1182,7 +1213,7 @@ pub const Apu = struct {
             self.pulse1.tickTimer();
             self.pulse2.tickTimer();
             self.noise.tickTimer();
-            self.dmc.tickTimer(mapper);
+            self.dmc.tickTimer();
         }
 
         const raw = mixOutput(self.pulse1.output(), self.pulse2.output(), self.triangle.output(), self.noise.output(), self.dmc.output());
@@ -1324,9 +1355,6 @@ test "a pulse channel driven through its real registers emits the period and dut
     // This drives pulse 1 the way a game would (register writes, then
     // whole CPU cycles through `tick`) and measures the waveform that
     // comes out the other side.
-    var prg = [_]u8{0} ** 0x8000;
-    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}, .horizontal) };
-
     var apu = Apu{};
     apu.writeRegister(0x4015, 0x01); // enable pulse 1
     apu.writeRegister(0x4000, 0b10_1_1_1001); // duty 2 (50%), halt, constant volume 9
@@ -1339,13 +1367,13 @@ test "a pulse channel driven through its real registers emits the period and dut
     const cycles_per_waveform: u32 = 2 * (100 + 1) * 8;
 
     var i: u32 = 0;
-    while (i < cycles_per_waveform) : (i += 1) apu.tick(&m); // settle onto a step boundary
+    while (i < cycles_per_waveform) : (i += 1) apu.tick(); // settle onto a step boundary
 
     var high_cycles: u32 = 0;
     var levels_seen_high: u4 = 0;
     i = 0;
     while (i < cycles_per_waveform) : (i += 1) {
-        apu.tick(&m);
+        apu.tick();
         const out = apu.pulse1.output();
         if (out != 0) {
             high_cycles += 1;
@@ -1374,12 +1402,9 @@ test "the filtered sample leaving the APU is DC-free when silent and swings when
     // what makes the ring's samples the centred, +-1.0-normalized signal
     // ENG-62 specifies. This test is the proof that the DC actually gets
     // blocked rather than being shipped to the worklet as a fixed offset.
-    var prg = [_]u8{0} ** 0x8000;
-    var m = Mapper{ .nrom = mapper_mod.Nrom.init(&prg, &.{}, .horizontal) };
-
     var quiet = Apu{};
     var i: u32 = 0;
-    while (i < 100_000) : (i += 1) quiet.tick(&m); // ~56ms: several time constants of the 90Hz pole
+    while (i < 100_000) : (i += 1) quiet.tick(); // ~56ms: several time constants of the 90Hz pole
     try testing.expect(@abs(quiet.output_sample) < 0.01);
 
     var loud = Apu{};
@@ -1389,12 +1414,12 @@ test "the filtered sample leaving the APU is DC-free when silent and swings when
     loud.writeRegister(0x4003, 0b00001_000);
 
     i = 0;
-    while (i < 100_000) : (i += 1) loud.tick(&m); // let the same DC settle out first
+    while (i < 100_000) : (i += 1) loud.tick(); // let the same DC settle out first
     var min_sample: f32 = 1.0;
     var max_sample: f32 = -1.0;
     i = 0;
     while (i < 1616) : (i += 1) { // one full waveform period
-        loud.tick(&m);
+        loud.tick();
         min_sample = @min(min_sample, loud.output_sample);
         max_sample = @max(max_sample, loud.output_sample);
     }

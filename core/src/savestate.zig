@@ -81,7 +81,7 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 
 /// Bumped only for a change that reinterprets bytes an older reader would
 /// misread -- see the module doc comment. Adding a section is not that.
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -419,6 +419,12 @@ fn sectionBody(comptime dir: Dir, c: *Codec(dir), m: *Machine, comptime id: Sect
             try c.scalar(&ctrl.strobe);
         },
         .mapper => try mapperBody(dir, c, &m.bus.mapper),
+        // `joy_oe` is deliberately absent: it is one cycle of wire state
+        // (which controller /OE line the *previous* bus access asserted --
+        // see `Bus.joy_oe`) and a save-state is only ever taken at an
+        // instruction boundary, where the previous access is never a
+        // contiguous controller read. Saving it would add a byte that can
+        // only ever hold 0.
         .bus => try c.scalar(&m.bus.open_bus),
         else => unreachable,
     }
@@ -574,6 +580,10 @@ fn apuBody(comptime dir: Dir, c: *Codec(dir), a: *apu_mod.Apu) CodecError!void {
     try c.scalar(&a.dmc.bits_remaining);
     try c.scalar(&a.dmc.silence);
     try c.scalar(&a.dmc.irq_flag);
+    // ENG-81: the DMC's sample fetch is a CPU-halting DMA, so "a fetch has
+    // been requested and not yet serviced" is real state. Saving mid-stall
+    // and reloading must resume the stall, not drop the fetch.
+    try c.scalar(&a.dmc.dma_pending);
 
     try c.scalar(&a.frame.mode);
     try c.scalar(&a.frame.irq_inhibit);
