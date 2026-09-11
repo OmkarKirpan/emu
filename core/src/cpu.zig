@@ -380,20 +380,29 @@ pub const Cpu = struct {
     /// (three) is naturally delayed by 1-3 cycles until the next read, as
     /// hardware does.
     ///
-    /// When the halt does take, this cycle *becomes* the DMA's halt cycle:
-    /// the read still happens (the address is already on the bus), but the
-    /// CPU does not advance, so it re-issues the identical read once the
-    /// DMA is done and keeps that second value. Both accesses are real, and
-    /// on a register with read side effects that is exactly the observable
-    /// glitch `dmc_dma_during_read4` measures -- a `$4016` read during DMC
-    /// DMA clocks the controller shift register twice and loses a bit.
+    /// When the halt does take, this cycle *becomes* the DMA's halt cycle,
+    /// and **the halted 6502 keeps re-issuing that same read on every
+    /// no-operation DMA cycle** -- it repeats the last read cycle
+    /// indefinitely, and on a 2A03 those repeats are externally visible
+    /// (https://www.nesdev.org/wiki/DMA). So a `LDA $4016` caught by a DMA
+    /// performs its read on the halt cycle, again on the dummy cycle, again
+    /// on the alignment cycle if there is one, and once more when the CPU
+    /// finally resumes -- with only the DMA's own get cycle, fetching the
+    /// sample from $8000-$FFFF, breaking the run.
+    ///
+    /// That the repeats are reads and not idle cycles is the whole
+    /// observable effect. On `$2007` each one advances the PPU's address
+    /// and read buffer; on `$4016`/`$4017` the contiguous run clocks the
+    /// controller only once (see `Bus.joy_oe`), so the single break the get
+    /// cycle puts in the middle is what costs the sequence one extra clock
+    /// and loses a bit.
     fn read(self: *Cpu, addr: u16) u8 {
         // `oam_dma_active`: OAM DMA has already halted the CPU, so a DMC
         // request arriving mid-copy costs the two cycles `runOamDma`
         // handles itself, not another halt sequence. See its doc comment.
         const halted_value = self.readCycle(addr);
         if (!self.bus.apu.dmc.dma_pending or self.oam_dma_active) return halted_value;
-        self.runDmcDma();
+        self.runDmcDma(addr);
         return self.readCycle(addr);
     }
 
@@ -417,13 +426,16 @@ pub const Cpu = struct {
     /// an alignment cycle *if* the fetch would otherwise land on a put
     /// cycle, and the get cycle that actually fetches the byte.
     ///
-    /// Every one of them runs through `idleCycle`/`tick`, the same
-    /// precedent `runOamDma` set: the PPU keeps advancing and NMI keeps
-    /// being polled while the CPU is frozen, because hardware halts only
-    /// the 6502, never the rest of the console.
-    fn runDmcDma(self: *Cpu) void {
-        self.idleCycle(); // the DMC-only dummy cycle -- no work is done
-        if (!self.nextIsGetCycle()) self.idleCycle(); // alignment
+    /// `halted_addr` is the address the 6502 was reading when it stopped.
+    /// The no-operation cycles re-issue that read rather than idling --
+    /// see `read`'s doc comment for why that is the entire observable
+    /// effect. They still go through `tick`, the same precedent
+    /// `runOamDma` set, so the PPU keeps advancing and NMI keeps being
+    /// polled while the CPU is frozen: hardware halts only the 6502, never
+    /// the rest of the console.
+    fn runDmcDma(self: *Cpu, halted_addr: u16) void {
+        _ = self.readCycle(halted_addr); // the DMC-only dummy cycle
+        if (!self.nextIsGetCycle()) _ = self.readCycle(halted_addr); // alignment
         self.dmcGetCycle();
     }
 
@@ -477,6 +489,7 @@ pub const Cpu = struct {
         self.tick();
         self.snapshotNmiReady();
         self.pollNmi();
+        self.bus.joy_oe = 0; // no bus access, so both /OE lines fall
     }
 
     /// OAMDMA ($4014): copy 256 bytes from $(page)00-$(page)FF into OAM

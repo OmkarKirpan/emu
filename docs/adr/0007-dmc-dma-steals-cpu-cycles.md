@@ -35,11 +35,34 @@ halt check, so a request landing mid-`STA`, mid-RMW (two consecutive
 writes) or mid-interrupt (three) is delayed by 1-3 cycles until the next
 read, exactly as hardware delays it.
 
-**The halted read happens twice.** The cycle the halt takes still performs
-its read -- the address is already on the bus -- and the CPU, not having
-advanced, re-issues the identical read when the DMA finishes, keeping that
-second value. On a register with read side effects both accesses are real,
-which is the glitch these ROMs exist to measure.
+**The halted read repeats on every no-operation DMA cycle.** A halted 6502
+repeats its last read cycle indefinitely, and on a 2A03 those repeats are
+externally visible. So the cycle the halt takes performs the read, the
+dummy cycle performs it again, the alignment cycle performs it again if
+there is one, and the CPU performs it once more when it resumes -- with
+only the DMA's own get cycle, fetching from $8000-$FFFF, breaking the run.
+This is the whole observable effect, and modeling the no-op cycles as idle
+rather than as reads was wrong: `dma_2007_read`'s own source says the DMA
+"causes 2-3 extra $2007 reads", and idling produced one.
+
+**Controllers clock once per contiguous run of reads, not once per read.**
+The joypad ports are not on the address bus at all; they hang off two
+dedicated output-enable lines that stay asserted across adjacent cycles
+reading the same register (`Bus.joy_oe`). Without that rule the repeats
+above would shift the controller three or four bits instead of the one
+hardware loses. With it, the count comes out right for the same reason it
+does on hardware: the get cycle in the middle splits one contiguous run
+into two, so the sequence pays exactly one extra clock.
+
+**A load DMA raises its request on the write cycle; a reload raises it on
+an APU tick.** When a `$4015` write starts a sample, the request goes up
+immediately, on that write's own cycle. When the timer empties the sample
+buffer, it goes up on the APU's own clock. That asymmetry is what makes the
+two cost different numbers of cycles: a write can land on either half of
+the APU clock, so a load's alignment cycle is there or not depending on
+when the game wrote, while a reload always starts from the same half and so
+always costs the same. Modeling both the same way is what left every ROM's
+result one alignment late, and it was the last thing wrong.
 
 **The stall is halt, dummy, optional alignment, get**, per
 https://www.nesdev.org/wiki/DMA -- three or four cycles, the alignment
@@ -70,32 +93,30 @@ protocol and report as console text in nametable 0, so this also grew
 `blargg_harness.zig` a shared nametable-text runner that
 `ppu_sprites_test.zig`'s two 2005-vintage suites now use as well.
 
-`dma_2007_write` and `read_write_2007` pass. The remaining five do not yet,
-and are wired up and marked as a measured gap rather than left out --
-`dmc_dma_test.zig` records exactly what each one reports, and the search
-already done for the residue, so the dead ends are not re-walked.
+Four of the seven pass: `dma_4016_read`, `dma_2007_read`,
+`dma_2007_write` and `read_write_2007`.
 
-The residue is one alignment, not a missing mechanism: `dma_4016_read`
-loses exactly one controller bit on exactly one of its five alignments, as
-hardware does, one alignment later than hardware does it. It is not a phase
-that can be dialed in. Shifting when the request is raised, or when it is
-sampled, cancels out, because the ROM re-locks the code to the DMC timer
-every iteration. Moving the halt without moving the get reproduces the run
-bit for bit -- only the total stall is observable, not its shape. The one
-lever that does not cancel is that the ROM's synchronization loop locks on
-a *load* DMA while the glitch under test is a *reload* DMA, but sweeping
-those independently walks the result in steps of two: load costing four
-cycles gives the fourth alignment, five gives none in the window, three
-makes the loop's period exactly the DMC's and every ROM hangs. The
-reachable answers are even and the wanted one is odd.
+`dma_2007_read` and `double_2007_read` have no verdict of their own -- they
+end in `print_crc` rather than `check_crc`, printing a checksum and exiting
+silently, because the right answer depends on the CPU-PPU alignment the
+console powered into and there is more than one. Their sources list the
+acceptable checksums and the tests assert against that list. This core
+lands on `dma_2007_read`'s three-extra-reads variant, `5E3DF9C4`.
 
-That parity points at the shape of the duplicated access rather than its
-timing -- most plausibly that the extra read is the get cycle spuriously
-selecting the register through the partial address decode the wiki
-describes (bits 4-0 from the 2A03 bus, bits 15-5 from the 6502 core),
-rather than the halt cycle re-running the CPU's own read. Modeling that
-needs the DMA's sample address to reach the decode, which nothing here
-plumbs today.
+Three remain open, and one of them does not belong to this ADR at all:
+
+* Both `sprdma_and_dmc_dma` ROMs want a collision cost constant across the
+  sixteen alignments they sweep. Ours is now nearly constant, 526 clocks
+  for most and 528 for a run at the top end, where before this work it
+  scattered over 526-529. What is left is the boundary between a DMC
+  request serviced inside `runOamDma`'s two-cycle path and one serviced
+  just outside it by `Cpu.read`'s full halt sequence.
+* `double_2007_read` is **not a DMC DMA test**. It includes `shell.inc`
+  directly rather than the suite's `common.inc`, never synchronizes to the
+  DMC and never starts a sample. It reads `lda $20F7,x` with X of `$00`
+  and `$10`; the second crosses a page, so the 6502's discarded dummy read
+  hits `$2007` and the real read hits it again. It measures what a double
+  read does to the PPU's read buffer, and the fix belongs in the PPU.
 
 ## Consequences
 

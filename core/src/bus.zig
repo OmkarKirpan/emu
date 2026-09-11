@@ -114,6 +114,25 @@ pub const Bus = struct {
     /// Last value driven on the data bus; see the open-bus note above.
     open_bus: u8 = 0,
 
+    /// Which joypad port's `/OE` line was asserted by the *previous* bus
+    /// access: 0 for neither, 1 for `$4016`, 2 for `$4017`.
+    ///
+    /// The controller ports are not clocked off the address bus at all --
+    /// they hang off two dedicated output-enable lines from the CPU, and
+    /// `/OE` stays asserted across adjacent cycles that read the same
+    /// register. A contiguous run of reads therefore clocks the shift
+    /// register **once**, not once per read
+    /// (https://www.nesdev.org/wiki/DMA). That only became observable with
+    /// DMC DMA (ENG-81): a halted CPU repeats its read on every no-op DMA
+    /// cycle, so `LDA $4016` interrupted by a DMA issues three or four
+    /// contiguous reads, and counting each of them would shift the
+    /// controller three bits instead of the one hardware loses.
+    ///
+    /// This models the NES-001 / AV Famicom behavior. The RF Famicom gates
+    /// `/OE` to half the clock and does clock on every single read cycle;
+    /// nothing here targets that machine.
+    joy_oe: u8 = 0,
+
     /// Takes no mirroring: it lives on the cartridge now (`Mapper.mirroring`),
     /// which is where MMC1 changes it at runtime.
     pub fn init(m: Mapper) Bus {
@@ -121,13 +140,24 @@ pub const Bus = struct {
     }
 
     pub fn read(self: *Bus, addr: u16) u8 {
+        const contiguous_joy_read = self.joy_oe;
+        self.joy_oe = switch (addr) {
+            0x4016 => 1,
+            0x4017 => 2,
+            else => 0,
+        };
         const value: u8 = switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF],
             0x2000...0x3FFF => self.ppu.readRegister(0x2000 | (addr & 0x0007), &self.mapper),
             0x4000...0x4014 => self.open_bus, // APU write-only regs + OAMDMA: open bus on read
             0x4015 => self.apu.readStatus(),
-            0x4016 => (self.open_bus & 0xFE) | self.controllers[0].read(),
-            0x4017 => (self.open_bus & 0xFE) | self.controllers[1].read(),
+            // `peek` rather than `read` when `/OE` was already asserted for
+            // this same port last cycle: the line never fell, so the shift
+            // register never clocked. See `joy_oe`.
+            0x4016 => (self.open_bus & 0xFE) |
+                (if (contiguous_joy_read == 1) self.controllers[0].peek() else self.controllers[0].read()),
+            0x4017 => (self.open_bus & 0xFE) |
+                (if (contiguous_joy_read == 2) self.controllers[1].peek() else self.controllers[1].read()),
             0x4018...0x5FFF => self.open_bus, // CPU test regs + cartridge expansion
             0x6000...0x7FFF => if (self.mapper.prgRamMap(addr, false)) |off| self.prg_ram[off] else self.open_bus,
             0x8000...0xFFFF => self.mapper.prgRead(addr),
@@ -138,6 +168,7 @@ pub const Bus = struct {
 
     pub fn write(self: *Bus, addr: u16, value: u8) void {
         self.open_bus = value;
+        self.joy_oe = 0; // a write drops both /OE lines -- see `joy_oe`
         switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF] = value,
             0x2000...0x3FFF => self.ppu.writeRegister(0x2000 | (addr & 0x0007), value, &self.mapper),

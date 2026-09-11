@@ -1,27 +1,34 @@
 //! The DMC-DMA conformance stage (ENG-81), per ENG-64's staged test-ROM
-//! harness.
+//! harness -- the gap `apu.zig` and
+//! `docs/adr/0002-apu-mixing-and-filtering.md` carried as explicitly
+//! deferred from M6, now modeled in `Cpu.read` and measured here.
 //!
-//! Two suites, both measuring cycles the CPU loses to the DMC's sample
-//! fetch -- the gap `apu.zig` and `docs/adr/0002-apu-mixing-and-filtering.md`
-//! carried as explicitly deferred from M6:
-//!
-//!   * `dmc_dma_during_read4` -- a DMA landing in the middle of a CPU read,
-//!     stepped one clock later on each of five iterations. The halt cycle
-//!     duplicates the read the CPU was frozen on, which on `$4016` clocks
-//!     the controller shift register an extra time (`dma_4016_read`) and on
-//!     `$2007` re-runs the PPU's read buffer (the four `2007` ROMs). Each
-//!     checks a CRC-32 over every value it printed, so a single wrong cycle
-//!     anywhere in the run fails it.
+//!   * `dmc_dma_during_read4` -- a DMA landing in the middle of a CPU
+//!     read, stepped one clock later on each of five iterations. A halted
+//!     6502 re-issues its read on every no-operation DMA cycle, so on
+//!     `$2007` the DMA costs two or three extra reads through the PPU's
+//!     read buffer, and on `$4016` the contiguous run clocks the
+//!     controller once where an uninterrupted read would have clocked it
+//!     once too -- except that the DMA's own get cycle breaks the run in
+//!     the middle, so the sequence pays one extra clock and loses a bit.
 //!   * `sprdma_and_dmc_dma` -- a DMC DMA colliding with an OAM DMA already
 //!     in progress. DMC wins the cycle and OAM DMA realigns, which is the
 //!     two-cycle case `Cpu.runOamDma` handles inline rather than through
 //!     `Cpu.read`'s full halt sequence.
 //!
-//! Both predate the `$6000` protocol and report as console text in
+//! Both suites predate the `$6000` protocol and report as console text in
 //! nametable 0 (see `blargg_harness.runToNametableOutcome`). This
-//! generation of Blargg's shell words it `"Passed"` / `"Failed"` /
-//! `"Error <n>"`, not the `"PASSED"` / `"FAILED #n"` that
+//! generation of Blargg's shell words its verdict `"Passed"` / `"Failed"`
+//! / `"Error <n>"`, not the `"PASSED"` / `"FAILED #n"` that
 //! `ppu_sprites_test.zig`'s 2005-vintage suites use.
+//!
+//! **Two of these ROMs have no verdict at all.** `dma_2007_read` and
+//! `double_2007_read` end in `print_crc`, not `check_crc` -- they print a
+//! CRC-32 over everything they emitted and exit silently, because the
+//! right answer depends on the CPU-PPU alignment the console powered up
+//! with and there is more than one. Their sources list the acceptable
+//! checksums, so `expectOneOfCrc` below asserts against that list rather
+//! than against a pass marker.
 
 const std = @import("std");
 const testing = std.testing;
@@ -65,60 +72,46 @@ fn expectPass(name: []const u8, rom_bytes: []const u8) !void {
     }
 }
 
-/// The three `dmc_dma_during_read4` ROMs and both `sprdma_and_dmc_dma`
-/// ROMs this model does not yet satisfy. They are vendored, wired up and
-/// run here deliberately rather than left out: the gap is now a measured
-/// number instead of the unmeasured "not implemented" `apu.zig` carried
-/// since M6.
+/// Poll for one of several accepted CRC-32 strings, for the two ROMs that
+/// print a checksum instead of a verdict (see the module doc comment). The
+/// checksums come from each ROM's own source comment.
+fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []const u8) !void {
+    var m: Machine = undefined;
+    try m.init(rom_bytes);
+    var buf: [960]u8 = undefined;
+    while (m.cpu.cycles < 40_000_000) {
+        const target = m.cpu.cycles + 100_000;
+        while (m.cpu.cycles < target) m.cpu.step();
+        const text = harness.nametableText(&m, &buf);
+        for (accepted) |crc| {
+            if (std.mem.indexOf(u8, text, crc)) |_| return;
+        }
+    }
+    std.debug.print("\n{s}: none of the accepted checksums appeared\n", .{name});
+    return error.TestUnexpectedResult;
+}
+
+/// The two `sprdma_and_dmc_dma` ROMs, and `double_2007_read`, which this
+/// model does not yet satisfy. They are vendored, wired up and run rather
+/// than left out, so the gap stays a measured number.
 ///
-/// What each reports today:
-///
-///   * `dma_4016_read` wants `08 08 07 08 08` and gets `08 08 08 07 08`.
-///     The lost controller bit is real and lands on exactly one of the five
-///     alignments, as hardware does -- one alignment late.
-///   * `dma_2007_read` differs on one of five rows (`22 33` where the other
-///     four read `11 22`); `double_2007_read` on the same kind of boundary.
-///   * Both `sprdma_and_dmc_dma` ROMs report 526-529 clocks where the
-///     collision cost should be constant across alignments. Ours splits
-///     into two groups two cycles apart at `T+05`.
-///
-/// `dma_2007_write` and `read_write_2007` pass, which is what establishes
-/// that the mechanism -- halt on a read cycle, dummy, alignment, get,
-/// re-issue -- is right.
-///
-/// **What the offset is not.** It is not a phase that can be dialed in.
-/// The search is recorded here because the obvious knobs are a dead end
-/// and re-trying them costs a three-minute build each:
-///
-///   * Sampling the DMA request before the cycle rather than after (the
-///     more faithful RDY model) moves nothing. Neither does raising the
-///     request a cycle earlier or later. Both cancel out: `sync_dmc.s`
-///     re-locks the code to the DMC timer at the top of every iteration,
-///     so any shift applied to both the lock and the DMA disappears.
-///   * Moving the halt without moving the get -- one fewer no-op before
-///     the get, one more after -- reproduces the previous run *bit for
-///     bit*, same CRC. Only the total stall is observable, not its shape.
-///   * The sync loop locks on the **load** DMA (its `sta $4015` restarts a
-///     one-byte sample and its `bit $4015` looks for the DMA to have
-///     finished in the six cycles between), while the glitch under test is
-///     a **reload** DMA. Those are separate events, so their costs do not
-///     cancel -- but sweeping them independently only walks the result in
-///     steps of two. Load costing 4 gives the fourth alignment; 5 gives the
-///     sixth or later, i.e. no glitch in the window at all; 3 makes the
-///     sync loop's period exactly the DMC's 3424 cycles, so it never drifts
-///     and every ROM hangs. Hardware wants the third. The reachable answers
-///     are even and the answer is odd.
-///
-/// So the residue is a parity, not a phase, and no integer stall length
-/// reaches it. That points at the shape of the duplicated access rather
-/// than its timing -- most likely that the extra read is not the halt
-/// cycle re-running the CPU's read at all, but the *get* cycle spuriously
-/// selecting the register, which https://www.nesdev.org/wiki/DMA describes
-/// as a partial address decode: bits 4-0 taken from the 2A03 bus (the DMA's
-/// own address) and bits 15-5 from the 6502 core. That trigger fires on a
-/// different condition than "the CPU was halted mid-read", and modeling it
-/// would need the DMA's sample address to reach the decode, which nothing
-/// here currently plumbs.
+///   * Both `sprdma_and_dmc_dma` ROMs want a collision cost that is
+///     constant across the sixteen alignments they sweep. Ours is now
+///     almost constant -- 526 clocks for most of them, 528 for a run at
+///     the top end -- where before the halted-read modeling it scattered
+///     across 526-529. What is left is the boundary between a DMC request
+///     serviced inside `runOamDma`'s two-cycle path and one serviced just
+///     outside it by `Cpu.read`'s full halt sequence.
+///   * `double_2007_read` is **not a DMC DMA test at all**, which is worth
+///     knowing before anyone spends time on it here. It includes
+///     `shell.inc` directly rather than the suite's `common.inc`, never
+///     synchronizes to the DMC and never starts a sample. It reads
+///     `lda $20F7,x` with X of `$00` and `$10` -- the second crosses a
+///     page, so the 6502's discarded dummy read hits `$2007` and the real
+///     read hits it again. It is measuring what a double read does to the
+///     PPU's read buffer. Ours prints `D84F6815` against accepted
+///     `85CFD627` / `F018C287` / `440EF923` / `E52F41A5`. The fix belongs
+///     in the PPU, not here.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
@@ -132,12 +125,27 @@ test "dmc_dma_during_read4 read_write_2007" {
     try expectPass("dmc_dma/read_write_2007", @embedFile("dmc_dma_read_write_2007"));
 }
 
-test "dmc_dma_during_read4 dma_2007_read" {
-    try expectKnownGap("dmc_dma/dma_2007_read", @embedFile("dmc_dma_dma_2007_read"));
-}
+// The headline one: a DMA landing inside `LDA $4016` costs the controller
+// one shift, and on exactly one of the five alignments it sweeps. Its own
+// source says so -- "DMC DMA during $4016 read causes extra $4016 read",
+// expecting `08 08 07 08 08` from a routine that counts bits until the
+// controller returns 1.
 test "dmc_dma_during_read4 dma_4016_read" {
-    try expectKnownGap("dmc_dma/dma_4016_read", @embedFile("dmc_dma_dma_4016_read"));
+    try expectPass("dmc_dma/dma_4016_read", @embedFile("dmc_dma_dma_4016_read"));
 }
+
+// "DMC DMA during $2007 read causes 2-3 extra $2007 reads before real
+// read. Number of extra reads depends on CPU-PPU synchronization at
+// reset." -- hence two accepted checksums, for the 2-extra and 3-extra
+// alignments. This core lands on the 3-extra one.
+test "dmc_dma_during_read4 dma_2007_read" {
+    try expectOneOfCrc(
+        "dmc_dma/dma_2007_read",
+        @embedFile("dmc_dma_dma_2007_read"),
+        &.{ "159A7A8F", "5E3DF9C4" },
+    );
+}
+
 test "dmc_dma_during_read4 double_2007_read" {
     try expectKnownGap("dmc_dma/double_2007_read", @embedFile("dmc_dma_double_2007_read"));
 }

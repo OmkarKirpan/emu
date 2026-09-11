@@ -1144,6 +1144,15 @@ pub const Apu = struct {
             self.dmc.bytes_remaining = 0;
         } else if (self.dmc.bytes_remaining == 0) {
             self.dmc.restart();
+            // A *load* DMA: the request goes up on this very write cycle,
+            // not on the next APU tick the way the timer's *reload* request
+            // does. That asymmetry is the whole reason the two cost
+            // different numbers of cycles
+            // (https://www.nesdev.org/wiki/DMA) -- a write can land on
+            // either half of the APU clock, so a load's alignment cycle is
+            // there or not depending on when the game wrote, while a reload
+            // always starts from the same half and so always costs the same.
+            if (self.dmc.sample_buffer == null) self.dmc.dma_pending = true;
         }
     }
 

@@ -419,6 +419,12 @@ fn sectionBody(comptime dir: Dir, c: *Codec(dir), m: *Machine, comptime id: Sect
             try c.scalar(&ctrl.strobe);
         },
         .mapper => try mapperBody(dir, c, &m.bus.mapper),
+        // `joy_oe` is deliberately absent: it is one cycle of wire state
+        // (which controller /OE line the *previous* bus access asserted --
+        // see `Bus.joy_oe`) and a save-state is only ever taken at an
+        // instruction boundary, where the previous access is never a
+        // contiguous controller read. Saving it would add a byte that can
+        // only ever hold 0.
         .bus => try c.scalar(&m.bus.open_bus),
         else => unreachable,
     }
