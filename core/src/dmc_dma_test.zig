@@ -97,7 +97,7 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 ///
 /// Each sweeps a DMC DMA across sixteen one-cycle offsets relative to an
 /// OAM DMA and prints how long the block took. Subtract the 524-clock
-/// baseline for what the DMA cost at that offset. Hardware's rule set
+/// baseline for what the DMA cost there. Hardware's rule set
 /// (https://www.nesdev.org/wiki/DMA and the nesdev "DMC/DMA timing and
 /// quirks" thread):
 ///
@@ -107,33 +107,41 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 ///     1   on the copy's next-to-next-to-last cycle
 ///     3   on the copy's last cycle
 ///
-/// What this core prints, against that baseline:
+/// What this core prints:
 ///
 ///     sprdma      +4 on offsets 00-04, +2 on 05-0F
 ///     sprdma_512  +2 on 00-06 and 0A, +4 on the rest
 ///
-/// **Both shapes are right.** `sprdma` sweeps into the copy -- five offsets
-/// before it at 4, eleven inside at 2. `_512` sweeps out of it, which is
-/// the mirror. Instrumenting where each of the sixteen is serviced confirms
-/// it: eight land inside the copy and eight land outside it entirely.
+/// Both shapes are right. `sprdma` sweeps into the copy, `_512` out of it.
+/// Instrumenting `_512` shows a clean monotonic sweep underneath: offsets
+/// 00-05 are serviced inside the copy loop, 06-07 in `Cpu.runOamDma`'s
+/// tail, and 08-0F outside the copy entirely by `Cpu.read`.
 ///
-/// **The 1 and 3 cases are barely reachable from these ROMs**, which is the
-/// thing worth knowing before picking this up. `Cpu.runOamDma`'s tail path,
-/// which implements them, is entered twice in an entire run of `_512` --
-/// and changing what it charges leaves all sixteen printed values
-/// unchanged. So the residue is not the tail: it is that eight offsets all
-/// come out at +2 where hardware wants six at +2, one at +1 and one at +3.
-/// The offsets that should differ are ones this core services inside the
-/// loop at a flat 2.
+/// Three things a further attempt should know, each of which cost a build
+/// to establish:
 ///
-/// Two things stand in the way of fitting it further. The DMC raises a
-/// reload request on an APU tick, so adjacent one-cycle sweep offsets can
-/// land on the same CPU cycle and cannot be told apart by anything
-/// downstream. And no expected table is published -- the ROM checks a
-/// CRC-32 over its whole output and prints nothing when it fails, so a
-/// wrong guess is indistinguishable from a differently wrong guess.
-/// Getting further probably means a cycle-exact trace from hardware or an
-/// emulator known to pass, not more model-fitting from this side.
+///   * **The printout is quantized to two clocks.** Across every variant
+///     tried -- tail costs of 1, 2, 3 and an exaggerated 21 -- no offset
+///     ever printed an odd number. Hardware's 1 and 3 therefore cannot be
+///     read off this output directly, and fitting the model until some
+///     offset prints +1 or +3 is chasing something the ROM does not
+///     report. A tail cost of 1 prints 524/526 for offsets 06/07, 2 prints
+///     526/526, 3 prints 526/528; the pair does not simply translate.
+///   * **The two tail offsets are indistinguishable to this model.** Both
+///     see the request go up on the same CPU cycle and both end the copy on
+///     the same half of the APU clock, because the DMC raises a reload
+///     request on an APU tick and so cannot resolve the copy's last cycle
+///     from its next-to-next-to-last. Telling them apart needs a finer
+///     request clock than the APU gives, which is the part of hardware this
+///     core does not reproduce.
+///   * **Offset 0A is the real anomaly and the best lead.** It prints +2
+///     while 08, 09 and 0B-0F all print +4, though all eight are serviced
+///     identically, outside the copy, by `Cpu.read`. A monotonic sweep
+///     should not do that. The suspect is `Cpu.runDmcDma`'s conditional
+///     alignment cycle, which makes a standalone DMC DMA cost 3 or 4
+///     depending on the phase the halt lands on, where hardware's "4
+///     normally" is uniform. That is one cycle of difference, printed as
+///     two by the quantization above.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
