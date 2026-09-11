@@ -18,3 +18,7 @@ docs/roms/
 
 # Agent worktrees (transient, created by the Agent tool)
 .claude/worktrees/
+
+# ENG-78: the fetched SingleStepTests/65x02 data set (1.08GB, never
+# vendored) -- see core/tools/fetch-65x02.sh.
+core/.cache/

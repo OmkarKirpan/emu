@@ -229,6 +229,30 @@ pub fn build(b: *std.Build) void {
     const debug_step = b.step("debug", "Run the native CLI debugger against a ROM: zig build debug -- path/to.nes");
     debug_step.dependOn(&run_debug_exe.step);
 
+    // ENG-78: the opt-in per-cycle CPU sweep against SingleStepTests/65x02.
+    // Its own executable root (`src/cpu_sweep.zig`), like the debugger above
+    // and for one extra reason: declaring `nes_flat_bus` in a *root* source
+    // file is what switches `Bus` to the flat 64KB address space the data
+    // set assumes (see `src/sweep_config.zig`), which a `zig build test`
+    // binary -- whose root is Zig's own test runner -- cannot do.
+    //
+    // Deliberately not wired into `test_step` above and never into CI: the
+    // data set is 1.08GB, is never vendored, and is fetched on demand into
+    // the gitignored `.cache/` by `tools/fetch-65x02.sh`.
+    const sweep_mod = b.createModule(.{
+        .root_source_file = b.path("src/cpu_sweep.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sweep_exe = b.addExecutable(.{ .name = "nes-cpu-sweep", .root_module = sweep_mod });
+    const run_sweep_exe = b.addRunArtifact(sweep_exe);
+    // Anchored to this build root so the default `.cache/65x02/nes6502/v1`
+    // resolves to the same directory whatever the caller's shell was in.
+    run_sweep_exe.setCwd(b.path("."));
+    if (b.args) |args| run_sweep_exe.addArgs(args);
+    const sweep_step = b.step("test-cpu-sweep", "Per-cycle CPU sweep against SingleStepTests/65x02 (opt-in; needs tools/fetch-65x02.sh)");
+    sweep_step.dependOn(&run_sweep_exe.step);
+
     // The wasm32-freestanding build: `src/wasm.zig` (not `root.zig` — see
     // its own doc comment) is the actual delivery artifact as of ENG-69
     // (M4), exporting the ABI ENG-60 designed. Still no shared_memory/
