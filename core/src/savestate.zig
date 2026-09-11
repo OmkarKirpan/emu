@@ -81,7 +81,7 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 
 /// Bumped only for a change that reinterprets bytes an older reader would
 /// misread -- see the module doc comment. Adding a section is not that.
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -574,6 +574,10 @@ fn apuBody(comptime dir: Dir, c: *Codec(dir), a: *apu_mod.Apu) CodecError!void {
     try c.scalar(&a.dmc.bits_remaining);
     try c.scalar(&a.dmc.silence);
     try c.scalar(&a.dmc.irq_flag);
+    // ENG-81: the DMC's sample fetch is a CPU-halting DMA, so "a fetch has
+    // been requested and not yet serviced" is real state. Saving mid-stall
+    // and reloading must resume the stall, not drop the fetch.
+    try c.scalar(&a.dmc.dma_pending);
 
     try c.scalar(&a.frame.mode);
     try c.scalar(&a.frame.irq_inhibit);

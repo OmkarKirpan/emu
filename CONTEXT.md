@@ -141,7 +141,9 @@ deliberately-unmodeled hardware ambiguity (MMC3 `$A001` bit 7's
 MMC6-incompatibility problem), not a bug. See
 `docs/adr/0001-audio-playback-no-howler.md` for the threaded-audio pipeline
 decision, `docs/adr/0002-apu-mixing-and-filtering.md` for the mixer/filter
-decisions and the deferred DMC-DMA-stealing gap,
+decisions (and its DMC-DMA-stealing deferral, now superseded by
+`docs/adr/0007-dmc-dma-steals-cpu-cycles.md`, ENG-81, which models the
+stall in `Cpu.read` and vendors the two suites that measure it),
 `docs/adr/0003-mapper-owns-mirroring-and-gets-a-per-cycle-tick.md` for the
 two interface changes MMC1 forced,
 `docs/adr/0004-mmc3-a12-from-chrread-not-a-new-hook.md` for MMC3's A12

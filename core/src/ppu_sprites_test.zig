@@ -52,25 +52,6 @@ test "oam_stress" {
 
 // ------------------------------------------- nametable-text-protocol suites
 
-/// See the module doc comment: nametable 0's tile grid always lives at
-/// `Ppu.vram` offset 0 regardless of mirroring mode (`physicalNametable`
-/// maps logical nametable 0 to physical bank 0 either way), so reading the
-/// first 960 bytes (32x30 tiles, before the 64-byte attribute table at
-/// $3C0-$3FF) directly is valid for any of these ROMs' mirroring header.
-fn nametableText(m: *const Machine, buf: *[960]u8) []const u8 {
-    @memcpy(buf, m.bus.ppu.vram[0..960]);
-    return buf[0..960];
-}
-
-/// Generous ceiling on total emulated CPU cycles (roughly 45 seconds of NES
-/// time). Every ROM in these two suites reports a result in well under a
-/// second of NES time in practice; this exists purely so a genuine hang
-/// fails the test instead of hanging CI.
-const max_cycles: u64 = 80_000_000;
-const poll_interval_cycles: u64 = 20_000;
-
-const NametableResult = union(enum) { passed, failed: u32 };
-
 /// Parse the digits immediately following a `"FAILED"` match (works for
 /// both `"FAILED #2"` and `"FAILED: #2"` -- the two suites format this
 /// differently, see each `ATTRIBUTION.md`).
@@ -85,24 +66,22 @@ fn failureCode(text: []const u8, failed_at: usize) ?u32 {
     return code;
 }
 
-fn runToResult(m: *Machine) !NametableResult {
-    var buf: [960]u8 = undefined;
-    while (m.cpu.cycles < max_cycles) {
-        const target = m.cpu.cycles + poll_interval_cycles;
-        while (m.cpu.cycles < target) m.cpu.step();
-        const text = nametableText(m, &buf);
-        if (std.mem.indexOf(u8, text, "PASSED")) |_| return .passed;
-        if (std.mem.indexOf(u8, text, "FAILED")) |idx| {
-            if (failureCode(text, idx)) |code| return .{ .failed = code };
-        }
+/// This generation of the protocol shouts its verdict. The polling loop
+/// itself lives in `blargg_harness.zig`, shared with `dmc_dma_test.zig`,
+/// whose ROMs use a later revision of Blargg's shell that says `"Passed"`
+/// / `"Failed"` / `"Error <n>"` instead.
+fn match(text: []const u8) ?harness.NametableOutcome {
+    if (std.mem.indexOf(u8, text, "PASSED")) |_| return .passed;
+    if (std.mem.indexOf(u8, text, "FAILED")) |idx| {
+        if (failureCode(text, idx)) |code| return .{ .failed = code };
     }
-    return error.Timeout;
+    return null;
 }
 
 fn expectPassText(name: []const u8, rom_bytes: []const u8) !void {
     var m: Machine = undefined;
     try m.init(rom_bytes);
-    switch (try runToResult(&m)) {
+    switch (try harness.runToNametableOutcome(&m, match)) {
         .passed => {},
         .failed => |code| {
             std.debug.print("\n{s}: FAILED #{d}\n", .{ name, code });
