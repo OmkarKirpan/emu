@@ -245,6 +245,40 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 /// streams `crc(S^D) = crc(S) ^ crc(D) ^ crc(0)`, so a candidate table
 /// costs a handful of XORs instead of rehashing 4179 bytes. That is what
 /// makes the enumerations above instant.
+///
+/// **How Mesen2 does it, and the three places this core diverges.**
+/// Mesen2 passes both ROMs. Its `NesCpu::ProcessPendingDma`
+/// (`Core/NES/NesCpu.cpp`) is one loop over both DMA units rather than
+/// two mechanisms, and the comparison is worth keeping because the
+/// differences are structural, not a different cost table.
+///
+///   * **It has no OAM-DMA alignment step of its own.**
+///     `RunDMATransfer` sets only `_spriteDmaTransfer` and `_needHalt`;
+///     the 513/514 falls out of the shared loop's "align to read cycle"
+///     branch, the same branch that aligns a DMC get. This core hardcodes
+///     `if (cycles % 2 == 1) idleCycle()` plus an unconditional halt.
+///   * **Sprite-DMA cycles absorb the DMC's halt and dummy cycles.** Its
+///     `processCycle` retires one of `_needHalt`/`_needDummyRead` on
+///     *every* cycle of the loop, whatever that cycle is doing -- the
+///     comment says so outright. That is what makes a mid-copy collision
+///     cost 2 and a boundary collision 1 or 3 without anyone computing a
+///     cost. `runOamDma` here charges a flat get+realign inline and then
+///     a post-hoc `dmcTailPrepCycles`, which is exactly the fixed-penalty
+///     shape that gets the boundary wrong: it is the direct cause of the
+///     two `_512` errors above (offsets 04-05 and 0A-0B).
+///   * **Its OAM DMA halts on a read, like every other DMA.**
+///     `ProcessPendingDma` runs from the CPU's next *read*, so the copy
+///     begins a cycle later than it does here, where `write` calls
+///     `runOamDma` inline on the `$4014` write cycle itself. That shifts
+///     the copy's phase against the DMC's independent schedule, and is
+///     the best remaining candidate for `sprdma`'s missing parity term.
+///
+/// One hypothesis is already eliminated: `nextIsGetCycle` reads
+/// `apu.even_cycle` while `runOamDma` tests `cycles % 2`, but `tick`
+/// increments `cycles` and then flips `even_cycle`, so the two are the
+/// same clock and the two DMA paths are not keyed to different phases.
+/// Mesen2 uses plain CPU-cycle parity (`CycleCount & 1`) for both, which
+/// is the same choice.
 fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
     _ = name;
     _ = rom_bytes;
