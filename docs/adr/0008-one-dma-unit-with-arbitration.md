@@ -94,6 +94,9 @@ routine cannot see it in this emulator and plainly can on hardware. See
 - `idleCycle` is now only `step`'s jammed-CPU path. The DMA unit never
   idles: a halted 6502 re-issues its read, so spare DMA cycles go through
   `readCycle`, which is what makes the repeats externally visible.
+  *(ENG-88 later removed `idleCycle` outright: a JAMmed core keeps driving
+  the address bus too, so that last path became a `read` as well, and this
+  core now has no cycle that skips the bus.)*
 - OAM DMA's cost is no longer attributable to the `STA $4014` instruction;
   it lands on the instruction that follows. Anything measuring per-
   instruction cycles across a DMA has to account for that.

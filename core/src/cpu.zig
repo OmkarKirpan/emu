@@ -252,11 +252,19 @@ pub const Cpu = struct {
     /// interrupt logic here never has to know which mapper is installed.
     irq_line: bool = false,
 
-    /// Set by one of the twelve `JAM` opcodes. A real NMOS core in this state
-    /// halts with the address bus floating and only a RESET recovers it; we
-    /// model it as "burn one cycle per step, PC frozen" and leave it to the
-    /// caller to notice. See `jammed` handling in `step`.
+    /// Set by one of the twelve `JAM` opcodes. Only a RESET clears it.
+    ///
+    /// A halted NMOS core does not stop driving the bus: it goes on issuing
+    /// read cycles at the interrupt vectors for as long as it is clocked.
+    /// `step` models that as one such read per call -- see `jamAddress` for
+    /// the sequence and `step` for why one cycle per call is the right
+    /// granularity.
     jammed: bool = false,
+
+    /// How far into the halt sequence `jamAddress` is. Saturates at 3,
+    /// which is the repeating tail, so it needs no wider type and a resumed
+    /// save-state lands back on the same address the run was driving.
+    jam_cycle: u2 = 0,
 
     /// Latched result of the interrupt poll performed at the end of the
     /// previous instruction. Hardware polls the interrupt lines during an
@@ -330,10 +338,9 @@ pub const Cpu = struct {
     /// (the fixed NTSC ratio) to match.
     ///
     /// **This is the only place `cycles` is incremented, deliberately.** Every
-    /// cycle the core spends — bus accesses and the idle cycle a jammed CPU
-    /// burns alike — funnels through here, so a jammed CPU still advances
-    /// video instead of freezing the picture, which is not what hardware
-    /// does.
+    /// cycle the core spends — a halted core's vector reads included —
+    /// funnels through here, so a jammed CPU still advances video instead of
+    /// freezing the picture, which is not what hardware does.
     ///
     /// **Why there's a poll wedged between the first and second PPU dot.**
     /// `read`/`write` poll NMI once more, *after* this returns and after the
@@ -368,24 +375,23 @@ pub const Cpu = struct {
 
     /// Re-latch the CPU's edge-triggered NMI input from the PPU's current
     /// (vblank_flag AND nmi_enable) output level. Called mid-`tick` (after
-    /// the first of this cycle's 3 PPU dots), after every bus access, and
-    /// after the idle cycle a jammed CPU burns — see `tick`'s doc comment
-    /// for why the split timing matters.
+    /// the first of this cycle's 3 PPU dots) and after every bus access —
+    /// see `tick`'s doc comment for why the split timing matters.
     fn pollNmi(self: *Cpu) void {
         self.setNmiLine(self.bus.ppu.nmiSignal());
     }
 
     /// Snapshot `nmi_ready` from `nmi_pending` as it stands *after* this
     /// cycle's 3 PPU dots (`tick`, mid-`tick` poll included) but *before*
-    /// this cycle's own bus access. Called by every `read`/`write` (and the
-    /// jammed-CPU idle cycle) right after `tick` returns — see `nmi_ready`'s
-    /// doc comment for why this ordering is what gives `step` the right
-    /// dispatch timing: an edge already visible by the time this cycle's 3
-    /// dots have ticked (whether latched earlier or by `tick`'s own
-    /// mid-point poll) is ready to dispatch as soon as *this* instruction
-    /// finishes, while an edge this cycle's own *access* produces (e.g. a
-    /// write enabling NMI) is deliberately one snapshot too late to affect
-    /// this instruction's dispatch decision, only the next one's.
+    /// this cycle's own bus access. Called by every `read`/`write` right
+    /// after `tick` returns — see `nmi_ready`'s doc comment for why this
+    /// ordering is what gives `step` the right dispatch timing: an edge
+    /// already visible by the time this cycle's 3 dots have ticked (whether
+    /// latched earlier or by `tick`'s own mid-point poll) is ready to
+    /// dispatch as soon as *this* instruction finishes, while an edge this
+    /// cycle's own *access* produces (e.g. a write enabling NMI) is
+    /// deliberately one snapshot too late to affect this instruction's
+    /// dispatch decision, only the next one's.
     fn snapshotNmiReady(self: *Cpu) void {
         self.nmi_ready = self.nmi_pending;
     }
@@ -615,21 +621,6 @@ pub const Cpu = struct {
         self.latchDmaRequest();
     }
 
-    /// Advance the clock by one CPU cycle with no bus access: `tick` plus
-    /// the same NMI re-snapshot/re-poll pair `read`/`write` perform around
-    /// their own access, minus the access itself. Used for `step`'s
-    /// jammed-CPU idle cycle, which burns CPU time with nothing
-    /// semantically observable happening. The DMA unit no longer idles at
-    /// all -- a halted 6502 re-issues its read, so `runDma`'s spare cycles
-    /// go through `readCycle`. See `read`'s doc comment.
-    fn idleCycle(self: *Cpu) void {
-        self.tick();
-        self.snapshotNmiReady();
-        self.pollNmi();
-        self.bus.joy_oe = 0; // no bus access, so both /OE lines fall
-        self.latchDmaRequest();
-    }
-
     fn fetch(self: *Cpu) u8 {
         const v = self.read(self.pc);
         self.pc +%= 1;
@@ -743,6 +734,7 @@ pub const Cpu = struct {
         self.pc = (@as(u16, hi) << 8) | lo;
         self.p.i = true;
         self.jammed = false;
+        self.jam_cycle = 0;
         self.nmi_pending = false;
         self.nmi_ready = false;
         self.irq_ready = false;
@@ -750,6 +742,29 @@ pub const Cpu = struct {
     }
 
     // ------------------------------------------------------------- stepping
+
+    /// The address a halted core drives on its `jam_cycle`-th cycle since
+    /// the JAM.
+    ///
+    /// Counting from the cycle after the JAM's own operand read, an NMOS
+    /// 6502 puts $FFFF, $FFFE, $FFFE on the bus and then holds $FFFF for as
+    /// long as it is clocked. That is what `SingleStepTests/65x02` records
+    /// across all 10,000 scenarios of every one of the twelve opcodes (its
+    /// window is 11 cycles, of which the last six are all $FFFF), and it is
+    /// the tail of an interrupt sequence the core started and can no longer
+    /// finish: the vector fetch is the last thing the stuck timing state
+    /// still drives.
+    ///
+    /// Nothing observable depends on the exact addresses -- a jammed CPU
+    /// ends the program -- but reads at $FFFE/$FFFF are what a cartridge
+    /// sees on hardware, so this is cheaper to model than to explain away.
+    fn jamAddress(self: *const Cpu) u16 {
+        return switch (self.jam_cycle) {
+            0 => 0xFFFF,
+            1, 2 => 0xFFFE,
+            3 => 0xFFFF,
+        };
+    }
 
     /// Run one instruction, or one interrupt sequence if one is due.
     ///
@@ -766,13 +781,23 @@ pub const Cpu = struct {
     /// nothing exercised by this milestone's test ROMs needs.
     pub fn step(self: *Cpu) void {
         if (self.jammed) {
-            // A jammed core still consumes bus cycles, so this must go
-            // through `tick` like every other cycle -- see `idleCycle`'s
-            // doc comment. No bus access happens this cycle, but NMI state
-            // is still re-derived for consistency with every other path (a
-            // jammed CPU can never service it anyway -- only RESET
-            // recovers from JAM).
-            self.idleCycle();
+            // One halt cycle per call. The sequence never ends on hardware,
+            // so *something* has to bound it, and the instruction boundary
+            // is the only bound this core has: `step`'s contract is "advance
+            // the machine by one unit of CPU work", and for a halted core
+            // that unit is a single bus cycle. Everything above the CPU --
+            // `Machine.runFrame`, the debugger, the sweep -- already calls
+            // `step` in a loop, so each keeps clocking the console at the
+            // rate hardware would.
+            //
+            // It is a real read, not an idle cycle: the address bus stays
+            // driven (see `jamAddress`), which is what the `65x02` data set
+            // records and, incidentally, what lets a DMA still halt a
+            // jammed core on it, as `read` does for any other read cycle.
+            // NMI is polled like anywhere else and can never be serviced --
+            // only RESET recovers from JAM.
+            _ = self.read(self.jamAddress());
+            self.jam_cycle +|= 1;
             return;
         }
 
@@ -1590,14 +1615,20 @@ pub const Cpu = struct {
                 self.storeHigh(t, self.s);
             },
 
-            // JAM: the twelve opcodes that halt the CPU with the address bus
-            // floating. Only RESET recovers. Modeled as a sticky halt rather
-            // than a panic so a misbehaving ROM does not take the emulator
-            // down with it; nestest never executes one.
+            // JAM: the twelve opcodes that halt the CPU. Only RESET
+            // recovers. Modeled as a sticky halt rather than a panic so a
+            // misbehaving ROM does not take the emulator down with it;
+            // nestest never executes one.
+            //
+            // The operand read happens and PC stays where it left it, one
+            // past the opcode: the halt catches the core after that fetch,
+            // not before, so PC is *frozen*, not rewound. The halt cycles
+            // themselves are `step`'s, not this instruction's -- see
+            // `jammed`.
             0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2 => {
                 _ = self.read(self.pc);
-                self.pc -%= 1; // the opcode fetch is retried forever
                 self.jammed = true;
+                self.jam_cycle = 0;
             },
         }
     }
@@ -2311,16 +2342,35 @@ test "a pending NMI hijacks BRK's vector but the pushed B flag stays set" {
     try testing.expect(!h.cpu.nmi_pending);
 }
 
-test "JAM halts the CPU without advancing PC" {
+test "JAM freezes PC one past the opcode and keeps driving the vectors" {
     var h: TestHarness = undefined;
     h.init(&[_]u8{0x02});
     h.cpu.step();
     try testing.expect(h.cpu.jammed);
-    try testing.expectEqual(@as(u16, 0xC000), h.cpu.pc);
-    const cycles = h.cpu.cycles;
-    h.cpu.step();
-    try testing.expect(h.cpu.cycles > cycles);
-    try testing.expectEqual(@as(u16, 0xC000), h.cpu.pc);
+    // Two cycles: the opcode fetch and the operand read that PC stops on.
+    try testing.expectEqual(@as(u16, 0xC001), h.cpu.pc);
+    try testing.expectEqual(@as(u64, 2), h.cpu.cycles);
+
+    // $FFFF, $FFFE, $FFFE, then $FFFF for as long as it is clocked -- one
+    // bus cycle per `step`, with PC frozen throughout. See `jamAddress`.
+    // Which vector byte was read is read back off `Bus.open_bus`, since the
+    // two vector bytes are given distinguishable values below.
+    h.prg[0x7FFE] = 0xAA; // $FFFE
+    h.prg[0x7FFF] = 0xE2; // $FFFF
+    const want = [_]u8{ 0xE2, 0xAA, 0xAA, 0xE2, 0xE2, 0xE2 };
+    for (want) |value| {
+        const cycles = h.cpu.cycles;
+        h.cpu.step();
+        try testing.expectEqual(cycles + 1, h.cpu.cycles);
+        try testing.expectEqual(value, h.bus.open_bus);
+        try testing.expectEqual(@as(u16, 0xC001), h.cpu.pc);
+        try testing.expect(h.cpu.jammed);
+    }
+
+    // Only RESET recovers, and it clears the halt sequence with it.
+    h.cpu.reset();
+    try testing.expect(!h.cpu.jammed);
+    try testing.expectEqual(@as(u2, 0), h.cpu.jam_cycle);
 }
 
 test "a mapper-asserted IRQ is seen by the CPU without mapper-specific code" {

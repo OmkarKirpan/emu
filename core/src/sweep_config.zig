@@ -39,9 +39,10 @@ pub const FlatOp = struct { addr: u16, value: u8, write: bool };
 ///
 /// Fixed capacity, no allocator: the longest thing a single `Cpu.step` can
 /// emit is a 7-cycle instruction or interrupt sequence. The headroom is for
-/// the JAM opcodes, whose data-set entries run 11 cycles (see
-/// `cpu_sweep.zig` on why they are skipped by default). `overflowed` makes a
-/// miscount loud rather than silently truncating into a passing comparison.
+/// the JAM opcodes, whose data-set entries run 11 cycles and which the sweep
+/// reaches by stepping a halted core repeatedly into the same log (see
+/// `cpu_sweep.zig`). `overflowed` makes a miscount loud rather than silently
+/// truncating into a passing comparison.
 pub const FlatLog = struct {
     ops: [32]FlatOp = undefined,
     len: usize = 0,

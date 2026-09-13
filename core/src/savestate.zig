@@ -83,7 +83,9 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 /// misread -- see the module doc comment. Adding a section is not that.
 /// 4 (ENG-86): the CPU section grew the DMA unit's state, in the middle of
 /// a fixed-layout section, so every field after it shifts.
-pub const format_version: u32 = 4;
+/// 5 (ENG-88): the CPU section grew `jam_cycle` next to `jammed`, ahead of
+/// that same DMA state, which shifts it again.
+pub const format_version: u32 = 5;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -486,6 +488,12 @@ fn cpuBody(comptime dir: Dir, c: *Codec(dir), cpu: *cpu_mod.Cpu) CodecError!void
     try c.scalar(&cpu.irq_ready);
     try c.scalar(&cpu.poll_i_override);
     try c.scalar(&cpu.jammed);
+    // ENG-88: which cycle of the halt sequence a jammed core is on. Only
+    // meaningful while `jammed`, and only observable as the address the
+    // halted core drives, but it is one byte and leaving it out would make
+    // a resumed state's first bus cycle differ from the run it came from --
+    // which `determinism.zig` hashes.
+    try c.scalar(&cpu.jam_cycle);
 
     // ENG-86: the DMA unit's own state. A `$4014` write only *requests* the
     // copy now -- it begins on the CPU's next read cycle -- so a state saved
