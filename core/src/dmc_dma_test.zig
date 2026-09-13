@@ -234,12 +234,35 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
 /// with it.
 ///
 /// `_512` needs that same parity term plus two cost corrections, both of
-/// them cases this core does not implement: offsets 04-05 want hardware's
-/// "1 on the copy's next-to-next-to-last cycle" where this core charges
-/// 2, and offsets 0A-0B want "3 landing on a CPU write" where this core
-/// charges 3 only on 0A and 4 on 0B. Note the expected costs hold for two
-/// consecutive offsets at a time, which matches the measured fact that
-/// the DMC advances one copy index every two offsets.
+/// them boundary cases: offsets 04-05 want hardware's "1 on the copy's
+/// next-to-next-to-last cycle" and offsets 0A-0B want "3 landing on a CPU
+/// write". Note the expected costs hold for two consecutive offsets at a
+/// time, which matches the measured fact that the DMC advances one copy
+/// index every two offsets.
+///
+/// **What the arbitration rewrite changed (ADR 0008).** Replacing the two
+/// DMA mechanisms with one per-cycle arbitration loop got offset 04 right
+/// -- it now prints 524, the expected value -- which is the first of those
+/// two boundary cases. The full suite stays green and all four
+/// `dmc_dma_during_read4` ROMs still pass.
+///
+/// It did **not** move `sprdma` at all: its sixteen values and its
+/// checksum are byte-identical before and after. That is worth stating
+/// plainly, because it settles something. The parity term is not an
+/// arbitration effect. Neither is it the phase the copy starts on: the
+/// rewrite deferred the copy to the CPU's next read, moved the halt test
+/// to before the read cycle, and flipped `nextIsGetCycle` to the literal
+/// Mesen2 polarity -- three changes that each shift the copy against the
+/// get/put clock, that together fixed OAM DMA's own 513/514 parity, and
+/// that between them changed `sprdma`'s printed output by nothing.
+///
+/// So the remaining gap is in what the ROM's clock can resolve, not in
+/// what the DMA costs. `$E280` times the block against the DMC's own
+/// playback, and `Apu.tick` advances `dmc.tickTimer` only on
+/// `even_cycle` -- a free-running 2-cycle grid. That is correct hardware
+/// (the DMC timer runs at CPU/2) and is not by itself the bug, but it is
+/// where a one-cycle difference is being swallowed, and it is where the
+/// next attempt should look rather than in `runDma`.
 ///
 /// For any further search, note CRC-32 is affine: for equal-length
 /// streams `crc(S^D) = crc(S) ^ crc(D) ^ crc(0)`, so a candidate table
