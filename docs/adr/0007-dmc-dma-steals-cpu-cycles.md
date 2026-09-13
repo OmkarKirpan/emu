@@ -2,6 +2,10 @@
 
 ## Status
 
+Superseded in part by [ADR 0008](0008-one-dma-unit-with-arbitration.md) (2026-09-13),
+which replaces the two DMA mechanisms below with one arbitrated loop. The
+halt/stall rules here still hold; only their implementation moved.
+
 Accepted (2026-09-11). Implemented as part of [ENG-81](https://linear.app/okirpan/issue/ENG-81/dmc-dma-does-not-steal-cpu-cycles).
 Supersedes the "DMC DMA stealing: not modeled" decision in
 [ADR 0002](0002-apu-mixing-and-filtering.md) (ENG-71, M6).

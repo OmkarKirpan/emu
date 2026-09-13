@@ -81,7 +81,9 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 
 /// Bumped only for a change that reinterprets bytes an older reader would
 /// misread -- see the module doc comment. Adding a section is not that.
-pub const format_version: u32 = 3;
+/// 4 (ENG-86): the CPU section grew the DMA unit's state, in the middle of
+/// a fixed-layout section, so every field after it shifts.
+pub const format_version: u32 = 4;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -484,6 +486,18 @@ fn cpuBody(comptime dir: Dir, c: *Codec(dir), cpu: *cpu_mod.Cpu) CodecError!void
     try c.scalar(&cpu.irq_ready);
     try c.scalar(&cpu.poll_i_override);
     try c.scalar(&cpu.jammed);
+
+    // ENG-86: the DMA unit's own state. A `$4014` write only *requests* the
+    // copy now -- it begins on the CPU's next read cycle -- so a state saved
+    // between those two instructions has a copy owed and nothing in the
+    // register file to say so. `dmc_pending_prev` goes too: it is the edge
+    // detector for the DMC's request line, and restoring it low against a
+    // line that is already high would manufacture a second halt.
+    try c.scalar(&cpu.halt_pending);
+    try c.scalar(&cpu.dmc_dummy_pending);
+    try c.scalar(&cpu.oam_dma_pending);
+    try c.scalar(&cpu.oam_dma_page);
+    try c.scalar(&cpu.dmc_pending_prev);
 }
 
 /// Everything a mid-scanline resume needs, per ENG-61 -- including the

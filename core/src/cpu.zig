@@ -290,11 +290,35 @@ pub const Cpu = struct {
     /// `05-nmi_timing` exercises.
     nmi_ready: bool = false,
 
-    /// Set for the duration of `runOamDma`. The CPU is already halted while
-    /// OAM DMA runs, so a DMC request arriving mid-copy must not trigger
-    /// `read`'s full halt sequence -- `runOamDma` services it directly, at
-    /// the cheaper cost hardware charges. See both doc comments.
-    oam_dma_active: bool = false,
+    /// **The DMA unit's own state, shared by both DMAs (ENG-86).** There is
+    /// one DMA mechanism here, not two: `runDma` arbitrates OAM DMA and DMC
+    /// DMA against each other cycle by cycle, and every cost hardware
+    /// charges -- 513/514 for a copy, 3/4 for a standalone sample fetch, and
+    /// the 1, 2 or 3 a collision costs depending on where in the copy it
+    /// lands -- falls out of that arbitration instead of being computed.
+    ///
+    /// `halt_pending` is the DMA unit's RDY assert: raised by a `$4014`
+    /// write or by a DMC request, retired by the first DMA cycle. It is what
+    /// `read` dispatches on, and that is what keeps the halt on a read
+    /// cycle -- `write` never checks it, so a request landing mid-`STA`,
+    /// mid-RMW or mid-interrupt waits for the next read exactly as hardware
+    /// makes it wait.
+    halt_pending: bool = false,
+    /// The DMC's extra dummy cycle, retired the same way. Only a DMC request
+    /// sets it; an OAM DMA has no dummy cycle of its own, which is why a
+    /// copy costs 513 rather than 514 when it needs no alignment.
+    dmc_dummy_pending: bool = false,
+    /// A `$4014` write *requests* the copy; it does not perform it. The copy
+    /// begins on the CPU's next read cycle, like every other DMA halt, so
+    /// this outlives the write that set it and is save-state state.
+    oam_dma_pending: bool = false,
+    oam_dma_page: u8 = 0,
+    /// Rising-edge detector for `Dmc.dma_pending`, sampled at the end of
+    /// every cycle (see `latchDmaRequest`). The DMC raises its request
+    /// either on an APU tick or on the `$4015` write that starts a sample,
+    /// and only the edge may set `halt_pending`/`dmc_dummy_pending` -- the
+    /// level stays high until the fetch actually happens.
+    dmc_pending_prev: bool = false,
 
     pub fn init(bus: *Bus) Cpu {
         return .{ .bus = bus };
@@ -375,7 +399,24 @@ pub const Cpu = struct {
         self.snapshotNmiReady();
         const value = self.bus.read(addr);
         self.pollNmi();
+        self.latchDmaRequest();
         return value;
+    }
+
+    /// Sample the DMC's request line at the end of a cycle and convert its
+    /// rising edge into the DMA unit's halt and dummy cycles. Called from
+    /// every cycle helper rather than from `tick`, because the edge has to
+    /// be seen on the cycle that raised it: a `$4015` write starts a sample
+    /// *during* the bus access, after that cycle's `tick` has already run,
+    /// and ADR 0007 records that getting this one cycle late is what left
+    /// every ROM's result an alignment behind.
+    fn latchDmaRequest(self: *Cpu) void {
+        const pending = self.bus.apu.dmc.dma_pending;
+        if (pending and !self.dmc_pending_prev) {
+            self.halt_pending = true;
+            self.dmc_dummy_pending = true;
+        }
+        self.dmc_pending_prev = pending;
     }
 
     /// **Why a read cycle is where DMC DMA lands (ENG-81).** The DMC's
@@ -404,12 +445,16 @@ pub const Cpu = struct {
     /// cycle puts in the middle is what costs the sequence one extra clock
     /// and loses a bit.
     fn read(self: *Cpu, addr: u16) u8 {
-        // `oam_dma_active`: OAM DMA has already halted the CPU, so a DMC
-        // request arriving mid-copy costs the two cycles `runOamDma`
-        // handles itself, not another halt sequence. See its doc comment.
-        const halted_value = self.readCycle(addr);
-        if (!self.bus.apu.dmc.dma_pending or self.oam_dma_active) return halted_value;
-        self.runDmcDma(addr);
+        // Checked *before* this cycle runs, not after. A request that goes
+        // up during a read cycle cannot be halted by that same cycle -- the
+        // read has already happened -- so it waits for the next one.
+        if (self.halt_pending) {
+            self.halt_pending = false;
+            _ = self.readCycle(addr); // the halt cycle
+            // Everything the DMA unit still owes -- the DMC's dummy, either
+            // unit's alignment, the copy itself -- is arbitrated in `runDma`.
+            self.runDma(addr);
+        }
         return self.readCycle(addr);
     }
 
@@ -424,26 +469,92 @@ pub const Cpu = struct {
     /// ("3421+4 clocks per iter", in its `sync_dmc.s`). The other polarity
     /// yields three, and that loop then never converges.
     fn nextIsGetCycle(self: *const Cpu) bool {
-        return self.bus.apu.even_cycle;
+        return !self.bus.apu.even_cycle;
     }
 
-    /// The DMC DMA proper, entered from `read` with the halt cycle already
-    /// spent. Three or four cycles total per
-    /// https://www.nesdev.org/wiki/DMA: the halt, a DMC-only dummy cycle,
-    /// an alignment cycle *if* the fetch would otherwise land on a put
-    /// cycle, and the get cycle that actually fetches the byte.
+    /// **The DMA unit (ENG-86).** Entered from `read` with the halt cycle
+    /// already spent, and runs until both DMAs are done. There is one loop
+    /// because on a 2A03 there is one DMA unit: OAM DMA and DMC DMA share
+    /// the bus, the get/put clock and the run-up cycles, and every cost
+    /// hardware charges is what falls out of them competing rather than a
+    /// number anyone computes.
+    ///
+    /// The rules, all of them local:
+    ///
+    ///   * **Only a get cycle may read.** The other half of the APU clock
+    ///     is a put, and the only thing that can happen on one is OAM DMA's
+    ///     write to `$2004`, which must follow a read it already did.
+    ///   * **DMC wins a get-cycle collision**, but only once its halt and
+    ///     dummy cycles are paid. OAM DMA's read simply does not happen
+    ///     that cycle: `oam_read_addr` and `oam_step` are untouched, so it
+    ///     re-issues the same byte on its next get cycle. That costs the
+    ///     copy the DMC's get plus one put spent realigning -- the two
+    ///     cycles a mid-copy collision costs.
+    ///   * **Any DMA cycle retires the run-up.** `retireRunUp` drops one of
+    ///     `halt_pending`/`dmc_dummy_pending` per cycle no matter what that
+    ///     cycle is doing, so a DMC request raised while a copy is already
+    ///     running has its halt and dummy absorbed by cycles the copy was
+    ///     going to spend anyway. This is the whole reason a collision costs
+    ///     2 in the middle of a copy and 3 or 4 outside one.
+    ///   * **The boundary needs no special case.** When the copy's 512th
+    ///     cycle retires `oam_dma_pending`, the loop keeps running for
+    ///     whatever the DMC still owes -- so a request the copy's last
+    ///     cycles raise pays what is left of its run-up outside the copy,
+    ///     and one raised a cycle earlier has it absorbed. That is hardware's
+    ///     1-on-the-next-to-next-to-last and 3-on-the-last, emergent. The
+    ///     `dmcTailPrepCycles` this replaced computed them instead, and got
+    ///     `sprdma_and_dmc_dma_512`'s offsets 04-05 and 0A-0B wrong.
     ///
     /// `halted_addr` is the address the 6502 was reading when it stopped.
-    /// The no-operation cycles re-issue that read rather than idling --
-    /// see `read`'s doc comment for why that is the entire observable
-    /// effect. They still go through `tick`, the same precedent
-    /// `runOamDma` set, so the PPU keeps advancing and NMI keeps being
-    /// polled while the CPU is frozen: hardware halts only the 6502, never
-    /// the rest of the console.
-    fn runDmcDma(self: *Cpu, halted_addr: u16) void {
-        _ = self.readCycle(halted_addr); // the DMC-only dummy cycle
-        if (!self.nextIsGetCycle()) _ = self.readCycle(halted_addr); // alignment
-        self.dmcGetCycle();
+    /// Cycles with nothing else to do re-issue that read rather than idling
+    /// -- see `read`'s doc comment for why that is the entire observable
+    /// effect. Every cycle goes through `tick`, so the PPU keeps advancing
+    /// and NMI keeps being polled throughout: hardware halts only the 6502,
+    /// never the rest of the console.
+    fn runDma(self: *Cpu, halted_addr: u16) void {
+        // Counts half-cycles of the copy: even means a read is due, odd
+        // means the write that follows it is. 0x200 of them is 256 bytes.
+        var oam_step: u16 = 0;
+        var oam_read_addr: u8 = 0;
+        var latched: u8 = 0;
+
+        while (self.bus.apu.dmc.dma_pending or self.oam_dma_pending) {
+            if (self.nextIsGetCycle()) {
+                if (self.bus.apu.dmc.dma_pending and !self.halt_pending and !self.dmc_dummy_pending) {
+                    self.retireRunUp();
+                    self.dmcGetCycle();
+                } else if (self.oam_dma_pending and oam_step % 2 == 0) {
+                    self.retireRunUp();
+                    latched = self.readCycle((@as(u16, self.oam_dma_page) << 8) | oam_read_addr);
+                    oam_read_addr +%= 1;
+                    oam_step += 1;
+                } else {
+                    self.retireRunUp();
+                    _ = self.readCycle(halted_addr);
+                }
+            } else {
+                if (self.oam_dma_pending and oam_step % 2 == 1) {
+                    self.retireRunUp();
+                    self.write(0x2004, latched);
+                    oam_step += 1;
+                    if (oam_step == 0x200) self.oam_dma_pending = false;
+                } else {
+                    self.retireRunUp();
+                    _ = self.readCycle(halted_addr);
+                }
+            }
+        }
+    }
+
+    /// Spend one cycle of the DMA unit's run-up, halt before dummy. Called
+    /// at the top of every cycle `runDma` takes, whatever that cycle does --
+    /// that sharing is the point, see `runDma`.
+    fn retireRunUp(self: *Cpu) void {
+        if (self.halt_pending) {
+            self.halt_pending = false;
+        } else if (self.dmc_dummy_pending) {
+            self.dmc_dummy_pending = false;
+        }
     }
 
     /// The one cycle of a DMC DMA that touches the bus. Reads through
@@ -457,6 +568,7 @@ pub const Cpu = struct {
         const value = self.bus.read(addr);
         self.pollNmi();
         self.bus.apu.dmc.completeDma(value);
+        self.latchDmaRequest();
     }
 
     /// **Why there is no `pollNmi()` at the end of a write, unlike `read`.**
@@ -479,115 +591,43 @@ pub const Cpu = struct {
         self.tick();
         self.snapshotNmiReady();
         self.bus.write(addr, value);
-        // OAMDMA. `Bus` cannot handle $4014 itself -- see its doc comment --
-        // because the 513-514 CPU cycles this burns have to flow through
-        // this exact chokepoint (PPU ticking, NMI polling) like any other
-        // cycle. Checked after the ordinary write above so `open_bus` still
-        // updates first, same as every other write to this address.
+        // OAMDMA ($4014). `Bus` cannot handle this itself -- see its doc
+        // comment -- because the 513-514 CPU cycles the copy burns have to
+        // flow through this exact chokepoint (PPU ticking, NMI polling)
+        // like any other cycle. Checked after the ordinary write above so
+        // `open_bus` still updates first, same as every other write here.
+        //
+        // ENG-86: this only *requests* the copy. A DMA halts the 6502 on a
+        // read cycle, and this is a write, so the copy begins on the CPU's
+        // next read like every other DMA halt -- see `read` and `runDma`.
+        // Running it inline here, as this did before, started the copy a
+        // cycle early and at the wrong phase against the DMC's own clock.
+        //
         // ENG-78: $4014 is an ordinary RAM address in the flat 64KB space
         // the sweep runs in, not OAMDMA. Comptime-known, as above.
         if (!sweep.flat_bus) {
-            if (addr == 0x4014) self.runOamDma(value);
+            if (addr == 0x4014) {
+                self.oam_dma_pending = true;
+                self.oam_dma_page = value;
+                self.halt_pending = true;
+            }
         }
+        self.latchDmaRequest();
     }
 
     /// Advance the clock by one CPU cycle with no bus access: `tick` plus
     /// the same NMI re-snapshot/re-poll pair `read`/`write` perform around
-    /// their own access, minus the access itself. Used for `step`'s jammed-
-    /// CPU idle cycle and for `runOamDma`'s halt/alignment cycles, both of
-    /// which burn CPU time with nothing semantically observable happening.
+    /// their own access, minus the access itself. Used for `step`'s
+    /// jammed-CPU idle cycle, which burns CPU time with nothing
+    /// semantically observable happening. The DMA unit no longer idles at
+    /// all -- a halted 6502 re-issues its read, so `runDma`'s spare cycles
+    /// go through `readCycle`. See `read`'s doc comment.
     fn idleCycle(self: *Cpu) void {
         self.tick();
         self.snapshotNmiReady();
         self.pollNmi();
         self.bus.joy_oe = 0; // no bus access, so both /OE lines fall
-    }
-
-    /// OAMDMA ($4014): copy 256 bytes from $(page)00-$(page)FF into OAM
-    /// through OAMDATA ($2004), exactly as if the CPU had done 256
-    /// individual `STA $2004` writes -- so it honors and advances OAMADDR
-    /// (`Ppu.writeRegister`'s existing $2004 case) as if it were still doing
-    /// so, just far faster than any real game would loop it by hand. Costs
-    /// 513 CPU cycles (1 halt cycle + 256 read/write pairs), or 514 if the
-    /// triggering write landed on an odd CPU cycle (one extra alignment
-    /// cycle before the first read) -- see https://www.nesdev.org/wiki/DMA.
-    ///
-    /// Driven entirely through `idleCycle`/`read`/`write`, so every cycle
-    /// this burns still ticks the PPU 3 dots and polls NMI exactly like
-    /// ordinary instruction execution -- a VBL NMI raised mid-DMA is
-    /// serviced the moment `step` is next called, matching real hardware
-    /// (which halts only the CPU's own bus activity, never the rest of the
-    /// console).
-    /// How many of a DMC DMA's preparation cycles are still owed once an
-    /// OAM DMA it overlapped has finished, given how long the request had
-    /// already been up.
-    ///
-    /// The DMA unit's run-up is halt, dummy, and an alignment cycle. While
-    /// the CPU is halted for an OAM DMA those overlap it and cost nothing,
-    /// and the halt is free even on the copy's very last cycle, because the
-    /// CPU was still halted for it. Whatever has not elapsed by the time the
-    /// copy ends is paid in real time, and then the get:
-    ///
-    ///     elapsed   owed   total cost
-    ///     2+        0      1   the run-up finished under cover; just the get
-    ///     1         1      2
-    ///     0         2      3
-    ///
-    /// The two ends of that are hardware's "1 on the next-to-next-to-last
-    /// OAM DMA cycle, 3 on the last" (https://www.nesdev.org/wiki/DMA).
-    /// None of them carries a realignment cycle: the copy is over, so there
-    /// is nothing left to realign, unlike the two-cycle mid-copy case.
-    ///
-    /// **No conformance ROM pins this.** Both `sprdma_and_dmc_dma` ROMs
-    /// sweep sixteen offsets and reach this path only twice in an entire
-    /// run, so they neither confirm nor refute it -- see `dmc_dma_test.zig`.
-    /// It is here because the alternative, charging the full four, is what
-    /// happens without it and contradicts documented hardware. The unit test
-    /// below pins the table so it cannot drift unnoticed.
-    fn dmcTailPrepCycles(elapsed: u64) u64 {
-        return 2 - @min(elapsed, 2);
-    }
-
-    fn runOamDma(self: *Cpu, page: u8) void {
-        self.oam_dma_active = true;
-        defer self.oam_dma_active = false;
-        // The alignment cycle comes *before* the halt cycle: it exists to
-        // land the halt cycle itself on an even CPU cycle, which is what
-        // lets the 256 read/write pairs that follow fall on the same
-        // even/odd phase every time regardless of when $4014 was written.
-        if (self.cycles % 2 == 1) self.idleCycle();
-        self.idleCycle(); // the halt/"get" cycle -- always happens
-        // When a DMC request goes up mid-copy: the CPU cycle it was first
-        // observed on, so the tail below can tell how much of the DMA
-        // unit's run-up overlapped the copy for free. Cleared whenever a
-        // request is serviced inside the loop.
-        var pending_since: ?u64 = null;
-        var i: u16 = 0;
-        while (i < 256) : (i += 1) {
-            // When both DMAs want the same cycle, DMC wins and OAM DMA
-            // waits (https://www.nesdev.org/wiki/DMA). It costs two cycles,
-            // not the three or four a standalone DMC DMA costs: the CPU is
-            // already halted, so there is no halt or dummy cycle to pay for
-            // -- just the DMC's get, and then one cycle for OAM DMA to
-            // realign to a get cycle of its own. This is what
-            // `sprdma_and_dmc_dma` measures.
-            if (self.bus.apu.dmc.dma_pending) {
-                self.dmcGetCycle();
-                self.idleCycle();
-                pending_since = null;
-            }
-            const value = self.read((@as(u16, page) << 8) | i);
-            if (pending_since == null and self.bus.apu.dmc.dma_pending) pending_since = self.cycles;
-            self.write(0x2004, value);
-            if (pending_since == null and self.bus.apu.dmc.dma_pending) pending_since = self.cycles;
-        }
-        // A request the copy's own last cycles raised has nowhere left to be
-        // absorbed. See `dmcTailPrepCycles`.
-        if (self.bus.apu.dmc.dma_pending) {
-            var remaining = dmcTailPrepCycles(self.cycles - (pending_since orelse self.cycles));
-            while (remaining > 0) : (remaining -= 1) self.idleCycle();
-            self.dmcGetCycle();
-        }
+        self.latchDmaRequest();
     }
 
     fn fetch(self: *Cpu) u8 {
@@ -2390,7 +2430,10 @@ test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advanci
         0x8D, 0x14, 0x40, // STA $4014 (trigger OAMDMA from $0200-$02FF)
     });
     for (0..256) |i| h.bus.wram[0x0200 + i] = @intCast(i ^ 0xA5); // recognizable pattern
-    h.stepN(4);
+    // ENG-86: the fourth instruction only *requests* the copy. A DMA halts
+    // the 6502 on a read cycle and `STA $4014` ends on a write, so the copy
+    // runs on the next instruction's opcode fetch -- hence the fifth step.
+    h.stepN(5);
 
     for (0..256) |i| {
         const oam_index: u8 = @truncate(0x40 +% i);
@@ -2407,22 +2450,27 @@ test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advanci
 }
 
 test "OAMDMA costs 513 CPU cycles when triggered on an even cycle, 514 on odd" {
+    // ENG-86: the copy no longer runs inside the `$4014` write -- it halts
+    // the CPU on the next read like any other DMA -- so it is measured as
+    // the extra cost the *following* instruction carries. That instruction
+    // is a 2-cycle NOP in both programs, hence `- 2`.
+    const cost = struct {
+        fn of(program: []const u8) u64 {
+            var h: TestHarness = undefined;
+            h.init(program);
+            h.stepN(2); // up to and including STA $4014
+            const before = h.cpu.cycles;
+            h.stepN(1); // the NOP that the copy halts on
+            return h.cpu.cycles - before - 2;
+        }
+    }.of;
+
     // NOP implied (2 cycles) + STA $4014 (4 cycles): the write lands on
     // cycle 6 (even) -> 513-cycle DMA.
-    {
-        var h: TestHarness = undefined;
-        h.init(&[_]u8{ 0xEA, 0x8D, 0x14, 0x40 });
-        h.stepN(2);
-        try testing.expectEqual(@as(u64, 6 + 513), h.cpu.cycles);
-    }
+    try testing.expectEqual(@as(u64, 513), cost(&[_]u8{ 0xEA, 0x8D, 0x14, 0x40, 0xEA }));
     // NOP $00 zero-page (3 cycles) + STA $4014 (4 cycles): the write lands
     // on cycle 7 (odd) -> 514-cycle DMA.
-    {
-        var h: TestHarness = undefined;
-        h.init(&[_]u8{ 0x04, 0x00, 0x8D, 0x14, 0x40 });
-        h.stepN(2);
-        try testing.expectEqual(@as(u64, 7 + 514), h.cpu.cycles);
-    }
+    try testing.expectEqual(@as(u64, 514), cost(&[_]u8{ 0x04, 0x00, 0x8D, 0x14, 0x40, 0xEA }));
 }
 
 test "OAMDMA still ticks the PPU 3 dots/cycle throughout, not just for ordinary instructions" {
@@ -2449,16 +2497,4 @@ test "the decode table covers all 256 opcodes with sane lengths" {
         const len = entry.mode.length();
         try testing.expect(len >= 1 and len <= 3);
     }
-}
-
-test "a DMC DMA left over at the end of an OAM DMA pays only the run-up it did not already get" {
-    // The table in `dmcTailPrepCycles`. Total cost is the owed cycles plus
-    // the get, so 1 / 2 / 3 as the request goes up later and later in the
-    // copy -- hardware's "1 on the next-to-next-to-last OAM DMA cycle, 3 on
-    // the last".
-    try testing.expectEqual(@as(u64, 2), Cpu.dmcTailPrepCycles(0)); // raised on the last cycle
-    try testing.expectEqual(@as(u64, 1), Cpu.dmcTailPrepCycles(1));
-    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(2));
-    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(3)); // saturates
-    try testing.expectEqual(@as(u64, 0), Cpu.dmcTailPrepCycles(500));
 }
