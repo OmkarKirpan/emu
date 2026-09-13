@@ -27,6 +27,7 @@ const Controller = controller_mod.Controller;
 ///     $4000-$4013  APU registers             -- decoded through `Apu.writeRegister` (M6)
 ///     $4014        OAMDMA                    -- handled by `Cpu.write`, not here (see below)
 ///     $4015        APU status (read) / channel enable (write) -- `Apu.readStatus`/`writeRegister`
+///                  (`Bus.peek` takes `Apu.peekStatus` instead -- ENG-83)
 ///     $4016        controller strobe (write) / port 0 data (read)
 ///     $4017        APU frame counter (write, `Apu.writeRegister`) / port 1 data (read)
 ///     $4018-$401F  remaining CPU-test registers -- not implemented: open bus
@@ -221,17 +222,18 @@ pub const Bus = struct {
     /// through `peekRegister` rather than `readRegister` for the same reason
     /// — reading through `peek` must never be observable by the emulated
     /// program (no VBL-flag clear, no write-toggle flip, no buffered-read
-    /// advance, no controller shift-register advance).
+    /// advance, no controller shift-register advance, no APU frame-IRQ
+    /// clear).
     pub fn peek(self: *const Bus, addr: u16) u8 {
         return switch (addr) {
             0x0000...0x1FFF => self.wram[addr & 0x07FF],
             0x2000...0x3FFF => self.ppu.peekRegister(0x2000 | (addr & 0x0007)),
             0x4000...0x4014 => self.open_bus,
-            // Not side-effect-free ($4015 clears the frame IRQ flag on
-            // read), but `peek` has no APU-side "peek" variant and no
-            // existing caller depends on this bit -- accepted as-is; flag
-            // for revisit if a debugger UI ever reads $4015 through peek.
-            0x4015 => self.open_bus,
+            // ENG-83: the real status byte, via the APU's own peek variant.
+            // A `read` of $4015 clears the frame IRQ flag; `peekStatus`
+            // reports the same bits -- the frame IRQ bit included -- and
+            // clears nothing.
+            0x4015 => self.apu.peekStatus(),
             0x4016 => (self.open_bus & 0xFE) | self.controllers[0].peek(),
             0x4017 => (self.open_bus & 0xFE) | self.controllers[1].peek(),
             0x4018...0x5FFF => self.open_bus,
@@ -313,6 +315,27 @@ test "Bus.peek reaches the PPU without clearing the VBL flag" {
     const peeked = bus.peek(0x2002);
     try testing.expect((peeked & 0x80) != 0);
     try testing.expect(bus.ppu.status.vblank); // still set: peek must not clear it
+}
+
+test "Bus.peek reports APU status without clearing the frame IRQ, which read does clear" {
+    const prg = [_]u8{0} ** 0x4000;
+    var bus = testBus(&prg);
+    bus.write(0x4015, 0x01); // enable pulse1
+    bus.write(0x4003, 0b00001_000); // load its length counter
+    bus.apu.frame.irq_flag = true;
+
+    // Peeking twice reports the same byte both times, frame IRQ included:
+    // the first peek changed nothing for the second to observe.
+    const first = bus.peek(0x4015);
+    try testing.expectEqual(@as(u8, 0x41), first); // frame IRQ | pulse1 active
+    try testing.expectEqual(first, bus.peek(0x4015));
+    try testing.expect(bus.apu.frame.irq_flag);
+
+    // A real read reports the same byte and then clears the flag -- which is
+    // the distinction that makes the peek path worth having.
+    try testing.expectEqual(first, bus.read(0x4015));
+    try testing.expect(!bus.apu.frame.irq_flag);
+    try testing.expectEqual(@as(u8, 0x01), bus.peek(0x4015));
 }
 
 test "$4016 write strobes both controller ports; $4016/$4017 reads carry each port's own data" {
