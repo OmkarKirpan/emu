@@ -21,7 +21,7 @@
 //! `debugger.zig`), which is also what makes the flat-bus switch work: see
 //! `sweep_config.zig`.
 //!
-//!     zig build test-cpu-sweep                    # every opcode but the JAMs
+//!     zig build test-cpu-sweep                    # all 256 opcodes, 1.08GB
 //!     zig build test-cpu-sweep -- --opcodes 1e,a9 # two opcodes, ~10MB of data
 //!     zig build test-cpu-sweep -- --limit 100     # 100 scenarios per opcode
 //!
@@ -47,16 +47,6 @@ const Cpu = cpu_mod.Cpu;
 
 const base_url = "https://raw.githubusercontent.com/SingleStepTests/65x02/main/nes6502/v1";
 const default_data_dir = ".cache/65x02/nes6502/v1";
-
-/// The twelve opcodes that lock up an NMOS 6502. The data set does cover
-/// them, as an 11-cycle sequence in which the core fetches, reads both
-/// interrupt vectors and then re-reads $FFFF/$FFFE forever. This core models
-/// JAM as "burn one cycle per `step`, PC frozen" (see `Cpu.jammed`), which
-/// is deliberately not that sequence, so they are skipped unless `--jam`
-/// asks for them. Naming them here reports the difference rather than hiding
-/// it: what `--jam` shows is filed as ENG-88, which is also where the case
-/// for leaving the model alone is written down.
-const jam_opcodes = [_]u8{ 0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2 };
 
 // ------------------------------------------------------------ the data set
 
@@ -100,8 +90,7 @@ const usage =
     \\usage: test-cpu-sweep [options]
     \\
     \\  --data <dir>       where the nes6502/v1 JSON lives (default: .cache/65x02/nes6502/v1)
-    \\  --opcodes <list>   comma-separated hex opcodes, e.g. 1e,a9,00 (default: all but JAM)
-    \\  --jam              also run the twelve JAM opcodes (expected to fail: see the source)
+    \\  --opcodes <list>   comma-separated hex opcodes, e.g. 1e,a9,00 (default: all 256)
     \\  --limit <n>        run only the first n scenarios of each opcode
     \\  --max-failures <n> stop after n failing scenarios (default: 20)
     \\
@@ -116,14 +105,10 @@ pub fn main(init: std.process.Init) u8 {
     };
 
     var opts = Options{};
-    var include_jam = false;
-    var explicit_opcodes = false;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--jam")) {
-            include_jam = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print("{s}", .{usage});
             return 0;
         } else if (i + 1 >= argv.len) {
@@ -134,7 +119,6 @@ pub fn main(init: std.process.Init) u8 {
             opts.data_dir = argv[i];
         } else if (std.mem.eql(u8, arg, "--opcodes")) {
             i += 1;
-            explicit_opcodes = true;
             opts.selected = [_]bool{false} ** 256;
             var it = std.mem.splitScalar(u8, argv[i], ',');
             while (it.next()) |tok| {
@@ -162,10 +146,6 @@ pub fn main(init: std.process.Init) u8 {
             std.debug.print("unknown option: '{s}'\n\n{s}", .{ arg, usage });
             return 2;
         }
-    }
-    // `--opcodes 02` means "run 02", not "run 02 unless it is a JAM".
-    if (!include_jam and !explicit_opcodes) {
-        for (jam_opcodes) |code| opts.selected[code] = false;
     }
 
     // `Bus` carries a 64KB flat array on top of everything it already owns,
@@ -270,6 +250,14 @@ fn runScenario(bus: *Bus, cpu: *Cpu, scenario: Scenario, code: u8) bool {
     bus.flat_log.reset();
 
     cpu.step();
+    // A halted core's bus activity never ends (see `Cpu.jamAddress`), so the
+    // data set's JAM entries are a window onto it -- 11 cycles -- rather than
+    // a whole instruction. `Cpu.step` emits one halt cycle per call, so fill
+    // the window the way anything above the CPU would: keep stepping. The
+    // bound is the window itself, not a JAM-specific cycle count, so a core
+    // that halted when it should not have still fails the comparison below
+    // rather than being padded into a pass.
+    while (cpu.jammed and bus.flat_log.len < scenario.cycles.len) cpu.step();
 
     var header_printed = false;
     var ok = true;

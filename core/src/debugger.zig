@@ -171,7 +171,10 @@ const Debugger = struct {
         self.cpu().step();
         while (!self.hasBreakpoint(self.cpu().pc)) {
             if (self.cpu().jammed) {
-                std.debug.print("CPU jammed at ${X:0>4} -- only a reset recovers; breakpoint unreachable\n", .{self.cpu().pc});
+                // PC froze one past the JAM's own opcode, so report the
+                // opcode's address -- that is what a user set a breakpoint
+                // near and what a disassembly lines up with.
+                std.debug.print("CPU jammed at ${X:0>4} -- only a reset recovers; breakpoint unreachable\n", .{self.cpu().pc -% 1});
                 self.printTraceLine();
                 return;
             }

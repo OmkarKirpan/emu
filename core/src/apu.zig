@@ -1157,6 +1157,16 @@ pub const Apu = struct {
     }
 
     pub fn readStatus(self: *Apu) u8 {
+        const status = self.peekStatus();
+        self.frame.irq_flag = false; // reading clears the frame IRQ only
+        return status;
+    }
+
+    /// Side-effect-free counterpart to `readStatus`, for `Bus.peek`
+    /// (ENG-83) -- the same split `Ppu.readRegister`/`peekRegister` has, and
+    /// for the same reason: a debugger that inspects APU state must not
+    /// clear the frame IRQ flag out from under the program it is inspecting.
+    pub fn peekStatus(self: *const Apu) u8 {
         var status: u8 = 0;
         if (self.pulse1.length_counter > 0) status |= 0x01;
         if (self.pulse2.length_counter > 0) status |= 0x02;
@@ -1165,7 +1175,6 @@ pub const Apu = struct {
         if (self.dmc.bytes_remaining > 0) status |= 0x10;
         if (self.frame.irq_flag) status |= 0x40;
         if (self.dmc.irq_flag) status |= 0x80;
-        self.frame.irq_flag = false; // reading clears the frame IRQ only
         return status;
     }
 
@@ -1267,6 +1276,25 @@ test "Apu.readStatus reports length-counter-nonzero bits, DMC active, and both I
     try testing.expectEqual(@as(u8, 0b1101_0001), status); // DMC-irq | frame-irq | dmc-active | pulse1
     try testing.expect(!apu.frame.irq_flag); // cleared by the read
     try testing.expect(apu.dmc.irq_flag); // NOT cleared by the read
+}
+
+test "Apu.peekStatus reports what readStatus would, without clearing the frame IRQ" {
+    var apu = Apu{};
+    apu.pulse1.length_counter = 1;
+    apu.dmc.bytes_remaining = 1;
+    apu.frame.irq_flag = true;
+    apu.dmc.irq_flag = true;
+
+    const peeked = apu.peekStatus();
+    try testing.expectEqual(@as(u8, 0b1101_0001), peeked);
+    try testing.expect(apu.frame.irq_flag); // untouched, unlike `readStatus`
+
+    // Same byte the destructive path would have produced, and the peek did
+    // not change what that path sees.
+    try testing.expectEqual(peeked, apu.readStatus());
+    try testing.expect(!apu.frame.irq_flag);
+    // Now that the read has cleared it, the peek follows.
+    try testing.expectEqual(@as(u8, 0b1001_0001), apu.peekStatus());
 }
 
 test "Apu.irqPending is the OR of the frame IRQ and DMC IRQ flags" {
