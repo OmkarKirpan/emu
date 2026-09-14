@@ -41,6 +41,12 @@ async function waitForUnderrunsToSettle(page: Page): Promise<number> {
  * block's own numbers instead: a healthy, bounded ring fill and no
  * *further* underruns once already past startup is exactly ENG-70's "no
  * underrun/desync glitches" acceptance criterion, made machine-checkable.
+ *
+ * Whether the worklet starves is a property of how much CPU the machine has
+ * spare, so this file runs in `playwright.config.ts`'s `timing` project --
+ * alone, one test at a time, after the rest of the suite. That is what lets
+ * the underrun bound below stay exact rather than being padded out into
+ * something that no longer says what it means (ENG-85).
  */
 test('audio output reaches a stable ring fill with no steady-state underruns', async ({ page }) => {
   const button = page.locator('.audio-output button')
@@ -84,7 +90,15 @@ test('audio output reaches a stable ring fill with no steady-state underruns', a
   // Worker/worklet/Atomics plumbing instead of a simulated consumer.
   expect(settled!.fill).toBeGreaterThan(0)
   expect(settled!.fill).toBeLessThan(8192)
-  expect(settled!.underrunCount).toBe(baselineUnderruns)
+  // Exact: past priming, `emulatorWorker.ts` only hands the ring to the
+  // worklet once it holds the ENG-62 target fill, so every underrun counted
+  // from here on is the producer genuinely failing to keep up. The delta is
+  // spelled out in the message because "expected 3 to be 0" on its own says
+  // nothing about whether the ring was starved or merely brushed empty.
+  expect(
+    settled!.underrunCount,
+    `the worklet starved ${settled!.underrunCount - baselineUnderruns} more time(s) after reaching steady state (ring fill ${settled!.fill} samples)`,
+  ).toBe(baselineUnderruns)
 })
 
 /**

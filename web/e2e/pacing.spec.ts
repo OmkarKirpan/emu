@@ -21,6 +21,12 @@ const TOLERANCE_FPS = 6 // generous: this is a real-clock measurement, not a moc
  * `scheduleLoop`), so there's no fast-display scenario left to simulate --
  * a plain real-time measurement against the standard fixture is now the
  * whole test.
+ *
+ * Being a real-time measurement is also why this file runs in
+ * `playwright.config.ts`'s `timing` project rather than alongside the rest
+ * of the suite: parallel workers each driving a wasm emulator at 60Hz push
+ * the measured rate below the tolerance without anything in the emulator
+ * having changed (ENG-85).
  */
 test('emulation runs at the real NES frame rate', async ({ page }) => {
   const before = findSpriteCol(await readFramebuffer(page), SPRITE_ROW, BACKDROP_RGBA)
