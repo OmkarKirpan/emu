@@ -634,6 +634,27 @@ pub const Dmc = struct {
     /// actually stalls the CPU and services it.
     dma_pending: bool = false,
 
+    /// A `$4015` write has started a sample into an empty buffer, and the
+    /// **load** DMA it schedules has not been raised yet (ENG-86).
+    ///
+    /// nesdev's DMA page: *"load and reload DMAs schedule on different
+    /// cycle types, [so] load DMAs take 3 cycles and reload DMAs take 4
+    /// unless the halt is delayed by an odd number of cycles."* A reload --
+    /// the buffer running dry mid-playback -- is raised by `tickTimer`, so
+    /// it always starts from a get cycle and always pays an alignment
+    /// cycle: halt, dummy, align, get. A load starts from the *put* half
+    /// instead, one cycle off, and so needs no alignment: halt, dummy, get.
+    ///
+    /// A `$4015` write can land on either half, so the load cannot simply
+    /// be raised where the write lands -- that would make its cost 3 or 4
+    /// depending on the CPU's phase, which is both wrong and *lossy*: the
+    /// alignment cycle would absorb the very phase difference the DMA is
+    /// supposed to preserve. `Apu.tick` raises it on the first put cycle at
+    /// or after the write instead, so the cost is a flat 3 and the CPU
+    /// comes out of the stall on the same half it went in on.
+    ///
+    /// That is what `sprdma_and_dmc_dma` measures. See `dmc_dma_test.zig`.
+    load_pending: bool = false,
 
     /// $4010: IL--.RRRR
     pub fn writeReg0(self: *Dmc, value: u8) void {
@@ -688,6 +709,13 @@ pub const Dmc = struct {
     /// bus access itself -- see the type doc comment.
     pub fn completeDma(self: *Dmc, value: u8) void {
         self.dma_pending = false;
+        // A `$4015` write clearing the DMC-enable bit zeroes
+        // `bytes_remaining`, and it can land after the DMA unit has already
+        // asserted RDY. Those stall cycles still happen -- RDY is out, the
+        // 6502 is halted -- but the byte they fetch has nowhere to go, so
+        // the request is retired and the read discarded rather than
+        // underflowing the counter the write just cleared.
+        if (self.bytes_remaining == 0) return;
         self.sample_buffer = value;
         self.current_address = if (self.current_address == 0xFFFF) 0x8000 else self.current_address + 1;
         self.bytes_remaining -= 1;
@@ -1142,17 +1170,20 @@ pub const Apu = struct {
         self.dmc.irq_flag = false;
         if (!dmc_enable) {
             self.dmc.bytes_remaining = 0;
+            self.dmc.load_pending = false;
         } else if (self.dmc.bytes_remaining == 0) {
             self.dmc.restart();
-            // A *load* DMA: the request goes up on this very write cycle,
-            // not on the next APU tick the way the timer's *reload* request
-            // does. That asymmetry is the whole reason the two cost
-            // different numbers of cycles
-            // (https://www.nesdev.org/wiki/DMA) -- a write can land on
-            // either half of the APU clock, so a load's alignment cycle is
-            // there or not depending on when the game wrote, while a reload
-            // always starts from the same half and so always costs the same.
-            if (self.dmc.sample_buffer == null) self.dmc.dma_pending = true;
+            // A *load* DMA, which schedules on the put half of the APU
+            // clock rather than the get half a `tickTimer` *reload* starts
+            // from -- see `Dmc.load_pending`, which `tick` turns into the
+            // request on the first put cycle at or after this write.
+            if (self.dmc.sample_buffer == null) {
+                // `even_cycle` marks the get half (it is the half
+                // `Dmc.tickTimer` runs on), so a write that already lands on
+                // a put raises the request itself and one that does not
+                // leaves it for `tick`'s next put.
+                if (self.even_cycle) self.dmc.load_pending = true else self.dmc.dma_pending = true;
+            }
         }
     }
 
@@ -1223,6 +1254,12 @@ pub const Apu = struct {
             self.pulse2.tickTimer();
             self.noise.tickTimer();
             self.dmc.tickTimer();
+        } else if (self.dmc.load_pending) {
+            // The put half: where a load DMA schedules, one cycle off the
+            // get half `Dmc.tickTimer`'s reload request starts from. See
+            // `Dmc.load_pending`.
+            self.dmc.load_pending = false;
+            self.dmc.dma_pending = true;
         }
 
         const raw = mixOutput(self.pulse1.output(), self.pulse2.output(), self.triangle.output(), self.noise.output(), self.dmc.output());

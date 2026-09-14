@@ -85,7 +85,9 @@ pub const magic = [4]u8{ 'N', 'E', 'S', 'S' };
 /// a fixed-layout section, so every field after it shifts.
 /// 5 (ENG-88): the CPU section grew `jam_cycle` next to `jammed`, ahead of
 /// that same DMA state, which shifts it again.
-pub const format_version: u32 = 5;
+/// 6 (ENG-86): the APU section grew `Dmc.load_pending` after
+/// `dmc.dma_pending`, shifting the frame sequencer's fields after it.
+pub const format_version: u32 = 6;
 
 pub const rom_hash_len = Sha256.digest_length;
 pub const RomHash = [rom_hash_len]u8;
@@ -611,6 +613,10 @@ fn apuBody(comptime dir: Dir, c: *Codec(dir), a: *apu_mod.Apu) CodecError!void {
     // been requested and not yet serviced" is real state. Saving mid-stall
     // and reloading must resume the stall, not drop the fetch.
     try c.scalar(&a.dmc.dma_pending);
+    // ENG-86: a `$4015` write schedules its load DMA on the next put cycle,
+    // and `STA $4015` ends *on* the write -- so the scheduled-but-unraised
+    // request can outlive the instruction that made it.
+    try c.scalar(&a.dmc.load_pending);
 
     try c.scalar(&a.frame.mode);
     try c.scalar(&a.frame.irq_inhibit);

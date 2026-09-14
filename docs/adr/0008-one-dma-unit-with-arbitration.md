@@ -70,18 +70,26 @@ translation of Mesen2's `(CycleCount & 1) == 0` and is what makes OAM DMA's
 
 ## Conformance status
 
-All four `dmc_dma_during_read4` ROMs that passed under ADR 0007 still pass,
-and the full suite is green. `_512`'s offset 04 now matches the expected
-table, which is one of the two boundary cases ADR 0007's shape could not
-reach.
+**Every ROM in both DMC-DMA suites now passes**, and the full suite is
+green.
 
-**Both `sprdma_and_dmc_dma` ROMs still fail, and this ADR does not claim to
-fix them.** Their remaining error is not arbitration: their printed values
-are parity-blind here, uniformly one cycle high on even offsets, and four
-different alignment variants leave the sixteen values byte-identical. The
-copy's 513/514 alternation is real and measured, but the ROM's own timing
-routine cannot see it in this emulator and plainly can on hardware. See
-`dmc_dma_test.zig` for the expected tables and the evidence.
+This arbitration is what made the *durations* right. Instrumenting the
+block `sprdma_and_dmc_dma` times shows all 32 of the two ROMs' collisions
+already landing on the expected clock counts once `runDma` replaced the two
+mechanisms -- including `_512`'s offsets 04-05 and 0A-0B, the two boundary
+cases ADR 0007's computed cost could not reach.
+
+The ROMs nonetheless still failed after this change, because what was left
+was not a DMA cost at all but the DMC's *scheduling* of its own request.
+`$E280` times the block against the DMC's playback at single-cycle
+resolution, and the first DMA that routine starts -- from its `$4015`
+write -- was paying an alignment cycle on one half of the APU clock and not
+on the other, which absorbed the very one-cycle phase difference being
+measured. nesdev's DMA page: *"load and reload DMAs schedule on different
+cycle types, [so] load DMAs take 3 cycles and reload DMAs take 4 unless the
+halt is delayed by an odd number of cycles."* `Dmc.load_pending` is that
+rule, and with it both ROMs pass. See `dmc_dma_test.zig` for the expected
+tables, how to re-derive them from the ROM images, and the dead ends.
 
 ## Consequences
 
@@ -90,7 +98,9 @@ routine cannot see it in this emulator and plainly can on hardware. See
 - The DMA unit's state (`halt_pending`, `dmc_dummy_pending`,
   `oam_dma_pending`, `oam_dma_page`, `dmc_pending_prev`) is save-state
   state, because a requested-but-not-started copy outlives the instruction
-  that requested it. Format version goes to 4.
+  that requested it. Format version goes to 4. *(ENG-86's follow-on added
+  `Dmc.load_pending` for the same reason -- `STA $4015` ends on the write
+  that schedules the load -- taking the format to 6.)*
 - `idleCycle` is now only `step`'s jammed-CPU path. The DMA unit never
   idles: a halted 6502 re-issues its read, so spare DMA cycles go through
   `readCycle`, which is what makes the repeats externally visible.

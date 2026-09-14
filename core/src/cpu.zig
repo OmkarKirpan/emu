@@ -2471,6 +2471,55 @@ test "an MMC3 scanline IRQ reaches the CPU through Bus and fires a real interrup
     try testing.expect(!bus.mapper.irqPending());
 }
 
+// ENG-86. nesdev's DMA page: "load and reload DMAs schedule on different
+// cycle types, [so] load DMAs take 3 cycles and reload DMAs take 4 unless
+// the halt is delayed by an odd number of cycles." Both halves of the APU
+// clock are exercised, because the whole point of `Dmc.load_pending` is
+// that a load costs the same on either -- a load whose cost tracked the
+// phase the `$4015` write happened to land on would have its alignment
+// cycle silently absorb that phase, which is exactly the measurement
+// `sprdma_and_dmc_dma` makes and exactly what it caught here.
+test "a DMC load DMA costs 3 cycles from either APU half, and the reload that follows costs 4" {
+    for ([_]u8{ 0, 1 }) |extra_cycle| {
+        var code = [_]u8{0xEA} ** 600;
+        @memcpy(code[0..15], &[_]u8{
+            0xA9, 0x01, // LDA #$01
+            0x8D, 0x13, 0x40, // STA $4013 -- sample length 1*16+1 = 17 bytes
+            0xA9, 0x0F, // LDA #$0F
+            0x8D, 0x10, 0x40, // STA $4010 -- rate 15, no IRQ, no loop
+            0xA9, 0x1F, // LDA #$1F
+            0x8D, 0x15, 0x40, // STA $4015 -- DMC enable: the *load*
+        });
+        var h: TestHarness = undefined;
+        h.init(&code);
+        // Shift the CPU onto the other half of the APU clock. The load's
+        // cost must not notice.
+        for (0..extra_cycle) |_| h.cpu.tick();
+        h.stepN(6);
+        try testing.expect(h.bus.apu.dmc.dma_pending or h.bus.apu.dmc.load_pending);
+
+        // `STA $4015` ends on a write, so the halt lands on the next read --
+        // the following NOP's opcode fetch, which therefore pays the stall.
+        var before = h.cpu.cycles;
+        h.cpu.step();
+        try testing.expectEqual(@as(u64, 2 + 3), h.cpu.cycles - before);
+        try testing.expectEqual(@as(u16, 16), h.bus.apu.dmc.bytes_remaining);
+
+        // Then run NOPs until the bit counter empties the sample buffer and
+        // the timer raises a *reload* request, which costs one cycle more.
+        var stalls: u32 = 0;
+        while (stalls == 0) {
+            before = h.cpu.cycles;
+            h.cpu.step();
+            const cost = h.cpu.cycles - before;
+            if (cost == 2) continue;
+            stalls += 1;
+            try testing.expectEqual(@as(u64, 2 + 4), cost);
+        }
+        try testing.expectEqual(@as(u16, 15), h.bus.apu.dmc.bytes_remaining);
+    }
+}
+
 test "OAMDMA copies 256 bytes from the given page into OAM, honoring and advancing OAMADDR" {
     var h: TestHarness = undefined;
     h.init(&[_]u8{

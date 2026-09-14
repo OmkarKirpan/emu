@@ -119,6 +119,12 @@ Three remain open, and one of them does not belong to this ADR at all:
   request raised by the copy's own final cycles currently falls out of
   `runOamDma` and gets charged the full 4. A tail case for it was tried
   and not kept; `dmc_dma_test.zig` records why.
+
+  *(ENG-86: both now pass. The costs came right with
+  [ADR 8](0008-one-dma-unit-with-arbitration.md)'s arbitrated DMA unit,
+  which deletes `runOamDma` and the tail case along with it; what was left
+  after that was `Dmc.load_pending`, the DMC scheduling a load DMA on the
+  put half of the APU clock. See ADR 8's conformance section.)*
 * `double_2007_read` is **not a DMC DMA test**. It includes `shell.inc`
   directly rather than the suite's `common.inc`, never synchronizes to the
   DMC and never starts a sample. It reads `lda $20F7,x` with X of `$00`

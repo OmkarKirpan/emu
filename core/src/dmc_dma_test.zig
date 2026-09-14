@@ -12,9 +12,12 @@
 //!     once too -- except that the DMA's own get cycle breaks the run in
 //!     the middle, so the sequence pays one extra clock and loses a bit.
 //!   * `sprdma_and_dmc_dma` -- a DMC DMA colliding with an OAM DMA already
-//!     in progress. DMC wins the cycle and OAM DMA realigns, which is the
-//!     two-cycle case `Cpu.runOamDma` handles inline rather than through
-//!     `Cpu.read`'s full halt sequence.
+//!     in progress, swept one cycle at a time across the copy's edges.
+//!     `Cpu.runDma` arbitrates the two against each other cycle by cycle
+//!     (`docs/adr/0008-one-dma-unit-with-arbitration.md`), and the ROMs
+//!     time the result against the DMC's own playback -- which made them
+//!     as much a test of `Dmc`'s DMA scheduling as of the DMA unit. See
+//!     the long comment above those two tests.
 //!
 //! Both suites predate the `$6000` protocol and report as console text in
 //! nametable 0 (see `blargg_harness.runToNametableOutcome`). This
@@ -91,222 +94,6 @@ fn expectOneOfCrc(name: []const u8, rom_bytes: []const u8, accepted: []const []c
     return error.TestUnexpectedResult;
 }
 
-/// The two `sprdma_and_dmc_dma` ROMs, which this model does not yet
-/// satisfy. They are vendored, wired up and run rather than left out, so
-/// the gap stays a measured number.
-///
-/// Each sweeps a DMC DMA across sixteen one-cycle offsets relative to an
-/// OAM DMA and prints how long the block took. Subtract the 524-clock
-/// baseline for what the DMA cost there. Hardware's rule set
-/// (https://www.nesdev.org/wiki/DMA and the nesdev "DMC/DMA timing and
-/// quirks" thread):
-///
-///     4   normally
-///     3   landing on a CPU write
-///     2   landing on the $4014 write, or anywhere inside the copy
-///     1   on the copy's next-to-next-to-last cycle
-///     3   on the copy's last cycle
-///
-/// What this core prints:
-///
-///     sprdma      +4 on offsets 00-04, +2 on 05-0F
-///     sprdma_512  +2 on 00-06 and 0A, +4 on the rest
-///
-/// Both shapes are right. `sprdma` sweeps into the copy, `_512` out of it.
-/// Instrumenting `_512` shows a clean monotonic sweep underneath: offsets
-/// 00-05 are serviced inside the copy loop, 06-07 in `Cpu.runOamDma`'s
-/// tail, and 08-0F outside the copy entirely by `Cpu.read`.
-///
-/// Three things a further attempt should know, each of which cost a build
-/// to establish:
-///
-///   * **The output is not quantized, and every value this core prints
-///     being even is a fact about this core, not the ROM.** Forcing
-///     `Cpu.runDmcDma`'s alignment cycle to fire unconditionally makes
-///     odd values appear immediately, all over both tables. So the ROM's
-///     timing routine does resolve single clocks, as its own source says,
-///     and a model that produced hardware's 1 and 3 would show them. An
-///     earlier note here claimed the opposite; it was wrong, and it was
-///     wrong because every variant tried happened to keep the standalone
-///     DMA at a uniform cost.
-///   * **The two tail offsets are indistinguishable to this model.** Both
-///     see the request go up on the same CPU cycle and both end the copy on
-///     the same half of the APU clock, because the DMC raises a reload
-///     request on an APU tick and so cannot resolve the copy's last cycle
-///     from its next-to-next-to-last. Telling them apart needs a finer
-///     request clock than the APU gives, which is the part of hardware this
-///     core does not reproduce.
-///   * **Offset 0A is the alignment cycle, and where it happens is now
-///     pinned.** Histogramming every standalone DMC DMA over a full run
-///     gives 314 at four extra cycles and 14 at three. The threes are the
-///     alignment cycle declining to fire, against hardware's "4 normally".
-///
-///     They are not scattered. Every one of the 14 halts on an opcode
-///     fetch at `$E213` or `$E285` -- two addresses inside the ROM's own
-///     synchronization loops -- and every one has the APU on the same half
-///     of its clock. `sync_dmc.s` budgets "4 DMC wait-states" for that
-///     loop, so if hardware really is uniform there, these threes are
-///     corrupting the very synchronization the measurement depends on,
-///     which would explain wrong values at every offset rather than just
-///     one.
-///
-///     Two candidate fixes are already excluded. Inverting the get-cycle
-///     polarity makes three the dominant cost and the ROM hangs outright,
-///     because the loop period then equals the DMC's 3424 and never
-///     drifts -- the same failure ENG-81 found. Making the alignment
-///     unconditional gives a uniform four but turns both tables into
-///     alternating 528/529 runs where hardware and this core both produce
-///     flat ones.
-///
-///     What is left needs hardware's answer, not more inference: whether
-///     the alignment is decided by the phase the *halt* lands on, as
-///     modeled here, or by the phase of the *request*, which in these
-///     loops would be fixed and would make the cost uniform. The two
-///     differ only when the CPU delays the halt, which is exactly what
-///     these two addresses do.
-/// **The checksum is invertible, and the machinery for it is proven.** The
-/// blocker on all of the above has been that a failing ROM reports only a
-/// CRC-32, so a wrong model looks like any other wrong model. That is no
-/// longer quite true, and whoever picks this up should not redo the
-/// following.
-///
-/// The ROM's CRC routine is at `$E78A` (its `reset` at `$E77B`), found by
-/// its inner-loop opcode signature rather than by a symbol, since this
-/// suite ships no source. Logging the accumulator at `$E78E` -- one
-/// instruction past the enable check, so disabled calls exclude themselves
-/// -- captures exactly the byte stream the ROM hashes. Dropping the last
-/// 24 bytes, which are fed while the checksum is frozen, makes
-/// `zlib.crc32` of that stream equal the value the ROM itself prints, for
-/// **both** ROMs. That is the proof the capture is right.
-///
-/// The stream is 4179 bytes: a 20-byte header (`"T+ Clocks (decimal)\0"`),
-/// then sixteen 260-byte blocks of 256 filler, three ASCII digits and one
-/// separator, the last block truncated after its digits.
-///
-/// **Retraction: the checksum does not cover OAM, and a timing-only fix
-/// does suffice.** An earlier note here read the 256-byte runs as the OAM
-/// contents each collision left behind. They are not. `$E4EB` fills
-/// `$0700-$07FF` by calling `update_crc` and then `AND #$E3`-ing the
-/// accumulator it preserved, so after the first iteration the value is a
-/// fixed point: the run is `$8F` followed by 255 `$83`, byte-identical in
-/// every block of both ROMs. The separator is just the loop index, 1..15.
-/// Diffing the two captured streams confirms it -- they differ in exactly
-/// thirteen bytes, every one of them the third digit of a clock count. So
-/// the only content the checksum varies over is the sixteen clock counts,
-/// and the search space is small enough to enumerate outright.
-///
-/// **The expected constants, and how to re-derive them.** `$E4D8` loads
-/// `$0E/$0F` with `$EE13` and calls `check_crc` at `$E84B`, which walks
-/// `$E7D1`: `LDA ($0E),Y / SEC / ADC $0012,Y` for Y=3..0, so the stored
-/// dword is the ones' complement of the running CRC -- the same
-/// complement `print_crc` at `$E7BF` applies, which makes the four bytes
-/// at `$EE13` the printed checksum verbatim, MSB last. They are the only
-/// bytes besides two delay constants (`$E381`, `$E3A5`) in which the two
-/// ROM images differ:
-///
-///     sprdma_and_dmc_dma       $EE13: 8d a4 ad fb   ->  FBADA48D
-///     sprdma_and_dmc_dma_512   $EE13: 55 8f a5 f1   ->  F1A58F55
-///
-/// **What the ROMs actually expect.** Writing the expected printed value
-/// as `523 + (offset & 1) + cost`, a complete 4^16 enumeration over
-/// `cost` in 1..4 leaves `sprdma` exactly one solution and `_512` one
-/// structured solution:
-///
-///     sprdma      cost = 4 4 4 4 4  2 2 2 2 2 2 2 2 2 2 2
-///     sprdma_512  cost = 2 2 2 2 1 1  3 3  4 4 3 3  4 4 4 4
-///
-/// `sprdma`'s cost table is *already what this core computes*. Its whole
-/// failure is the `(offset & 1)` term: the printed value must track the
-/// OAM DMA's own 513/514 alignment, and here it does not. Substituting
-/// "this core's value minus one on the even-parity iterations" into the
-/// captured stream reproduces `FBADA48D` exactly, which is an independent
-/// second derivation of the same table.
-///
-/// That parity term is the open question. `runOamDma` does insert its
-/// alignment cycle on the right iterations -- instrumenting it shows the
-/// copy alternating 513/514 across the sweep exactly as it should -- but
-/// the ROM's own timing routine (`$E280`, which clocks the block against
-/// the DMC's independent playback) cannot see the difference here, and on
-/// hardware it plainly can. Four variants of the alignment (flipped
-/// parity, APU-phase-driven, either polarity) all leave `sprdma`'s
-/// sixteen printed values byte-identical, so the insensitivity is not in
-/// which iterations get the cycle. It is in what the measurement does
-/// with it.
-///
-/// `_512` needs that same parity term plus two cost corrections, both of
-/// them boundary cases: offsets 04-05 want hardware's "1 on the copy's
-/// next-to-next-to-last cycle" and offsets 0A-0B want "3 landing on a CPU
-/// write". Note the expected costs hold for two consecutive offsets at a
-/// time, which matches the measured fact that the DMC advances one copy
-/// index every two offsets.
-///
-/// **What the arbitration rewrite changed (ADR 0008).** Replacing the two
-/// DMA mechanisms with one per-cycle arbitration loop got offset 04 right
-/// -- it now prints 524, the expected value -- which is the first of those
-/// two boundary cases. The full suite stays green and all four
-/// `dmc_dma_during_read4` ROMs still pass.
-///
-/// It did **not** move `sprdma` at all: its sixteen values and its
-/// checksum are byte-identical before and after. That is worth stating
-/// plainly, because it settles something. The parity term is not an
-/// arbitration effect. Neither is it the phase the copy starts on: the
-/// rewrite deferred the copy to the CPU's next read, moved the halt test
-/// to before the read cycle, and flipped `nextIsGetCycle` to the literal
-/// Mesen2 polarity -- three changes that each shift the copy against the
-/// get/put clock, that together fixed OAM DMA's own 513/514 parity, and
-/// that between them changed `sprdma`'s printed output by nothing.
-///
-/// So the remaining gap is in what the ROM's clock can resolve, not in
-/// what the DMA costs. `$E280` times the block against the DMC's own
-/// playback, and `Apu.tick` advances `dmc.tickTimer` only on
-/// `even_cycle` -- a free-running 2-cycle grid. That is correct hardware
-/// (the DMC timer runs at CPU/2) and is not by itself the bug, but it is
-/// where a one-cycle difference is being swallowed, and it is where the
-/// next attempt should look rather than in `runDma`.
-///
-/// For any further search, note CRC-32 is affine: for equal-length
-/// streams `crc(S^D) = crc(S) ^ crc(D) ^ crc(0)`, so a candidate table
-/// costs a handful of XORs instead of rehashing 4179 bytes. That is what
-/// makes the enumerations above instant.
-///
-/// **How Mesen2 does it, and the three places this core diverges.**
-/// Mesen2 passes both ROMs. Its `NesCpu::ProcessPendingDma`
-/// (`Core/NES/NesCpu.cpp`) is one loop over both DMA units rather than
-/// two mechanisms, and the comparison is worth keeping because the
-/// differences are structural, not a different cost table.
-///
-///   * **It has no OAM-DMA alignment step of its own.**
-///     `RunDMATransfer` sets only `_spriteDmaTransfer` and `_needHalt`;
-///     the 513/514 falls out of the shared loop's "align to read cycle"
-///     branch, the same branch that aligns a DMC get. This core hardcodes
-///     `if (cycles % 2 == 1) idleCycle()` plus an unconditional halt.
-///   * **Sprite-DMA cycles absorb the DMC's halt and dummy cycles.** Its
-///     `processCycle` retires one of `_needHalt`/`_needDummyRead` on
-///     *every* cycle of the loop, whatever that cycle is doing -- the
-///     comment says so outright. That is what makes a mid-copy collision
-///     cost 2 and a boundary collision 1 or 3 without anyone computing a
-///     cost. `runOamDma` here charges a flat get+realign inline and then
-///     a post-hoc `dmcTailPrepCycles`, which is exactly the fixed-penalty
-///     shape that gets the boundary wrong: it is the direct cause of the
-///     two `_512` errors above (offsets 04-05 and 0A-0B).
-///   * **Its OAM DMA halts on a read, like every other DMA.**
-///     `ProcessPendingDma` runs from the CPU's next *read*, so the copy
-///     begins a cycle later than it does here, where `write` calls
-///     `runOamDma` inline on the `$4014` write cycle itself. That shifts
-///     the copy's phase against the DMC's independent schedule, and is
-///     the best remaining candidate for `sprdma`'s missing parity term.
-///
-/// One hypothesis is already eliminated: `nextIsGetCycle` reads
-/// `apu.even_cycle` while `runOamDma` tests `cycles % 2`, but `tick`
-/// increments `cycles` and then flips `even_cycle`, so the two are the
-/// same clock and the two DMA paths are not keyed to different phases.
-/// Mesen2 uses plain CPU-cycle parity (`CycleCount & 1`) for both, which
-/// is the same choice.
-fn expectKnownGap(name: []const u8, rom_bytes: []const u8) !void {
-    _ = name;
-    _ = rom_bytes;
-    return error.SkipZigTest;
-}
 
 test "dmc_dma_during_read4 dma_2007_write" {
     try expectPass("dmc_dma/dma_2007_write", @embedFile("dmc_dma_dma_2007_write"));
@@ -349,9 +136,142 @@ test "dmc_dma_during_read4 double_2007_read" {
         &.{ "85CFD627", "F018C287", "440EF923", "E52F41A5" },
     );
 }
+// ---------------------------------------------------------------------
+// `sprdma_and_dmc_dma` (ENG-81, ENG-86)
+//
+// Each of the two ROMs sweeps a DMC DMA across sixteen one-cycle offsets
+// relative to an OAM DMA and prints how long the block took, as
+// `523 + (offset & 1) + cost` -- a 523-clock baseline, the copy's own
+// 513/514 alternation, and what the collision cost on top. Hardware's rule
+// set for that last term (https://www.nesdev.org/wiki/DMA and the nesdev
+// "DMC/DMA timing and quirks" thread):
+//
+//     4   normally
+//     3   landing on a CPU write
+//     2   landing on the $4014 write, or anywhere inside the copy
+//     1   on the copy's next-to-next-to-last cycle
+//     3   on the copy's last cycle
+//
+// None of those numbers is computed anywhere in this core. They fall out
+// of `Cpu.runDma` arbitrating one DMA unit cycle by cycle -- see
+// `docs/adr/0008-one-dma-unit-with-arbitration.md`, which is what got the
+// block durations right. What these two ROMs then took, on top of that,
+// was `Dmc.load_pending`: see the "what was actually wrong" section below.
+//
+// Where each row comes from, since none of them is written down anywhere:
+//
+//   * **4 normally.** A reload request goes up on a get cycle, so halt,
+//     dummy, alignment and get are four cycles. `Dmc.load_pending`'s doc
+//     comment has the phase argument; `cpu.zig`'s
+//     "a DMC load DMA costs 3 cycles..." test pins it.
+//   * **3 landing on a CPU write.** `Cpu.read` is the only place that
+//     tests `halt_pending`, so a request the CPU cannot halt on waits a
+//     cycle for the next read -- and that cycle does the alignment's job,
+//     paid by an instruction cycle the CPU was going to spend anyway. The
+//     `$4015` write that starts a sample is itself this case, which is why
+//     a load costs 3 and why the same test pins it; `_512`'s offsets
+//     0A-0B are the ROM measurement of it.
+//   * **2 landing on the `$4014` write, or anywhere inside the copy.**
+//     `retireRunUp` spends the run-up on whatever cycle the DMA unit is
+//     taking, so a request raised while a copy is already running has its
+//     halt and dummy absorbed and pays only the get plus the put the copy
+//     spends realigning. A request landing on the `$4014` write is the
+//     same case one cycle earlier: the copy has not started, but neither
+//     unit can halt on that write and both take the same next read, so
+//     they share the run-up from its first cycle. `sprdma`'s offsets
+//     05-0F are the eleven measurements of the in-copy form.
+//   * **1 on the copy's next-to-next-to-last cycle (`_512` offsets
+//     04-05), 3 on its last (06-07).** The loop keeps running after
+//     `oam_dma_pending` clears, for whatever the DMC still owes, so a
+//     request the copy's final cycles raise pays the remainder of its
+//     run-up in real time while one raised a cycle earlier has it
+//     absorbed.
+//
+// **What the ROMs expect, and how to re-derive it.** They check a CRC-32
+// over everything they print and report only pass/fail, so the expected
+// tables had to be recovered from the ROM images. Write the expected
+// printed value as `523 + (offset & 1) + cost`; a complete 4^16
+// enumeration over `cost` in 1..4 leaves `sprdma` exactly one solution and
+// `_512` one structured solution:
+//
+//     sprdma      cost = 4 4 4 4 4  2 2 2 2 2 2 2 2 2 2 2
+//     sprdma_512  cost = 2 2 2 2 1 1  3 3  4 4 3 3  4 4 4 4
+//
+// which is to say the sixteen printed values are
+//
+//     sprdma      527 528 527 528 527 526 525 526 525 526 525 526 525 526 525 526
+//     sprdma_512  525 526 525 526 524 525 526 527 527 528 526 527 527 528 527 528
+//
+// and this core now prints exactly those. None of that machinery needs
+// rebuilding, but if a regression ever needs it again:
+//
+//   * The CRC routine is at `$E78A` (`reset` at `$E77B`), found by its
+//     inner-loop opcode signature -- this suite ships no source. Logging
+//     the accumulator at `$E78E`, one instruction past the enable check so
+//     disabled calls exclude themselves, captures the hashed byte stream;
+//     dropping the last 24 bytes, fed while the checksum is frozen, makes
+//     `zlib.crc32` of it equal the value the ROM prints, for both ROMs.
+//   * The stream is 4179 bytes: a 20-byte header, then sixteen 260-byte
+//     blocks of filler, three ASCII digits and a separator. The filler is
+//     a fixed point of `$E4EB`'s `update_crc`-then-`AND #$E3` loop (`$8F`
+//     then 255 `$83`), identical in every block of both ROMs, so the only
+//     content the checksum varies over is the sixteen clock counts.
+//   * `$E4D8` loads `$0E/$0F` with `$EE13` and calls `check_crc` at
+//     `$E84B`, which walks `$E7D1` (`LDA ($0E),Y / SEC / ADC $0012,Y` for
+//     Y=3..0), so the stored dword is the ones' complement of the running
+//     CRC -- the same complement `print_crc` at `$E7BF` applies. The four
+//     bytes at `$EE13` are therefore the printed checksum verbatim, MSB
+//     last, and they are the only bytes besides two delay constants
+//     (`$E381`, `$E3A5`) in which the two ROM images differ:
+//
+//         sprdma_and_dmc_dma       $EE13: 8d a4 ad fb   ->  FBADA48D
+//         sprdma_and_dmc_dma_512   $EE13: 55 8f a5 f1   ->  F1A58F55
+//
+//   * CRC-32 is affine -- for equal-length streams
+//     `crc(S^D) = crc(S) ^ crc(D) ^ crc(0)` -- so a candidate table costs
+//     a handful of XORs rather than rehashing 4179 bytes, which is what
+//     makes the enumeration above instant.
+//
+// **What was actually wrong, and why it took this long to see.** The DMA
+// costs were right well before the ROMs passed: instrumenting the block
+// these ROMs time (`$E36C` to the `JSR $E280` at `$E38C`) showed all 32
+// durations already equal to the expected printed values plus a constant.
+// The defect was in the *measurement*, not in what was being measured.
+//
+// `$E280` times the block against the DMC's own playback: a 16-cycle
+// coarse loop counts `Y` down while the DMC is active, then a vernier at
+// `$E296` -- whose 3423-cycle loop beats against the DMC's 3424-cycle byte
+// period, one cycle per iteration -- resolves the remainder into `X`, and
+// the routine returns `Y*16 + X`. That is a single-cycle clock, and it was
+// coming back quantized to two: every value this core printed was even.
+//
+// The culprit was the alignment cycle of the very first DMC DMA `$E280`
+// starts, at its `$4015` write. A DMA that pays an alignment cycle when
+// the CPU is on one half of the APU clock and not when it is on the other
+// *absorbs* that phase: both alignments come out of the stall on the same
+// half, and the one-cycle difference the whole block was measuring is
+// gone. nesdev's DMA page says hardware does not do that -- "load and
+// reload DMAs schedule on different cycle types, [so] load DMAs take 3
+// cycles and reload DMAs take 4 unless the halt is delayed by an odd
+// number of cycles" -- so a load costs 3 whichever half the write landed
+// on. `Dmc.load_pending` is that rule; `cpu.zig` has a unit test pinning
+// both costs.
+//
+// Two things this cost several rounds to establish, worth not redoing:
+//
+//   * **Four alignment variants of the *OAM* DMA leave all sixteen of
+//     `sprdma`'s printed values byte-identical**, and so did the whole
+//     ADR 0008 rewrite. The parity term was never an OAM-DMA effect, and
+//     hunting for it in `runDma` could not have found it.
+//   * **Clocking `dmc.tickTimer` at the CPU rate with the unhalved
+//     `dmc_rate_table`** keeps `apu_test` green but hangs three `dmc_dma`
+//     ROMs, and nesdev's framing of the rate table says the timer is
+//     APU-clocked anyway. Do not retry it.
+// ---------------------------------------------------------------------
+
 test "sprdma_and_dmc_dma" {
-    try expectKnownGap("sprdma_and_dmc_dma", @embedFile("sprdma_dmc_sprdma_and_dmc_dma"));
+    try expectPass("sprdma_and_dmc_dma", @embedFile("sprdma_dmc_sprdma_and_dmc_dma"));
 }
 test "sprdma_and_dmc_dma_512" {
-    try expectKnownGap("sprdma_and_dmc_dma_512", @embedFile("sprdma_dmc_sprdma_and_dmc_dma_512"));
+    try expectPass("sprdma_and_dmc_dma_512", @embedFile("sprdma_dmc_sprdma_and_dmc_dma_512"));
 }
