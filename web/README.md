@@ -105,6 +105,20 @@ actual compiled module rather than a hand-maintained mock of its exports.
 > time out under that load and the failing set shifts between runs. If you
 > see scattered failures, re-run with `--workers=1` before treating them as
 > real.
+>
+> Two specs measure the host clock rather than just driving the app —
+> `audio.spec.ts` (the AudioWorklet never starves in steady state) and
+> `pacing.spec.ts` (measured frames per second) — and would fail under that
+> contention every time rather than scattered. They run in their own
+> `timing` project instead: one test at a time, after the rest of the suite
+> has finished, so the measurement gets an idle machine and the bounds can
+> stay exact. Two consequences worth knowing:
+>
+> - A failure anywhere in the `chromium` project reports these as *skipped*,
+>   because Playwright skips a project whose dependency failed.
+> - To run them on their own — the usual loop when working on audio or
+>   pacing — use `npx playwright test --project=timing --no-deps`, which
+>   takes about 20s instead of the full suite's minute.
 
 ## Debugging affordances
 
