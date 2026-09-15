@@ -7,13 +7,17 @@ import { GamepadController } from './gamepad'
  * Gamepad API, so `navigator.getGamepads` is stubbed directly rather than
  * driving this through any browser event -- there isn't one; the API is
  * poll-only. */
-function fakeGamepad(pressed: readonly number[], mapping: GamepadMappingType | '' = 'standard'): Gamepad {
+function fakeGamepad(
+  pressed: readonly number[],
+  mapping: GamepadMappingType | '' = 'standard',
+  axes: readonly number[] = [0, 0, 0, 0],
+): Gamepad {
   const buttons: GamepadButton[] = Array.from({ length: 17 }, (_, i) => ({
     pressed: pressed.includes(i),
     touched: pressed.includes(i),
     value: pressed.includes(i) ? 1 : 0,
   }))
-  return { connected: true, mapping, buttons, axes: [], id: 'fake', index: 0, timestamp: 0, vibrationActuator: null } as unknown as Gamepad
+  return { connected: true, mapping, buttons, axes, id: 'fake', index: 0, timestamp: 0, vibrationActuator: null } as unknown as Gamepad
 }
 
 function stubGamepads(...pads: (Gamepad | null)[]): void {
@@ -42,8 +46,33 @@ describe('GamepadController', () => {
     expect(new GamepadController().read()).toBe(Button.B | Button.A | Button.Select | Button.Start)
   })
 
+  it.each([
+    ['right', [1, 0], Button.Right],
+    ['left', [-1, 0], Button.Left],
+    ['up', [0, -1], Button.Up],
+    ['down', [0, 1], Button.Down],
+  ] as const)('maps the left stick pushed %s to the D-pad', (_, [x, y], bit) => {
+    stubGamepads(fakeGamepad([], 'standard', [x, y, 0, 0]))
+    expect(new GamepadController().read()).toBe(bit)
+  })
+
+  it('maps a diagonal left stick to both directions', () => {
+    stubGamepads(fakeGamepad([], 'standard', [0.8, 0.8, 0, 0]))
+    expect(new GamepadController().read()).toBe(Button.Right | Button.Down)
+  })
+
+  it('ignores left-stick deflection inside the deadzone, so drift never walks the player', () => {
+    stubGamepads(fakeGamepad([], 'standard', [0.3, -0.3, 0, 0]))
+    expect(new GamepadController().read()).toBe(0)
+  })
+
+  it('ignores the right stick', () => {
+    stubGamepads(fakeGamepad([], 'standard', [0, 0, 1, 1]))
+    expect(new GamepadController().read()).toBe(0)
+  })
+
   it('ignores a gamepad that is not using the standard mapping', () => {
-    stubGamepads(fakeGamepad([0, 1], ''))
+    stubGamepads(fakeGamepad([0, 1], '', [1, 1]))
     expect(new GamepadController().read()).toBe(0)
   })
 
