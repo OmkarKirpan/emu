@@ -120,6 +120,18 @@ describe('the Worker reply', () => {
     await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
   })
 
+  it('names a resumed cartridge from a boot-rom message, with no pick involved (ENG-89)', async () => {
+    const { worker, reply } = fakeWorker()
+    render(<Harness worker={worker} />)
+
+    // No `fireEvent.change` here at all -- this is `start()` resolving a
+    // library entry at boot, before the user has touched the picker.
+    reply({ type: 'boot-rom', name: 'metroid.nes' })
+
+    expect(await screen.findByText('cartridge · metroid.nes')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
   it('ignores messages that are not rom-loaded', async () => {
     const { worker, reply } = fakeWorker()
     render(<Harness worker={worker} />)

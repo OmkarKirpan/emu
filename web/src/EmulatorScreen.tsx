@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
+import { RomLibrary } from './RomLibrary'
 import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
 import type { TouchController } from './wasm/touch'
@@ -403,6 +404,13 @@ export function EmulatorScreen() {
             the panel is part of the page's shape, and having it appear late
             would reflow everything below it mid-boot. */}
         <SaveStates worker={worker} enabled={status.kind === 'running'} />
+
+        {/* ENG-89's library surface -- placed below the per-ROM save states
+            rather than above them, so this milestone's addition doesn't
+            reflow anything the rail already had above the fold. Also owns
+            wiring up the resume-on-hide autosave (see its own doc comment),
+            which is why it needs `enabled` too. */}
+        <RomLibrary worker={worker} enabled={status.kind === 'running'} />
       </aside>
     </>
   )

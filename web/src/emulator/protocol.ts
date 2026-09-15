@@ -6,11 +6,12 @@
  * lib conflicting with the other's (see `tsconfig.worker.json`'s own
  * comment for why those two libs can't both be active in one project).
  */
-import type { SaveSlot, SlotSummary } from '../persistence/saveStore'
+import type { RomLibraryEntry, SaveSlot, SlotSummary } from '../persistence/saveStore'
 
-// Re-exported so the Worker and its callers can name a slot without either
-// of them reaching into the persistence layer directly.
-export type { SaveSlot, SlotSummary }
+// Re-exported so the Worker and its callers can name a slot, or describe a
+// library entry, without either of them reaching into the persistence layer
+// directly.
+export type { RomLibraryEntry, SaveSlot, SlotSummary }
 
 /** Which backend `renderer.ts` stood up. Reported back so the UI (and
  * `e2e/renderer.spec.ts`) can state it rather than infer it -- WebGPU
@@ -42,10 +43,19 @@ export type EmulatorWorkerInbound =
    * renderer and input SAB are bound to the session rather than the ROM,
    * and the audio ring is a module-level global outside `Machine`, so
    * samples keep flowing across the swap with no second handshake. */
-  | { type: 'load-rom'; romBytes: ArrayBuffer }
+  // `name` travels alongside the bytes as of ENG-89: the Worker persists a
+  // freshly-picked ROM into the library (`putRom`), and a library record
+  // needs a name to show in `RomLibrary.tsx` -- the file's own `File.name`
+  // is the only place that name exists, and it never otherwise reaches the
+  // Worker (the main thread's own copy lives in `useRomLoader`'s
+  // `pendingName` ref, purely for correlating the `'rom-loaded'` reply).
+  | { type: 'load-rom'; romBytes: ArrayBuffer; name: string }
   // Save-states (M8, ENG-76). The Worker owns both the wasm instance and
   // the IndexedDB store, so these carry a slot number and nothing else --
-  // no state bytes ever cross this boundary in either direction.
+  // no state bytes ever cross this boundary in either direction. `slot` can
+  // be `RESUME_SLOT` here too (ENG-89): `useResumeAutosave.ts` posts a plain
+  // `'save-state'` on `visibilitychange`/`pagehide`, reusing this exact
+  // handler rather than inventing a parallel one.
   | { type: 'save-state'; slot: SaveSlot }
   | { type: 'load-state'; slot: SaveSlot }
   | { type: 'delete-state'; slot: SaveSlot }
@@ -61,6 +71,13 @@ export type EmulatorWorkerInbound =
   // forget, the same way `'reset'` is.
   | { type: 'pause' }
   | { type: 'resume' }
+  // ROM library (ENG-89). The Worker owns IndexedDB, so -- same shape of
+  // division as the save-state messages above -- these carry only a hash,
+  // never ROM bytes; the bytes for a `'resume-rom'` are already sitting in
+  // `LIBRARY_STORE` from when the ROM was first picked.
+  | { type: 'list-library' }
+  | { type: 'resume-rom'; romHash: string }
+  | { type: 'remove-rom'; romHash: string }
 
 /** The ENG-62 ring handshake: forwarded down the transferred worklet port
  * as-is, and posted to the main thread (debug/test hook only, see
@@ -85,6 +102,19 @@ export type EmulatorWorkerOutbound =
    * cartridge is genuinely untouched -- and must not read as fatal. */
   | { type: 'rom-loaded'; ok: true }
   | { type: 'rom-loaded'; ok: false; message: string }
+  /** ENG-89: names a ROM the main thread didn't itself supply the name for
+   * -- either `start()` resolving a boot ROM from the library instead of
+   * falling back to the vendored demo, or a `'resume-rom'` swap triggered
+   * from `RomLibrary.tsx`. Both land here rather than folding into
+   * `'rom-loaded'`: that message's `ok: true` case carries no name at all,
+   * relying on the *picker's* own `pendingName` ref
+   * (`useRomLoader.ts`) for correlation -- which has nothing to correlate
+   * against when nobody on this side picked a file. Lets `useRomLoader.ts`
+   * show "cartridge · <name>" for either case the same way it does for a
+   * picked one, with no separate readout to build. Not sent for the demo
+   * fallback boot: that path is unchanged from before ENG-89, and inventing
+   * a name for it here would be new UI surface the ticket didn't ask for. */
+  | { type: 'boot-rom'; name: string }
   | ({ type: 'audio-ready' } & RingHandshake)
   | { type: 'stats'; fill: number; underrunCount: number; peak: number; rms: number }
   /** The full slot listing for the loaded ROM, pushed after every save,
@@ -97,3 +127,12 @@ export type EmulatorWorkerOutbound =
    * the Worker's `onerror`, which `EmulatorScreen` treats as "the emulator
    * died" and would blank the screen over a failed save. */
   | { type: 'slot-error'; slot: SaveSlot; message: string }
+  /** The full library listing, pushed after every load, resume, remove and
+   * explicit `'list-library'` -- same "full snapshot, not a delta" reasoning
+   * as `'slots'` above. */
+  | { type: 'library'; roms: RomLibraryEntry[] }
+  /** A library operation that failed -- e.g. a `'resume-rom'` naming a
+   * `romHash` no longer in the store (removed from another tab). Reported
+   * rather than thrown, for the same "don't blank the screen over this"
+   * reason as `'slot-error'`. */
+  | { type: 'library-error'; message: string }

@@ -20,7 +20,21 @@ import { NesCore, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from '../wasm/core'
 import { CONTROL_INT32_LENGTH, READ_INDEX, targetFillSamples, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
 import { NTSC_FRAME_MS } from '../timing'
 import { createRenderer } from './renderer'
-import { deleteSlot, getSlot, listSlots, putSlot, SRAM_SLOT, type SaveSlot } from '../persistence/saveStore'
+import {
+  deleteRom,
+  deleteSlot,
+  getRom,
+  getSlot,
+  listRoms,
+  listSlots,
+  putRom,
+  putSlot,
+  RESUME_SLOT,
+  SRAM_SLOT,
+  touchRom,
+  type RomLibraryEntry,
+  type SaveSlot,
+} from '../persistence/saveStore'
 import type { EmulatorWorkerInbound, EmulatorWorkerOutbound, RendererKind, RingHandshake } from './protocol'
 
 /** Typed wrapper over `self.postMessage` for messages to the main thread,
@@ -60,6 +74,22 @@ const MAX_PRIME_TICKS = 30
  * next to 120 emulated frames. */
 const SRAM_AUTOSAVE_INTERVAL_MS = 2_000
 
+/** How often the running game's exact position is autosaved into the
+ * reserved `RESUME_SLOT` (ENG-89), independent of the main-thread
+ * `visibilitychange`/`pagehide` triggers (`useResumeAutosave.ts`) that are
+ * this feature's *primary* save path. Those are best-effort: `pagehide` in
+ * particular can lose the race against this very Worker being terminated
+ * mid-write (`EmulatorScreen.tsx`'s cleanup calls `worker.terminate()`), and
+ * a tab that's simply killed by the OS (mobile, especially) may fire
+ * neither event at all. This interval is the backstop that bounds how much
+ * of a session that scenario can cost. Coarser than `SRAM_AUTOSAVE_
+ * INTERVAL_MS`: a full save-state is a bigger serialize (~20KB of CPU/
+ * PPU/APU/mapper state, see `savestate.zig`) than an 8KB RAM compare, and
+ * losing up to this long of unsaved play to a hard crash -- a rare event --
+ * is a reasonable trade against paying that serialize cost every two
+ * seconds for the length of every session. */
+const RESUME_AUTOSAVE_INTERVAL_MS = 15_000
+
 let nesCore: NesCore | null = null
 let audioPort: MessagePort | null = null
 let audioReady = false
@@ -76,6 +106,13 @@ let romHash = ''
 /** The SRAM bytes most recently written to IndexedDB, so the autosave below
  * writes only on an actual change rather than every two seconds forever. */
 let persistedSram: Uint8Array | null = null
+
+/** The `RESUME_SLOT` save-state bytes most recently written to IndexedDB
+ * (by either path -- the explicit `'save-state'` a hide/pagehide triggers,
+ * or `scheduleResumeAutosave`'s periodic backstop below), so the backstop
+ * writes only when the position has actually changed. Reset to `null` on
+ * every ROM adoption; see `restoreResume`. */
+let persistedResumeState: Uint8Array | null = null
 
 /** True from the instant a ROM swap replaces the running cartridge until
  * its battery has been restored. See the tick loop's guard. */
@@ -128,7 +165,7 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       nesCore?.reset()
       break
     case 'load-rom':
-      loadRom(message.romBytes)
+      loadRom(message.romBytes, message.name)
       break
     case 'save-state':
       void saveToSlot(message.slot)
@@ -141,6 +178,15 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       break
     case 'list-states':
       void publishSlots()
+      break
+    case 'list-library':
+      void publishLibrary()
+      break
+    case 'resume-rom':
+      void resumeRom(message.romHash)
+      break
+    case 'remove-rom':
+      void removeRom(message.romHash)
       break
     case 'audio-start':
       // `nesCore` not existing yet is a real (if narrow) race -- a click
@@ -181,7 +227,12 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
 }
 
 /**
- * ENG-77's runtime ROM swap: re-loads the *running* core in place.
+ * ENG-77's runtime ROM swap: re-loads the *running* core in place. Common
+ * tail of both ways that can happen -- a fresh file pick (`loadRom`) and an
+ * ENG-89 library resume (`resumeRom`) -- differing only in what `persist`
+ * says to do about the library: `{ name, bytes }` for a fresh pick (write
+ * the bytes), `{ name }` alone for a resume whose bytes are already stored
+ * (touch the timestamp only, see `adoptRom`).
  *
  * Safe to call on a live machine because `wasm.zig`'s `load_rom` parses
  * and mapper-checks into a throwaway `validate` pass before it touches
@@ -196,7 +247,7 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
  * ring lives outside `Machine` (see `audio_ring.zig`), so `stepAudioFrame`
  * keeps feeding the same ring the worklet is already reading.
  */
-function loadRom(romBytes: ArrayBuffer): void {
+function swapRom(romBytes: Uint8Array, persist: { name: string; bytes?: Uint8Array }): void {
   if (!nesCore) {
     // Only reachable by picking a file before the Worker finished booting;
     // an honest "not yet" beats silently dropping the message.
@@ -204,12 +255,21 @@ function loadRom(romBytes: ArrayBuffer): void {
     return
   }
 
+  // The outgoing cartridge's exact position, captured while it is still the
+  // one in the machine -- `load_rom` below replaces it. Without this,
+  // switching games through the library silently throws away everything
+  // since the outgoing game's last autosave (up to
+  // `RESUME_AUTOSAVE_INTERVAL_MS`), and "switch to B, switch back to A"
+  // lands A somewhere earlier than where it was left. Skipped mid-swap for
+  // the same half-adopted-machine reason `scheduleResumeAutosave` skips.
+  const outgoing = romHash && !swapPending ? { hash: romHash, state: nesCore.saveState() } : null
+
   // Set before the call, not after: the moment `load_rom` succeeds the core
   // is running a different cartridge, and the tick loop must not advance it
   // until that cartridge's battery has been restored (M8).
   swapPending = true
   try {
-    nesCore.loadRom(new Uint8Array(romBytes))
+    nesCore.loadRom(romBytes)
   } catch (err: unknown) {
     swapPending = false
     // `RomLoadError extends Error`, so one check covers both.
@@ -224,12 +284,89 @@ function loadRom(romBytes: ArrayBuffer): void {
   // uses, and for the same reason: `read_index` is the worklet's own field.
   audioPort?.postMessage({ type: 'resync' })
   post({ type: 'rom-loaded', ok: true })
+  // Written only once the new ROM has actually loaded (a rejected pick
+  // leaves the old cartridge running, with nothing to save), and not when a
+  // fresh pick re-inserts the *same* cartridge: that is the user restarting
+  // it (see `RomPicker.tsx`'s "load it again to restart it"), and
+  // recording the position they are walking away from as the one to resume
+  // would undo the restart on the next reload.
+  if (outgoing && !(persist.bytes && nesCore.romHash() === outgoing.hash)) {
+    putSlot(outgoing.hash, RESUME_SLOT, outgoing.state).catch((err: unknown) => {
+      post({ type: 'slot-error', slot: RESUME_SLOT, message: err instanceof Error ? err.message : String(err) })
+    })
+  }
+  // `persist.bytes` absent means this swap came from the library
+  // (`resumeRom`), not a fresh pick (`loadRom`) -- the main thread's own
+  // `pendingName` correlation (`useRomLoader.ts`) has nothing to go on for
+  // that case, since nobody there picked a file, so the name is handed
+  // over explicitly instead. See `'boot-rom'`'s own comment in
+  // `protocol.ts`.
+  if (!persist.bytes) post({ type: 'boot-rom', name: persist.name })
   // The save-state identity changed with the cartridge: a different
   // `rom_hash` means a different set of slots, and the old ROM's battery
   // must not follow the new one. Not awaited -- `'rom-loaded'` reports that
   // the *ROM* loaded, which it did; `swapPending` is what holds emulation
   // until the rest of the swap has landed.
-  void adoptRom(nesCore)
+  void adoptRom(nesCore, persist)
+}
+
+/** ENG-77's runtime ROM swap, now also ENG-89's library write: a freshly
+ * picked file's bytes are stored under its `rom_hash` (once `adoptRom`
+ * computes it) the same way every load has always gone into `rom_storage`,
+ * just persisted this time too. */
+function loadRom(romBytes: ArrayBuffer, name: string): void {
+  const bytes = new Uint8Array(romBytes)
+  swapRom(bytes, { name, bytes })
+}
+
+/**
+ * ENG-89: re-plays a cartridge already in the library, chosen from
+ * `RomLibrary.tsx`'s listing. Reads the stored bytes back out of
+ * `LIBRARY_STORE` and swaps them in exactly like a fresh pick, except the
+ * library write on the other end of `swapRom` is a `touchRom` (bump
+ * `lastPlayedAt`) rather than a `putRom` (rewrite the bytes) -- the whole
+ * point of storing the ROM in the first place was so this moment doesn't
+ * need the file again.
+ */
+async function resumeRom(targetHash: string): Promise<void> {
+  if (!nesCore) {
+    post({ type: 'library-error', message: 'The emulator is still starting up -- try again in a moment.' })
+    return
+  }
+  const [entry, bytes] = await Promise.all([findRomEntry(targetHash), getRom(targetHash)])
+  if (!entry || !bytes) {
+    // A tab that removed this entry (or never had it -- two tabs can race
+    // a delete) leaves a stale row in another tab's still-open listing.
+    post({ type: 'library-error', message: 'That ROM is no longer in the library.' })
+    return
+  }
+  swapRom(bytes, { name: entry.name })
+}
+
+/** ENG-89: drops a ROM from the library. Runtime state (the currently
+ * loaded cartridge, its save-state slots) is untouched -- see `deleteRom`'s
+ * own comment for why removal doesn't cascade. */
+async function removeRom(targetHash: string): Promise<void> {
+  try {
+    await deleteRom(targetHash)
+    await publishLibrary()
+  } catch (err: unknown) {
+    post({ type: 'library-error', message: err instanceof Error ? err.message : String(err) })
+  }
+}
+
+async function findRomEntry(targetHash: string): Promise<RomLibraryEntry | undefined> {
+  return (await listRoms()).find((entry) => entry.romHash === targetHash)
+}
+
+/** Pushes the full library listing to the main thread, most recently played
+ * first -- the order `RomLibrary.tsx` renders it in, decided here rather
+ * than in the component so every caller (not just the UI) sees the same
+ * ordering. */
+async function publishLibrary(): Promise<void> {
+  const roms = await listRoms()
+  roms.sort((a, b) => b.lastPlayedAt - a.lastPlayedAt)
+  post({ type: 'library', roms })
 }
 
 async function start(
@@ -269,8 +406,45 @@ async function start(
     return
   }
 
+  // ENG-89: boot the last-played library entry instead of unconditionally
+  // booting the vendored demo. `romBytes` (the demo, fetched by
+  // `EmulatorScreen.tsx` before this message was even sent) stays the
+  // fallback for a genuinely empty library -- first visit ever, or every
+  // library entry having been removed -- so a `start()` never has nothing
+  // to boot. This is a *read*, not a network fetch or a picker click, so it
+  // costs nothing on the path that never has a library yet.
+  //
+  // Every failure on the library path falls back to the demo rather than
+  // to an error status, and that is load-bearing, not politeness: boot
+  // always picks the most recently played entry, so a stored ROM that no
+  // longer loads (bytes corrupted, or a mapper a future build drops) would
+  // otherwise fail *every* boot identically -- a console bricked until the
+  // user finds out how to clear site data. The same goes for an IndexedDB
+  // that can't be opened at all (some private-browsing modes): before
+  // ENG-89 boot never depended on it, and it still mustn't.
+  let mostRecent: RomLibraryEntry | null = null
+  let resumed: Uint8Array | null = null
   try {
-    core.loadRom(new Uint8Array(romBytes))
+    const library = await listRoms()
+    mostRecent = library.reduce<RomLibraryEntry | null>(
+      (latest, entry) => (latest === null || entry.lastPlayedAt > latest.lastPlayedAt ? entry : latest),
+      null,
+    )
+    resumed = mostRecent ? await getRom(mostRecent.romHash) : null
+  } catch (err: unknown) {
+    console.warn('ROM library unreadable; booting the demo instead:', err)
+  }
+  if (resumed) {
+    try {
+      core.loadRom(resumed)
+    } catch (err: unknown) {
+      console.warn(`Stored ROM "${mostRecent?.name}" failed to load; booting the demo instead:`, err)
+      resumed = null
+    }
+  }
+
+  try {
+    if (!resumed) core.loadRom(new Uint8Array(romBytes))
   } catch (err: unknown) {
     // `RomLoadError extends Error`, so one check covers both.
     const message = err instanceof Error ? err.message : String(err)
@@ -279,10 +453,17 @@ async function start(
   }
 
   nesCore = core
-  await adoptRom(core)
+  // `resumed`'s bytes are already in the library (that's where they came
+  // from) -- `touchRom` bumps `lastPlayedAt`, `putRom` is not needed and
+  // would just rewrite what's already stored. The demo-fallback path passes
+  // no `persist` at all: the demo is the empty-library placeholder, not a
+  // cartridge that belongs *in* the library (see `RomLibrary.tsx`).
+  await adoptRom(core, resumed && mostRecent ? { name: mostRecent.name } : undefined)
+  if (resumed && mostRecent) post({ type: 'boot-rom', name: mostRecent.name })
 
   post({ type: 'status', status: 'running', renderer: renderer.kind })
   scheduleSramAutosave(core)
+  scheduleResumeAutosave(core)
   if (pendingAudioStart) {
     startAudio(pendingAudioStart.sampleRate, pendingAudioStart.port)
     pendingAudioStart = null
@@ -534,7 +715,15 @@ async function withSlotErrors(slot: SaveSlot, run: (core: NesCore) => Promise<un
 }
 
 function saveToSlot(slot: SaveSlot): Promise<void> {
-  return withSlotErrors(slot, (core) => putSlot(romHash, slot, core.saveState()))
+  return withSlotErrors(slot, async (core) => {
+    const data = core.saveState()
+    await putSlot(romHash, slot, data)
+    // Rebaselines the ENG-89 backstop (`scheduleResumeAutosave`) so it
+    // doesn't immediately rewrite the identical bytes this call -- whether
+    // triggered by `useResumeAutosave.ts`'s hide/pagehide handlers or, in
+    // principle, a future manual control -- just wrote.
+    if (slot === RESUME_SLOT) persistedResumeState = data
+  })
 }
 
 function loadFromSlot(slot: SaveSlot): Promise<void> {
@@ -554,30 +743,67 @@ function loadFromSlot(slot: SaveSlot): Promise<void> {
 
 /**
  * Takes on a newly-loaded cartridge's save-state identity: its `rom_hash`
- * (which keys every slot), its battery, and its slot listing.
+ * (which keys every slot and the library entry alike), its battery, its
+ * ENG-89 resume point, its slot listing, and -- if `persist` says so -- its
+ * place in the library.
  *
- * Called from both places a ROM can arrive -- the initial boot and ENG-77's
- * runtime file picker -- because a swap changes every one of those. Without
- * it the slot browser would keep showing the previous game's saves, and the
- * next save would be filed under the wrong cartridge.
+ * Called from every place a ROM can arrive -- the initial boot, ENG-77's
+ * runtime file picker, and ENG-89's library resume -- because a swap
+ * changes every one of those. Without it the slot browser would keep
+ * showing the previous game's saves, and the next save would be filed under
+ * the wrong cartridge.
  *
- * The battery goes back *before* the first emulated frame of the new ROM
- * (`swapPending` is what enforces that): a real cartridge's RAM is already
- * holding its contents at power-on, and most games read their save file
- * during boot.
+ * `persist` is `undefined` only for the demo-fallback boot (see `start`):
+ * every other caller passes it, `bytes` present for a fresh pick (`putRom`,
+ * a real write) or absent for a library-sourced boot/resume (`touchRom`, a
+ * timestamp bump only).
+ *
+ * The battery and resume-state restores both happen *before* the first
+ * emulated frame of the new ROM (`swapPending` is what enforces that): a
+ * real cartridge's RAM is already holding its contents at power-on, and
+ * most games read their save file during boot -- and a resumed session
+ * should look, from the very first frame, like it never stopped.
  */
-async function adoptRom(core: NesCore): Promise<void> {
+async function adoptRom(core: NesCore, persist?: { name: string; bytes?: Uint8Array }): Promise<void> {
   romHash = core.romHash()
-  // Cleared, not carried over: it is the previous cartridge's RAM, and
-  // leaving it would let the autosave decide "nothing changed" and never
-  // write the new game's battery at all.
+  // Cleared, not carried over: it is the previous cartridge's RAM/position,
+  // and leaving either would let an autosave decide "nothing changed" and
+  // never write the new game's battery or resume point at all.
   persistedSram = null
+  persistedResumeState = null
+  const hash = romHash
   try {
     await restoreSram(core)
+    // Only a *continuation* resumes: the boot path and a library pick. A
+    // fresh file pick is inserting a cartridge and powering on -- which is
+    // what the picker has always meant, "load it again to restart it"
+    // included (`RomPicker.tsx`) -- so it restores the battery, as a real
+    // cartridge would, but not a mid-game position. `persist.bytes` is
+    // exactly "this came from the picker"; see this function's doc comment.
+    if (!persist?.bytes) await restoreResume(core)
   } finally {
     swapPending = false
   }
+  // After the restores and outside `swapPending`, deliberately. Before
+  // them, a failed library write -- a quota error on a large ROM is the
+  // realistic one -- threw straight past `restoreSram`, booting the game
+  // with a blank battery that the SRAM autosave would then write over the
+  // real one. And a ROM-sized IndexedDB write has no business holding
+  // emulation frozen in the meantime. A cartridge that plays but didn't
+  // make it into the library is a recoverable annoyance; say so and move on.
+  if (persist) {
+    try {
+      if (persist.bytes) await putRom(hash, persist.name, persist.bytes)
+      else await touchRom(hash)
+    } catch (err: unknown) {
+      post({
+        type: 'library-error',
+        message: `Couldn't save "${persist.name}" to the library: ${err instanceof Error ? err.message : String(err)}`,
+      })
+    }
+  }
   await publishSlots()
+  await publishLibrary()
 }
 
 /** Loads the reserved `"sram"` slot into the cartridge, if this ROM has one
@@ -593,6 +819,36 @@ async function restoreSram(core: NesCore): Promise<void> {
     post({
       type: 'slot-error',
       slot: SRAM_SLOT,
+      message: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+/**
+ * ENG-89: loads the reserved `RESUME_SLOT` into the cartridge, if this ROM
+ * has one stored -- the auto-resume half of session continuity, mirroring
+ * `restoreSram` immediately above it. Runs *after* `restoreSram` in
+ * `adoptRom`: a resume state is a full machine snapshot and so carries its
+ * own point-in-time SRAM, overwriting whatever `restoreSram` just loaded --
+ * correct, since the fuller record should win -- which is why
+ * `persistedSram` is rebaselined here too, the same reasoning
+ * `loadFromSlot` already uses for a manual load. A cartridge with no resume
+ * point yet (never played before, or its save-state was written by an
+ * older, incompatible build and rejected) simply boots from power-on, same
+ * as before ENG-89.
+ */
+async function restoreResume(core: NesCore): Promise<void> {
+  try {
+    const blob = await getSlot(romHash, RESUME_SLOT)
+    if (blob) {
+      core.loadState(blob)
+      persistedResumeState = blob
+      persistedSram = core.sram()
+    }
+  } catch (err: unknown) {
+    post({
+      type: 'slot-error',
+      slot: RESUME_SLOT,
       message: err instanceof Error ? err.message : String(err),
     })
   }
@@ -617,6 +873,30 @@ function scheduleSramAutosave(core: NesCore): void {
     persistedSram = current
     void withSlotErrors(SRAM_SLOT, () => putSlot(romHash, SRAM_SLOT, current))
   }, SRAM_AUTOSAVE_INTERVAL_MS)
+}
+
+/**
+ * ENG-89's periodic backstop for `RESUME_SLOT` -- see
+ * `RESUME_AUTOSAVE_INTERVAL_MS`'s comment for why this exists alongside the
+ * main-thread `visibilitychange`/`pagehide` triggers rather than instead of
+ * them. Mirrors `scheduleSramAutosave`'s "only write on an actual change"
+ * shape, compared against `persistedResumeState` instead of
+ * `persistedSram` -- but *without* that function's "all zero means never
+ * saved, skip" carve-out, since a fresh save-state is never all zero (it
+ * always carries real CPU/PPU register state) and there is no equivalent
+ * "hasn't happened yet" case to distinguish from "genuinely empty".
+ * Skipped entirely mid-swap (`swapPending`): `core.saveState()` against a
+ * cartridge whose battery/resume restore hasn't landed yet would capture a
+ * half-adopted machine.
+ */
+function scheduleResumeAutosave(core: NesCore): void {
+  setInterval(() => {
+    if (swapPending || !romHash) return
+    const current = core.saveState()
+    if (persistedResumeState !== null && equalBytes(current, persistedResumeState)) return
+    persistedResumeState = current
+    void withSlotErrors(RESUME_SLOT, () => putSlot(romHash, RESUME_SLOT, current))
+  }, RESUME_AUTOSAVE_INTERVAL_MS)
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {

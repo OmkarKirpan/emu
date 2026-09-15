@@ -5,13 +5,27 @@ import type { EmulatorWorkerOutbound } from './emulator/protocol'
  * ENG-77's runtime ROM loading: turns a picked or dropped `File` into a
  * `'load-rom'` message, and tracks what came back.
  *
- * **The chosen file never leaves this tab.** It goes `File` ->
- * `ArrayBuffer` -> Worker -> wasm and is then dropped: never fetched from
- * the server, never written anywhere, never persisted across a reload.
+ * **The chosen file never leaves this browser.** It goes `File` ->
+ * `ArrayBuffer` -> Worker -> wasm exactly as it always has: never fetched
+ * from the server, never uploaded, never sent anywhere off this device.
  * That is precisely what lets a real commercial game reach the emulator
  * without the repo's ROM policy being involved at all -- the file is chosen
  * at runtime by the person running it. See `docs/research/test-rom-
  * licensing.md` (ENG-59) for why the distinction matters here.
+ *
+ * **What ENG-89 changed is what happens after that.** This hook still only
+ * ever hands the Worker an `ArrayBuffer` and a name; it is the Worker
+ * (never this thread, never a server) that, on the other side of the
+ * `'load-rom'` message, now also writes those bytes into this origin's own
+ * IndexedDB (`persistence/saveStore.ts`'s `romLibrary` store, keyed by the
+ * ROM's own hash) so a reload can restore the last-played cartridge instead
+ * of always booting the vendored demo. The old "never persisted" guarantee
+ * this comment used to make is no longer true and would be actively
+ * misleading left as-is -- what's still true, and what actually matters for
+ * the ROM policy, is "never leaves this browser, never uploaded, entirely
+ * under the user's own control" (`RomLibrary.tsx` is what lets them remove
+ * an entry, and DevTools' own IndexedDB inspector can always show them
+ * what's stored).
  *
  * Split out of `EmulatorScreen.tsx` rather than added to it: that file
  * already carries the session-caching and StrictMode-remount reasoning,
@@ -63,6 +77,15 @@ export function useRomLoader(worker: Worker | null): RomLoader {
     if (!worker) return
     const handleMessage = (event: MessageEvent<EmulatorWorkerOutbound>) => {
       const message = event.data
+      // ENG-89: the Worker resolved a library ROM at boot with nobody here
+      // having picked anything -- `pendingName` (correlation data for a
+      // reply to *this* thread's own post) has nothing to say about it, so
+      // this is handled as a distinct case rather than folded into
+      // `'rom-loaded'`'s `pendingName` lookup below.
+      if (message.type === 'boot-rom') {
+        setRomLoad({ name: message.name })
+        return
+      }
       if (message.type !== 'rom-loaded') return
       const name = pendingName.current ?? ''
       setRomLoad(message.ok ? { name } : { name, error: message.message })
@@ -85,8 +108,11 @@ export function useRomLoader(worker: Worker | null): RomLoader {
       void (async () => {
         const romBytes = await file.arrayBuffer()
         // Transferred, not copied -- a ROM is up to a few hundred KB and
-        // this side has no further use for the bytes.
-        worker.postMessage({ type: 'load-rom', romBytes }, [romBytes])
+        // this side has no further use for the bytes. `name` travels
+        // alongside them (ENG-89) so the Worker can label the library entry
+        // it writes -- see `protocol.ts`'s `'load-rom'` for why that can't
+        // just be read back off the `File` on this side later.
+        worker.postMessage({ type: 'load-rom', romBytes, name: file.name }, [romBytes])
       })()
     },
     [worker],
