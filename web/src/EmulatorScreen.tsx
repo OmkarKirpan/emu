@@ -47,12 +47,19 @@ function preferredRendererFromQuery(): RendererKind | undefined {
 /** Debug/test hook only: `web/e2e/helpers.ts`'s `readFramebuffer` reads this
  * instead of the canvas's own 2D context -- once `transferControlToOffscreen`
  * hands the canvas to the Worker, the placeholder element left behind
- * refuses `getContext('2d')` entirely (ENG-57), so this is a live shared-
- * memory view onto the wasm-side framebuffer instead, built from the
- * `'video-ready'` handshake below. No production code path reads it. */
+ * refuses `getContext('2d')` entirely (ENG-57), so this reads the live
+ * shared-memory view onto the wasm-side framebuffer instead, built from the
+ * `'video-ready'` handshake below. No production code path reads it.
+ *
+ * Returns a `Uint8Array` rather than a plain `number[]`, and that is not a
+ * cosmetic choice (ENG-99): Playwright serializes a typed array as one
+ * base64 blob, but a `number[]` as 245,760 individual protocol values --
+ * which measured at ~1.2s per call on an *idle* machine and several seconds
+ * under load, against `waitUntilRunning`'s 5s poll budget. See
+ * `e2e/helpers.ts`'s `readFramebuffer`. */
 declare global {
   interface Window {
-    __frameDebug__?: () => number[]
+    __frameDebug__?: () => Uint8Array
   }
 }
 
@@ -158,7 +165,10 @@ export function EmulatorScreen() {
       const message = event.data
       if (message.type === 'video-ready') {
         const view = new Uint8ClampedArray(message.sab, message.framebufferPtr, message.width * message.height * 4)
-        window.__frameDebug__ = () => Array.from(view)
+        // Copied out of the shared view on every call, not aliased: the
+        // copy is what makes it a plain (non-shared) buffer, which is what
+        // lets Playwright hand it across as a single base64 blob.
+        window.__frameDebug__ = () => new Uint8Array(view)
       } else if (message.type === 'status') {
         setStatus(
           message.status === 'running'

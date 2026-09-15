@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
 import type { Page } from '@playwright/test'
-import { BACKDROP_RGBA, findSpriteCol, readFramebuffer, SPRITE_INITIAL_COL, SPRITE_ROW } from './helpers'
+import { BACKDROP_RGBA, findSpriteCol, readFramebuffer, readSpriteCol, SPRITE_INITIAL_COL, SPRITE_ROW } from './helpers'
 import { expect, test } from './fixtures'
 
 /**
@@ -90,9 +90,11 @@ test('loading a ROM cold-boots the machine rather than resetting it', async ({ p
 
   // Polled, not sampled once: the freshly booted ROM waits two VBLANKs
   // before it turns rendering on (see `waitUntilRunning`'s comment), so
-  // the frame right after the load is legitimately blank.
+  // the frame right after the load is legitimately blank. `readSpriteCol`
+  // rather than a whole `readFramebuffer` per iteration, for the reason
+  // `helpers.ts` gives -- polling is what that split exists for.
   await expect
-    .poll(async () => findSpriteCol(await readFramebuffer(page), SPRITE_ROW, BACKDROP_RGBA), {
+    .poll(() => readSpriteCol(page, SPRITE_ROW, BACKDROP_RGBA), {
       message: 'the sprite never returned to its power-on column after the ROM load',
     })
     .toBe(SPRITE_INITIAL_COL)
