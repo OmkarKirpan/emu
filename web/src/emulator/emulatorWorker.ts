@@ -255,6 +255,15 @@ function swapRom(romBytes: Uint8Array, persist: { name: string; bytes?: Uint8Arr
     return
   }
 
+  // The outgoing cartridge's exact position, captured while it is still the
+  // one in the machine -- `load_rom` below replaces it. Without this,
+  // switching games through the library silently throws away everything
+  // since the outgoing game's last autosave (up to
+  // `RESUME_AUTOSAVE_INTERVAL_MS`), and "switch to B, switch back to A"
+  // lands A somewhere earlier than where it was left. Skipped mid-swap for
+  // the same half-adopted-machine reason `scheduleResumeAutosave` skips.
+  const outgoing = romHash && !swapPending ? { hash: romHash, state: nesCore.saveState() } : null
+
   // Set before the call, not after: the moment `load_rom` succeeds the core
   // is running a different cartridge, and the tick loop must not advance it
   // until that cartridge's battery has been restored (M8).
@@ -275,6 +284,17 @@ function swapRom(romBytes: Uint8Array, persist: { name: string; bytes?: Uint8Arr
   // uses, and for the same reason: `read_index` is the worklet's own field.
   audioPort?.postMessage({ type: 'resync' })
   post({ type: 'rom-loaded', ok: true })
+  // Written only once the new ROM has actually loaded (a rejected pick
+  // leaves the old cartridge running, with nothing to save), and not when a
+  // fresh pick re-inserts the *same* cartridge: that is the user restarting
+  // it (see `RomPicker.tsx`'s "load it again to restart it"), and
+  // recording the position they are walking away from as the one to resume
+  // would undo the restart on the next reload.
+  if (outgoing && !(persist.bytes && nesCore.romHash() === outgoing.hash)) {
+    putSlot(outgoing.hash, RESUME_SLOT, outgoing.state).catch((err: unknown) => {
+      post({ type: 'slot-error', slot: RESUME_SLOT, message: err instanceof Error ? err.message : String(err) })
+    })
+  }
   // `persist.bytes` absent means this swap came from the library
   // (`resumeRom`), not a fresh pick (`loadRom`) -- the main thread's own
   // `pendingName` correlation (`useRomLoader.ts`) has nothing to go on for
@@ -393,15 +413,38 @@ async function start(
   // library entry having been removed -- so a `start()` never has nothing
   // to boot. This is a *read*, not a network fetch or a picker click, so it
   // costs nothing on the path that never has a library yet.
-  const library = await listRoms()
-  const mostRecent = library.reduce<RomLibraryEntry | null>(
-    (latest, entry) => (latest === null || entry.lastPlayedAt > latest.lastPlayedAt ? entry : latest),
-    null,
-  )
-  const resumed = mostRecent ? await getRom(mostRecent.romHash) : null
+  //
+  // Every failure on the library path falls back to the demo rather than
+  // to an error status, and that is load-bearing, not politeness: boot
+  // always picks the most recently played entry, so a stored ROM that no
+  // longer loads (bytes corrupted, or a mapper a future build drops) would
+  // otherwise fail *every* boot identically -- a console bricked until the
+  // user finds out how to clear site data. The same goes for an IndexedDB
+  // that can't be opened at all (some private-browsing modes): before
+  // ENG-89 boot never depended on it, and it still mustn't.
+  let mostRecent: RomLibraryEntry | null = null
+  let resumed: Uint8Array | null = null
+  try {
+    const library = await listRoms()
+    mostRecent = library.reduce<RomLibraryEntry | null>(
+      (latest, entry) => (latest === null || entry.lastPlayedAt > latest.lastPlayedAt ? entry : latest),
+      null,
+    )
+    resumed = mostRecent ? await getRom(mostRecent.romHash) : null
+  } catch (err: unknown) {
+    console.warn('ROM library unreadable; booting the demo instead:', err)
+  }
+  if (resumed) {
+    try {
+      core.loadRom(resumed)
+    } catch (err: unknown) {
+      console.warn(`Stored ROM "${mostRecent?.name}" failed to load; booting the demo instead:`, err)
+      resumed = null
+    }
+  }
 
   try {
-    core.loadRom(resumed ?? new Uint8Array(romBytes))
+    if (!resumed) core.loadRom(new Uint8Array(romBytes))
   } catch (err: unknown) {
     // `RomLoadError extends Error`, so one check covers both.
     const message = err instanceof Error ? err.message : String(err)
@@ -728,15 +771,36 @@ async function adoptRom(core: NesCore, persist?: { name: string; bytes?: Uint8Ar
   // never write the new game's battery or resume point at all.
   persistedSram = null
   persistedResumeState = null
+  const hash = romHash
   try {
-    if (persist) {
-      if (persist.bytes) await putRom(romHash, persist.name, persist.bytes)
-      else await touchRom(romHash)
-    }
     await restoreSram(core)
-    await restoreResume(core)
+    // Only a *continuation* resumes: the boot path and a library pick. A
+    // fresh file pick is inserting a cartridge and powering on -- which is
+    // what the picker has always meant, "load it again to restart it"
+    // included (`RomPicker.tsx`) -- so it restores the battery, as a real
+    // cartridge would, but not a mid-game position. `persist.bytes` is
+    // exactly "this came from the picker"; see this function's doc comment.
+    if (!persist?.bytes) await restoreResume(core)
   } finally {
     swapPending = false
+  }
+  // After the restores and outside `swapPending`, deliberately. Before
+  // them, a failed library write -- a quota error on a large ROM is the
+  // realistic one -- threw straight past `restoreSram`, booting the game
+  // with a blank battery that the SRAM autosave would then write over the
+  // real one. And a ROM-sized IndexedDB write has no business holding
+  // emulation frozen in the meantime. A cartridge that plays but didn't
+  // make it into the library is a recoverable annoyance; say so and move on.
+  if (persist) {
+    try {
+      if (persist.bytes) await putRom(hash, persist.name, persist.bytes)
+      else await touchRom(hash)
+    } catch (err: unknown) {
+      post({
+        type: 'library-error',
+        message: `Couldn't save "${persist.name}" to the library: ${err instanceof Error ? err.message : String(err)}`,
+      })
+    }
   }
   await publishSlots()
   await publishLibrary()
