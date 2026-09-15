@@ -2,6 +2,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
+import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
 import { RomLibrary } from './RomLibrary'
 import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
@@ -112,6 +113,65 @@ export function EmulatorScreen() {
   const [pauseState, dispatchPause] = useReducer(pauseReasonReducer, document.hidden, initialPauseReasonState)
   const paused = isPaused(pauseState)
 
+  /**
+   * ENG-91's rewind hold. A ref, not just the mirrored `rewinding` state
+   * below, because the keydown/keyup and pointerdown/pointerup handlers
+   * that drive it need a synchronous "is a hold already in progress?"
+   * check to swallow both key-repeat and a duplicate pointer event (a
+   * `pointerdown` that fires again before React re-renders with the state
+   * this same handler just set) -- reading `rewinding` state directly here
+   * could still observe the pre-update value. The state exists purely to
+   * re-render the canvas indicator and the button's `aria-pressed`.
+   */
+  const rewindHeldRef = useRef(false)
+  const [rewinding, setRewinding] = useState(false)
+
+  const startRewind = useCallback(() => {
+    if (rewindHeldRef.current) return
+    rewindHeldRef.current = true
+    setRewinding(true)
+    worker?.postMessage({ type: 'rewind-start' })
+  }, [worker])
+
+  const stopRewind = useCallback(() => {
+    if (!rewindHeldRef.current) return
+    rewindHeldRef.current = false
+    setRewinding(false)
+    worker?.postMessage({ type: 'rewind-end' })
+  }, [worker])
+
+  /** ENG-91's speed control: 0.5x/1x/2x. Always starts at 1x on a fresh
+   * mount -- like `paused`, this is transport state a reload should not
+   * remember (unlike, say, volume/mute). */
+  const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED)
+
+  const applySpeed = useCallback(
+    (next: Speed) => {
+      setSpeed(next)
+      worker?.postMessage({ type: 'set-speed', multiplier: next })
+    },
+    [worker],
+  )
+
+  /** The app-bar button's own click behaviour -- cycling forward, not the
+   * `-`/`=` keys' up/down stepping. See `speedControl.ts`'s `cycleSpeed` for
+   * why a single button reads correctly wrapping where the keys should not. */
+  const handleSpeedCycle = useCallback(() => {
+    applySpeed(cycleSpeed(speed))
+    canvasRef.current?.focus()
+  }, [applySpeed, speed])
+
+  /** ENG-91's frame-step (`K`): a no-op unless the transport is actually
+   * paused, matching the ticket's own "only while paused" rule and the
+   * app-bar button's `disabled` state below -- re-checked worker-side too
+   * (`handleFrameStep` in `emulatorWorker.ts`) for the same defense-in-depth
+   * reason every other transport message gets it. */
+  const handleFrameStep = useCallback(() => {
+    if (!paused) return
+    worker?.postMessage({ type: 'frame-step' })
+    canvasRef.current?.focus()
+  }, [paused, worker])
+
   /** Drives the ABI's `reset` export -- the emulated console's RESET line,
    * not a reload: WRAM, VRAM and palette survive it exactly as they do on
    * hardware (see `Ppu.reset`). Works, and stays paused, while paused: it
@@ -175,6 +235,58 @@ export function EmulatorScreen() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [handlePauseToggle])
+
+  /**
+   * ENG-91's key bindings: `R` (held) rewinds, `K` frame-steps, `-`/`=`
+   * (`Minus`/`Equal`, not `KeyMinus`/`KeyEqual` -- neither exists) step the
+   * speed down/up. None of these are in `KEY_MAP` (`wasm/controller.ts`) or
+   * `P`'s own binding, and stay that way -- see this file's own module
+   * comment on the ownership split with ENG-93's control-map documentation.
+   * Ignored the same way `P` is while a form control has focus.
+   *
+   * `blur` also ends a rewind hold: alt-tabbing (or anything else that
+   * steals focus) away mid-hold fires no `keyup` at all, and without this
+   * the game would stay frozen and muted until some *other* key event
+   * happened to arrive on `KeyR`.
+   */
+  useEffect(() => {
+    const isFormTarget = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isFormTarget(event.target)) return
+      switch (event.code) {
+        case 'KeyR':
+          if (event.repeat) return
+          event.preventDefault()
+          startRewind()
+          break
+        case 'KeyK':
+          if (event.repeat) return
+          handleFrameStep()
+          break
+        case 'Minus':
+          if (event.repeat) return
+          applySpeed(stepSpeed(speed, -1))
+          break
+        case 'Equal':
+          if (event.repeat) return
+          applySpeed(stepSpeed(speed, 1))
+          break
+      }
+    }
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'KeyR') stopRewind()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    window.addEventListener('blur', stopRewind)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+      window.removeEventListener('blur', stopRewind)
+    }
+  }, [startRewind, stopRewind, handleFrameStep, applySpeed, speed])
 
   /** Fullscreen the stage, or leave it. Rendered conditionally on
    * `document.fullscreenEnabled` rather than offered-and-failing: iPhone
@@ -346,6 +458,44 @@ export function EmulatorScreen() {
           >
             {paused ? '--resume' : '--pause'}
           </button>
+          {/* ENG-91: hold-to-rewind. Pointer events, not `onClick` --
+              `onPointerDown`/`onPointerUp` are what let this work as a
+              press-and-hold on touch the same way the keyboard's `R`
+              keydown/keyup does; `onPointerLeave`/`onPointerCancel` end the
+              hold too, so a drag off the button (or the OS interrupting the
+              gesture) can't leave rewind stuck on the way a missed `keyup`
+              could -- see the `blur` listener alongside the keyboard
+              handler for that same failure mode. */}
+          <button
+            type="button"
+            className="flag rewind"
+            onPointerDown={(event) => {
+              event.preventDefault()
+              startRewind()
+            }}
+            onPointerUp={stopRewind}
+            onPointerLeave={stopRewind}
+            onPointerCancel={stopRewind}
+            disabled={status.kind !== 'running'}
+            aria-pressed={rewinding}
+          >
+            --rewind
+          </button>
+          <button
+            type="button"
+            className="flag step"
+            onClick={handleFrameStep}
+            disabled={status.kind !== 'running' || !paused}
+          >
+            --step
+          </button>
+          {/* ENG-91's speed control: one button, cycling forward through
+              every level on click (`cycleSpeed`) -- `-`/`=` are the
+              up/down steppers, this is the "next" affordance for a mouse or
+              a thumb. */}
+          <button type="button" className="flag speed" onClick={handleSpeedCycle} disabled={status.kind !== 'running'}>
+            --speed {speed}x
+          </button>
           {document.fullscreenEnabled && (
             <button type="button" className="flag" onClick={toggleFullscreen}>
               --fullscreen
@@ -378,6 +528,22 @@ export function EmulatorScreen() {
               `status.kind === 'running'` so it can never appear stacked
               over the loading/error overlays above. */}
           {status.kind === 'running' && paused && <p className="screen-overlay screen-overlay-paused">Paused</p>}
+          {/* ENG-91: a small, non-covering readout -- deliberately not the
+              full-screen `.screen-overlay` treatment above, since both of
+              these describe the picture still actively changing underneath
+              them (a rewind hold visibly plays frames backward; a non-1x
+              speed visibly plays them forward faster/slower), unlike
+              Paused/Loading/error which describe a frozen or absent one.
+              Rewind wins when both are true: `speedMultiplier` doesn't even
+              apply while `rewinding` gates the tick loop worker-side (see
+              `emulatorWorker.ts`), so showing "2x" during a hold would be
+              stating something not currently in effect. */}
+          {status.kind === 'running' && rewinding && (
+            <p className="screen-indicator screen-indicator-rewind">Rewinding</p>
+          )}
+          {status.kind === 'running' && !rewinding && speed !== 1 && (
+            <p className="screen-indicator screen-indicator-speed">{speed}x</p>
+          )}
         </div>
         <TouchControls touch={touch} />
       </div>

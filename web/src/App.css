@@ -312,6 +312,29 @@
   text-transform: uppercase;
 }
 
+/* ENG-91: rewind/speed's on-canvas readout. A small corner badge, not the
+   full-cover `.screen-overlay` treatment above -- both of these describe a
+   picture that's still actively changing underneath them (see
+   `EmulatorScreen.tsx`'s own comment on why that rules out reusing the
+   overlay), so covering the screen to say so would hide the very thing
+   being described. */
+.screen-indicator {
+  position: absolute;
+  right: var(--space-xs);
+  bottom: var(--space-xs);
+  margin: 0;
+  padding: var(--space-2xs) var(--space-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+  background: var(--color-scrim);
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+}
+
 /* ------------------------------------------------------------------ *
  * Touch controls
  * ------------------------------------------------------------------ */

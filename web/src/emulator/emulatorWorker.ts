@@ -19,7 +19,9 @@
 import { NesCore, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from '../wasm/core'
 import { CONTROL_INT32_LENGTH, READ_INDEX, targetFillSamples, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
 import { NTSC_FRAME_MS } from '../timing'
-import { createRenderer } from './renderer'
+import { createRenderer, type FrameRenderer } from './renderer'
+import { CAPTURE_INTERVAL_FRAMES, RewindRing } from './rewindRing'
+import { DEFAULT_SPEED, type Speed } from './speedControl'
 import {
   deleteRom,
   deleteSlot,
@@ -131,6 +133,78 @@ let swapPending = false
  */
 let paused = false
 
+/**
+ * ENG-91's rewind gate, parallel to `paused` above but independent of it --
+ * see `protocol.ts`'s `'rewind-start'`/`'rewind-end'` doc comment for why
+ * two flags (checked together, `if (paused || rewinding) return`, in the
+ * tick loop below) is what lets a rewind hold work identically whether the
+ * transport was running or already user-paused, with no third message
+ * needed to say which one to return to on release. Never touched by
+ * `'pause'`/`'resume'` themselves.
+ */
+let rewinding = false
+
+/** setInterval handle for the active rewind hold's own stepping loop
+ * (`startRewind`), or `null` when no hold is in progress. Distinct from
+ * `scheduleLoop`'s timer, which keeps running (and skipped) throughout the
+ * hold exactly as it does under `paused` -- see that function's own
+ * comment. */
+let rewindTimer: ReturnType<typeof setInterval> | null = null
+
+/** ENG-91's per-cartridge rewind history -- cleared in `adoptRom`, appended
+ * to every `CAPTURE_INTERVAL_FRAMES`th forward frame by
+ * `advanceAndMaybeCapture`, and walked backwards by `startRewind`. See
+ * `rewindRing.ts`'s own module comment for why this is a plain capped stack
+ * rather than a circular buffer with a cursor. */
+const rewindRing = new RewindRing()
+
+/** Counts forward frames (normal play *and* frame-step -- anything that
+ * calls `advanceAndMaybeCapture`) since the last rewind capture, wrapping
+ * at `CAPTURE_INTERVAL_FRAMES`. Reset alongside the ring itself in
+ * `adoptRom`, and after a manual slot load (`loadFromSlot`) re-baselines
+ * the ring's top -- see that function's own comment. */
+let framesSinceCapture = 0
+
+/** ENG-91's speed multiplier, applied to `NTSC_FRAME_MS` by `scheduleLoop`'s
+ * period getter -- see `setSpeed` for the audio-muting side of a change. */
+let speedMultiplier: Speed = DEFAULT_SPEED
+
+/**
+ * The renderer `start()` stands up, hoisted to module scope (rather than
+ * kept as a local inside `start()`, as it was before ENG-91) so
+ * `handleFrameStep` and `startRewind` -- both driven by a plain
+ * `self.onmessage` case, not the tick loop's own closure -- can paint a
+ * frame outside of `scheduleLoop`'s regular cadence. `null` until `start()`
+ * resolves; every reader below already guards on `nesCore` existing at the
+ * same point in the boot sequence, so the two are checked together.
+ */
+let renderer: FrameRenderer | null = null
+
+/**
+ * Rewind holds and non-1x speeds mute the worklet by reusing ENG-90's own
+ * `paused` bypass (`audioRingProcessor.js`'s `paused` branch) rather than
+ * inventing a second silence path -- see this file's ENG-91 message
+ * handlers. `audioMuted` is *this file's* record of which state the
+ * worklet was last told to be in, independent of `paused`/`rewinding`/
+ * `speedMultiplier` individually, so `syncAudioMute` sends a message only on
+ * an actual transition -- exactly the redundant-call guard `'resume'`
+ * already had one-off (`if (!paused) break`), generalized to cover every
+ * reason the worklet might need muting now that there is more than one.
+ */
+let audioMuted = false
+
+/** ENG-91's chosen rewind rate: fast enough to be worth holding a key for,
+ * slow enough to track visually. Stepping back one `CAPTURE_INTERVAL_
+ * FRAMES`-frame capture on every real video-frame tick (~16.6ms) would
+ * consume ~166ms of game time per 16.6ms of wall time -- a ~10x rewind,
+ * too fast to see anything at. Instead `startRewind`'s own timer ticks
+ * every `REWIND_TICK_MS`, chosen so one capture (166ms of game time) plays
+ * back over roughly `REWIND_SPEED_MULTIPLIER` times less wall time than it
+ * took to play forward -- i.e. a visibly-controllable ~2.5x rewind, not a
+ * blur and not a slideshow. */
+const REWIND_SPEED_MULTIPLIER = 2.5
+const REWIND_TICK_MS = (CAPTURE_INTERVAL_FRAMES * NTSC_FRAME_MS) / REWIND_SPEED_MULTIPLIER
+
 /** The audio ring's shared control-block view and this session's target
  * fill, captured once in `startAudio` so `beginAudioReprime` (run from an
  * unrelated `'resume'` message, long after `startAudio`'s own locals have
@@ -203,12 +277,11 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       break
     case 'pause':
       paused = true
-      // Tell the worklet too, so a drained ring reads as "intentionally
-      // silent" rather than "starved" -- see `audioRingProcessor.js`'s own
-      // `paused` flag. Skipped until the cold-start handshake is done --
-      // see `audioHandshakeDone` for why forwarding it earlier strands the
-      // worklet paused.
-      if (audioHandshakeDone) audioPort?.postMessage({ type: 'pause' })
+      // The audio side is now `syncAudioMute`'s job -- see that function's
+      // doc comment for why muting is centralized there as of ENG-91
+      // (rewind and non-1x speed need the exact same worklet bypass this
+      // used to reach for directly).
+      syncAudioMute()
       break
     case 'resume':
       // Idempotent: `EmulatorScreen` posts `'resume'` on mount as well as
@@ -216,12 +289,22 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       // frozen would resync a playing stream for no reason.
       if (!paused) break
       paused = false
-      // Only the audio side needs ceremony on the way back -- see
-      // `beginAudioReprime`'s doc comment for why. Video just resumes
-      // drawing on the very next tick. Pre-handshake there is nothing to
-      // reprime: the cold-start hook is still installed and resumes on its
-      // own (see `audioHandshakeDone`).
-      if (audioHandshakeDone) beginAudioReprime()
+      // Video just resumes drawing on the very next tick. Audio only
+      // actually un-mutes if nothing else (a rewind hold, a non-1x speed)
+      // still wants it muted -- `syncAudioMute` is what checks that.
+      syncAudioMute()
+      break
+    case 'rewind-start':
+      startRewind()
+      break
+    case 'rewind-end':
+      endRewind()
+      break
+    case 'frame-step':
+      handleFrameStep()
+      break
+    case 'set-speed':
+      setSpeed(message.multiplier)
       break
   }
 }
@@ -397,7 +480,9 @@ async function start(
     height: FRAMEBUFFER_HEIGHT,
   })
 
-  let renderer
+  // Assigned to the module-level `renderer` (not a local) as of ENG-91: the
+  // rewind and frame-step handlers paint outside `scheduleLoop`'s own
+  // closure, from a plain `self.onmessage` case, and need the same instance.
   try {
     renderer = await createRenderer(canvas, FRAMEBUFFER_WIDTH, FRAMEBUFFER_HEIGHT, preferredRenderer)
   } catch (err: unknown) {
@@ -484,13 +569,15 @@ async function start(
     // blank save file it should have had would not be.
     if (swapPending) return
     // ENG-90: freezes the picture and stops sample production in one place.
-    // `nextTick` above keeps advancing at the real frame period regardless
-    // (this `return` is inside `step`, never touching `scheduleLoop`'s own
-    // bookkeeping), so an arbitrarily long pause never reads as the kind of
-    // stall `RESYNC_THRESHOLD_MS` exists to correct -- there is no backlog
-    // to resync away, because nothing fell behind in the first place.
-    if (paused) return
-    renderer.draw(core.stepFrame())
+    // ENG-91 adds `rewinding` alongside it, for the same reason -- see that
+    // flag's own doc comment. `nextTick` above keeps advancing at the real
+    // frame period regardless (this `return` is inside `step`, never
+    // touching `scheduleLoop`'s own bookkeeping), so an arbitrarily long
+    // pause or rewind hold never reads as the kind of stall `RESYNC_
+    // THRESHOLD_MS` exists to correct -- there is no backlog to resync
+    // away, because nothing fell behind in the first place.
+    if (paused || rewinding) return
+    renderer!.draw(advanceAndMaybeCapture(core))
     // Skipped until a user gesture creates the `AudioContext` and this
     // Worker's `startAudio` runs -- no point producing test-tone samples
     // (with the wrong, still-default sample rate) that nothing will ever
@@ -499,7 +586,155 @@ async function start(
       core.stepAudioFrame()
       awaitAudioPrimed?.()
     }
-  }, NTSC_FRAME_MS)
+  }, () => NTSC_FRAME_MS / speedMultiplier)
+}
+
+/**
+ * Advances one video frame and, every `CAPTURE_INTERVAL_FRAMES`th one,
+ * pushes a fresh rewind capture -- the one path both the normal tick loop
+ * and `handleFrameStep` advance a frame through, so "every 10th forward
+ * frame is captured" means the same thing regardless of whether those
+ * frames came from real-time play or manual single-stepping while paused.
+ *
+ * Deliberately *not* called from `startRewind`'s own stepping -- loading a
+ * historical snapshot and re-rendering it (see that function) is not new
+ * forward progress, and capturing it would let a rewind hold quietly graft
+ * captures from the timeline it is currently walking backward through onto
+ * the ring it is popping from.
+ *
+ * `core.saveState()` is a ~20KB serialize, called here at most once every
+ * ten frames (~166ms) -- `pacing.spec.ts` (real-time fps) is the
+ * regression test for this staying cheap enough to not show up as dropped
+ * frames at 1x.
+ */
+function advanceAndMaybeCapture(core: NesCore): Uint8ClampedArray<ArrayBuffer> {
+  const frame = core.stepFrame()
+  framesSinceCapture += 1
+  if (framesSinceCapture >= CAPTURE_INTERVAL_FRAMES) {
+    framesSinceCapture = 0
+    rewindRing.push(core.saveState())
+  }
+  return frame
+}
+
+/**
+ * ENG-91: single-step while paused (`K`). Re-checks `paused` itself (not
+ * just trusting the main thread's own `disabled` button/no-op key guard --
+ * see `EmulatorScreen.tsx`) because this runs off a plain message, the same
+ * way `'reset'` does, and a frame-step racing a `'resume'` that already
+ * landed must not double-advance the machine from two directions at once.
+ * Also refuses during a rewind hold or a pending ROM swap, for the same
+ * "don't mutate the machine from two places at once" reason.
+ *
+ * Draws exactly one frame and leaves `paused` untouched -- the tick loop's
+ * own gate is what keeps the machine from advancing again on its own.
+ */
+function handleFrameStep(): void {
+  if (!nesCore || !renderer || !paused || rewinding || swapPending) return
+  renderer.draw(advanceAndMaybeCapture(nesCore))
+}
+
+/**
+ * ENG-91: starts a rewind hold. Its own `setInterval`, independent of
+ * `scheduleLoop`'s timer (which keeps running throughout, skipped by the
+ * `rewinding` gate above) -- rewind is a human-scale interaction, not a
+ * frame-accurate playback path, so the small jitter a plain `setInterval`
+ * carries is not worth `scheduleLoop`'s self-correcting bookkeeping.
+ *
+ * Each tick pops one capture off `rewindRing` -- one step back in time --
+ * loads it, and steps *one frame forward* from it purely to render:
+ * ADR 0006 excludes `Ppu.framebuffer` from the save-state format (it is
+ * redrawn from the dot the state resumes at, same as a numbered slot load),
+ * so a `loadState` alone leaves nothing new on screen. That render frame
+ * also pushes real APU samples into the ring via `Apu.tick` regardless of
+ * `stepAudioFrame` ever being called (see `audio_ring.zig`'s module
+ * comment -- `pushSample` runs inside `step_frame`'s `runFrames`, not
+ * inside `step_audio_frame`, which only refreshes the DRC ratio) --
+ * harmless here because the worklet is muted for the whole hold
+ * (`syncAudioMute`) and `pushSample`'s own capacity check simply stops
+ * accepting samples once the ring is full rather than corrupting anything;
+ * whatever is sitting in it gets discarded wholesale by `beginAudioReprime`
+ * resyncing straight to target fill when normal play resumes.
+ *
+ * Once the ring is empty, `pop()` returns `undefined` and this simply holds
+ * the oldest frame already on screen rather than underflowing -- see
+ * `RewindRing.pop`'s own comment.
+ */
+function startRewind(): void {
+  if (rewinding || !nesCore || !renderer) return
+  rewinding = true
+  syncAudioMute()
+  const core = nesCore
+  rewindTimer = setInterval(() => {
+    const snapshot = rewindRing.pop()
+    if (!snapshot) return
+    core.loadState(snapshot)
+    renderer!.draw(core.stepFrame())
+  }, REWIND_TICK_MS)
+}
+
+/**
+ * ENG-91: ends a rewind hold. Clearing `rewinding` alone is what makes
+ * release behave correctly whether the transport was running or
+ * user-paused when the hold started -- see `rewinding`'s own doc comment:
+ * if `paused` is still `true`, the tick loop's `if (paused || rewinding)`
+ * gate keeps it frozen exactly where rewind left it ("stay paused on
+ * release"); if not, the very next scheduled tick steps forward from there
+ * ("resume running on release"), with no bookkeeping here about which case
+ * applied.
+ */
+function endRewind(): void {
+  if (!rewinding) return
+  rewinding = false
+  if (rewindTimer !== null) {
+    clearInterval(rewindTimer)
+    rewindTimer = null
+  }
+  syncAudioMute()
+}
+
+/**
+ * ENG-91: applies a speed change. `scheduleLoop`'s period getter reads
+ * `speedMultiplier` fresh on every tick, so this needs no coordination with
+ * the loop itself -- the very next `setTimeout` callback just uses the new
+ * period, and `RESYNC_THRESHOLD_MS`'s drift check is untouched by the
+ * change (see `scheduleLoop`'s own doc comment for why a period change
+ * can't produce a catch-up burst regardless of when it lands).
+ */
+function setSpeed(multiplier: Speed): void {
+  if (multiplier === speedMultiplier) return
+  speedMultiplier = multiplier
+  syncAudioMute()
+}
+
+/**
+ * Centralizes every reason the worklet should be muted right now --
+ * ENG-90's user/hidden pause, ENG-91's rewind hold, and ENG-91's non-1x
+ * speed -- into one send-on-transition call, reusing exactly
+ * `audioRingProcessor.js`'s existing `paused` bypass (silence, nothing
+ * counted) rather than adding a second one. A non-1x speed needs this for
+ * a different reason than pause/rewind do: at 0.5x the ring is fed at half
+ * the real-time rate a live worklet expects and would starve continuously,
+ * while at 2x it's fed faster than the worklet drains it and
+ * `pushSample`'s capacity check would start silently dropping samples --
+ * "the audio either follows or is muted deliberately, never left to
+ * underrun/overflow" is satisfied by choosing mute, uniformly, for every
+ * speed but 1x.
+ *
+ * Skipped entirely pre-handshake (`audioHandshakeDone`) for the same reason
+ * `'pause'` always was -- see that flag's own doc comment -- and re-applied
+ * the instant the handshake *does* complete (`startAudio`'s `awaitAudioPrimed`
+ * calls this too), so a speed change or rewind hold that happened to occur
+ * during the cold-start priming window is not silently dropped once the
+ * worklet actually comes alive.
+ */
+function syncAudioMute(): void {
+  if (!audioHandshakeDone) return
+  const shouldMute = paused || rewinding || speedMultiplier !== 1
+  if (shouldMute === audioMuted) return
+  audioMuted = shouldMute
+  if (shouldMute) audioPort?.postMessage({ type: 'pause' })
+  else beginAudioReprime()
 }
 
 function startAudio(sampleRate: number, port: MessagePort): void {
@@ -551,6 +786,10 @@ function startAudio(sampleRate: number, port: MessagePort): void {
     if (fill < primeTarget && ticksWaited < MAX_PRIME_TICKS) return
     awaitAudioPrimed = null
     audioHandshakeDone = true
+    // ENG-91: applies whatever mute state (rewind/non-1x speed/pause) was
+    // already requested during the priming window this closure just
+    // finished waiting out -- see `syncAudioMute`'s own doc comment.
+    syncAudioMute()
 
     port.postMessage({ type: 'init', ...handshake })
     // Debug/test hook aside (see `AudioOutput.tsx`), this is the cue to
@@ -664,15 +903,25 @@ function measureRing(ring: Float32Array, write: number, fill: number): { peak: n
  * burst that coupling used to require (see the old `EmulatorScreen.tsx`'s
  * `MAX_CATCHUP_FRAMES`) has no equivalent problem to solve here. No stop
  * handle: see this function's only caller for why.
+ *
+ * `frameMs` is a getter, not a fixed number, so ENG-91's speed control can
+ * change the period mid-run (`setSpeed` just mutates `speedMultiplier`,
+ * read fresh here every tick) without this function knowing speed exists.
+ * That live change is exactly as safe as any other tick-to-tick jitter this
+ * loop already tolerates: `step()` is called at most once per `tick()`
+ * regardless of how far `now` and `nextTick` have drifted, so there is no
+ * multi-step "catch up to the new rate" burst to produce in the first
+ * place -- the same property the module comment above already leans on for
+ * the ordinary resync case, unaffected by *why* a gap between them opened.
  */
-function scheduleLoop(step: () => void, frameMs: number): void {
+function scheduleLoop(step: () => void, frameMs: () => number): void {
   let nextTick = performance.now()
 
   const tick = () => {
     const now = performance.now()
     if (now - nextTick > RESYNC_THRESHOLD_MS) nextTick = now // see RESYNC_THRESHOLD_MS's own comment
     step()
-    nextTick += frameMs
+    nextTick += frameMs()
     setTimeout(tick, Math.max(0, nextTick - performance.now()))
   }
   setTimeout(tick, 0)
@@ -738,6 +987,17 @@ function loadFromSlot(slot: SaveSlot): Promise<void> {
     // autosave from either writing it back immediately or, worse, deciding
     // nothing changed and leaving the battery stale.
     persistedSram = core.sram()
+    // ENG-91: a manual slot load is a deliberate jump to a different point
+    // in this cartridge's history, same in kind as what rewind itself does
+    // -- so it gets folded into the same ring rather than invalidating it.
+    // Pushing `blob` (already in hand, no second `saveState()` call) keeps
+    // the ring's top consistent with what is now actually running, and
+    // deliberately does *not* clear the rest of the history below it:
+    // rewinding right after this load walks back into the pre-load past,
+    // which reads as "undo the load" -- a reasonable thing to want, and no
+    // worse than what loading the slot already did to "now".
+    rewindRing.push(blob)
+    framesSinceCapture = 0
   })
 }
 
@@ -771,6 +1031,14 @@ async function adoptRom(core: NesCore, persist?: { name: string; bytes?: Uint8Ar
   // never write the new game's battery or resume point at all.
   persistedSram = null
   persistedResumeState = null
+  // ENG-91: the rewind ring is per-cartridge. A previous game's captures
+  // are meaningless against a different `rom_hash`/mapper -- `wasm.zig`'s
+  // `load_state` would likely just reject them outright -- and even a
+  // same-ROM re-adoption (a fresh pick re-inserting the identical cartridge,
+  // see `swapRom`'s "load it again to restart it") is a genuine power-on,
+  // which real rewind hardware has nothing to rewind past either.
+  rewindRing.clear()
+  framesSinceCapture = 0
   const hash = romHash
   try {
     await restoreSram(core)
@@ -861,6 +1129,12 @@ async function restoreResume(core: NesCore): Promise<void> {
  * this Worker's lifecycle is the emulator's. */
 function scheduleSramAutosave(core: NesCore): void {
   setInterval(() => {
+    // ENG-91: a rewind hold has `core` sitting on a historical snapshot for
+    // the interval's whole duration -- reading its SRAM here would risk
+    // writing the player's *past* battery contents over their real,
+    // current save. Same "half-adopted/in-flux machine" reasoning
+    // `scheduleResumeAutosave` already applied to `swapPending`.
+    if (rewinding) return
     const current = core.sram()
     // A cartridge whose RAM is still entirely zero has never written a save
     // file, and storing 8KB of nothing for every ROM the user merely opens
@@ -891,7 +1165,9 @@ function scheduleSramAutosave(core: NesCore): void {
  */
 function scheduleResumeAutosave(core: NesCore): void {
   setInterval(() => {
-    if (swapPending || !romHash) return
+    // ENG-91: `rewinding` added alongside `swapPending` for the same
+    // reason -- see `scheduleSramAutosave`'s matching guard.
+    if (swapPending || rewinding || !romHash) return
     const current = core.saveState()
     if (persistedResumeState !== null && equalBytes(current, persistedResumeState)) return
     persistedResumeState = current
