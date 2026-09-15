@@ -212,3 +212,46 @@ test('pausing does not register as audio underruns, and resume re-primes without
   // above uses.
   expect(resumedStats!.rms).toBeGreaterThan(0.005)
 })
+
+/**
+ * ENG-90's other pause/audio interaction: audio enabled *while* paused.
+ *
+ * Cold start withholds the worklet's `'init'` and the main thread's
+ * `'audio-ready'` until the ring is primed (`startAudio`), and priming only
+ * advances on a real tick -- so a pause straddling it leaves that hook
+ * pending. An earlier cut of `'resume'` installed `beginAudioReprime`'s hook
+ * over it, dropping the handshake for good: the worklet never received a
+ * ring, never read, and the session was silent until reload. The button
+ * still read "Audio playing" and the Worker-side rms still looked healthy,
+ * because both are measured without the worklet -- which is why this test
+ * asserts on fill instead: a worklet that never reads lets the writer run
+ * the ring up to `audio_ring.zig`'s capacity (8192) and saturate there,
+ * where a live one holds it near ENG-62's target.
+ */
+test('audio enabled while paused starts playing once resumed', async ({ page }) => {
+  const pauseButton = page.locator('.flag.pause')
+  await pauseButton.click()
+  await expect(pauseButton).toHaveText('--resume')
+
+  const audioButton = page.locator('.audio-enable')
+  await audioButton.click()
+  await expect(audioButton).toHaveText('Audio playing')
+  // Longer than the cold-start priming window (`MAX_PRIME_TICKS` ~ 0.5s of
+  // ticks), so the pause really does straddle it rather than racing it.
+  await page.waitForTimeout(1000)
+
+  await pauseButton.click()
+  await expect(pauseButton).toHaveText('--pause')
+
+  await expect
+    .poll(() => readAudioDebug(page), { message: 'no audio debug stats ever arrived from the Worker', timeout: 5000 })
+    .not.toBeNull()
+  await waitForUnderrunsToSettle(page)
+  await page.waitForTimeout(1000)
+
+  const stats = await readAudioDebug(page)
+  expect(stats).not.toBeNull()
+  expect(stats!.fill).toBeGreaterThan(0)
+  expect(stats!.fill, `ring fill ${stats!.fill} -- the worklet never started reading`).toBeLessThan(8192)
+  expect(stats!.rms).toBeGreaterThan(0.005)
+})
