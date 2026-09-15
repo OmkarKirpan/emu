@@ -101,10 +101,15 @@ pipeline end to end — lives in `e2e/` under Playwright, run against the
 actual compiled module rather than a hand-maintained mock of its exports.
 
 > **Note on the e2e suite.** It runs `fullyParallel`, which puts several
-> wasm emulators in contention on one machine; the framebuffer polls can
-> time out under that load and the failing set shifts between runs. If you
-> see scattered failures, re-run with `--workers=1` before treating them as
-> real.
+> wasm emulators in contention on one machine. That used to make the
+> framebuffer polls time out under load, with a failing set that shifted
+> between runs; the cause turned out to be the *test harness*, not the
+> emulator — `waitUntilRunning` polled with a whole-framebuffer read, and
+> a framebuffer serialized as a plain `number[]` costs ~1.2s a call even on
+> an idle machine (ENG-99). Both halves of that are fixed in
+> `e2e/helpers.ts`: polls use the in-page scan, and the whole-frame read
+> crosses as a typed array. Scattered failures are no longer expected, so
+> treat one as real rather than re-running with `--workers=1`.
 >
 > Two specs measure the host clock rather than just driving the app —
 > `audio.spec.ts` (the AudioWorklet never starves in steady state) and
@@ -118,7 +123,7 @@ actual compiled module rather than a hand-maintained mock of its exports.
 >   because Playwright skips a project whose dependency failed.
 > - To run them on their own — the usual loop when working on audio or
 >   pacing — use `npx playwright test --project=timing --no-deps`, which
->   takes about 20s instead of the full suite's minute.
+>   takes a few seconds instead of the full suite's twenty-odd.
 
 ## Debugging affordances
 
