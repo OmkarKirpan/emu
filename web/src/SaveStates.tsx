@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import { SAVE_SLOTS, SRAM_SLOT, type SaveSlot, type SlotSummary } from './persistence/saveStore'
+import { RESUME_SLOT, SAVE_SLOTS, SRAM_SLOT, type SaveSlot, type SlotSummary } from './persistence/saveStore'
 import type { EmulatorWorkerOutbound } from './emulator/protocol'
+import { formatWhen } from './formatWhen'
 
 /**
  * ENG-76 (M8)'s save-state slot browser.
@@ -16,7 +17,12 @@ import type { EmulatorWorkerOutbound } from './emulator/protocol'
  * slot ENG-61 auto-loads on boot and auto-saves as the cartridge's RAM
  * changes; offering "save"/"load" for it would invite the user to fight the
  * mechanism that is already doing it. It is shown, not driven -- so "is my
- * progress actually being kept?" has a visible answer.
+ * progress actually being kept?" has a visible answer. The resume row below
+ * it is the ENG-89 counterpart for the same reason: `"resume"` is written by
+ * `useResumeAutosave.ts` (on `visibilitychange`/`pagehide`) and
+ * `emulatorWorker.ts`'s periodic backstop, and auto-loaded on every ROM
+ * adopt -- never something the numbered Save/Load/Delete controls should
+ * touch, so it does not appear in `SAVE_SLOTS` at all.
  *
  * The ticket also names a settings panel. Nothing this milestone produced
  * belongs in one (the renderer override is a query parameter, audio is a
@@ -28,14 +34,6 @@ interface SaveStatesProps {
   /** False until the ROM is actually running -- there is no machine to
    * snapshot before then, and the Worker would answer with a `'slot-error'`. */
   enabled: boolean
-}
-
-function formatWhen(savedAt: number): string {
-  const date = new Date(savedAt)
-  const today = new Date().toDateString() === date.toDateString()
-  return today
-    ? date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : date.toLocaleDateString([], { month: 'short', day: 'numeric' })
 }
 
 export function SaveStates({ worker, enabled }: SaveStatesProps) {
@@ -69,6 +67,7 @@ export function SaveStates({ worker, enabled }: SaveStatesProps) {
   )
 
   const battery = slots.find((s) => s.slot === SRAM_SLOT)
+  const resume = slots.find((s) => s.slot === RESUME_SLOT)
 
   return (
     <section className="save-states" aria-label="Save states">
@@ -111,6 +110,13 @@ export function SaveStates({ worker, enabled }: SaveStatesProps) {
             user recognizes, and the acronym explains nothing to them. */}
         Battery save:{' '}
         {battery ? `kept automatically, last written ${formatWhen(battery.savedAt)}` : 'nothing written yet'}
+      </p>
+      <p className="resume-point" data-saved={resume ? 'yes' : 'no'}>
+        {/* Read-only for the same reason the battery row is: ENG-89's
+            resume point is auto-saved on hide/pagehide and auto-loaded on
+            boot, not a slot the user picks. */}
+        Resume point:{' '}
+        {resume ? `kept automatically, last written ${formatWhen(resume.savedAt)}` : 'nothing written yet'}
       </p>
       {error && (
         <p className="slot-error" role="alert">
