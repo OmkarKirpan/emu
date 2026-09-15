@@ -23,7 +23,7 @@ describe('isDebugMode', () => {
     expect(isDebugMode()).toBe(true)
   })
 
-  it('is true regardless of the value given -- presence-only, like ?renderer=', () => {
+  it('is true regardless of the value given -- presence-only, unlike ?renderer=', () => {
     setSearch('?debug=false')
     expect(isDebugMode()).toBe(true)
   })
