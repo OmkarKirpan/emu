@@ -49,6 +49,12 @@ class AudioRingProcessor extends AudioWorkletProcessor {
     /** @type {Int32Array | null} */
     this.control = null
     this.capacity = 0
+    /** ENG-90's transport pause, set by `emulatorWorker.ts` forwarding the
+     * main thread's `'pause'`/`'resume'`. See `process()` for why this is
+     * its own branch rather than reusing the pre-`init` silence path below
+     * -- both output silence, but only this one has a real `read_index` to
+     * leave untouched. */
+    this.paused = false
     this.port.onmessage = (event) => this.handleMessage(event.data)
   }
 
@@ -65,6 +71,25 @@ class AudioRingProcessor extends AudioWorkletProcessor {
         break
       case 'resync':
         this.resync()
+        break
+      case 'pause':
+        // Freeze `read_index` exactly where it is rather than let it keep
+        // draining toward `write_index` -- there is no producer moving
+        // `write_index` forward behind a pause, so continuing to drain
+        // would just walk straight into the ordinary starved-ring branch
+        // below and start counting underruns for a silence that was
+        // requested, not a stall. `process()` bypasses that branch entirely
+        // while `paused`.
+        this.paused = true
+        break
+      case 'resume':
+        // Resync first, *then* clear `paused` -- see `emulatorWorker.ts`'s
+        // `beginAudioReprime` for why the message doesn't arrive until a
+        // fresh target's worth of samples has already been produced: this
+        // lands `read_index` on that fresh cushion instead of the stale
+        // pre-pause audio still sitting `targetFill` samples back.
+        this.resync()
+        this.paused = false
         break
       default:
         break
@@ -89,8 +114,12 @@ class AudioRingProcessor extends AudioWorkletProcessor {
     const channel = outputs[0]?.[0]
     if (!channel) return true
 
-    if (!this.ring || !this.control) {
-      channel.fill(0) // no `init` message yet -- silence, not garbage/uninitialized memory
+    if (this.paused || !this.ring || !this.control) {
+      // Same output either way (silence, nothing counted) whether there's
+      // no ring yet or a real one that's deliberately not being read from
+      // -- see the `pause` case in `handleMessage` for why `paused` must
+      // not fall through to the starved-ring branch below.
+      channel.fill(0)
       copyToRemainingChannels(outputs[0], channel)
       return true
     }

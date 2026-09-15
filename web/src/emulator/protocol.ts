@@ -52,6 +52,15 @@ export type EmulatorWorkerInbound =
   | { type: 'list-states' }
   | { type: 'audio-start'; sampleRate: number; port: MessagePort }
   | { type: 'audio-resync' }
+  // ENG-90's transport surface (pause/resume is also the plumbing ENG-91's
+  // rewind reuses). The timer inside `scheduleLoop` keeps running either
+  // way -- only the step it drives is skipped -- so a stall this causes
+  // never trips `RESYNC_THRESHOLD_MS`'s catch-up path on resume. Owns no
+  // reply: `EmulatorScreen.tsx` tracks its own pause intent locally (the
+  // "user paused" vs. "tab hidden" reasons) and this message is fire-and-
+  // forget, the same way `'reset'` is.
+  | { type: 'pause' }
+  | { type: 'resume' }
 
 /** The ENG-62 ring handshake: forwarded down the transferred worklet port
  * as-is, and posted to the main thread (debug/test hook only, see

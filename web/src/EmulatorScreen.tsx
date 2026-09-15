@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { InputBridge } from './emulator/InputBridge'
+import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
 import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
 import type { TouchController } from './wasm/touch'
@@ -96,13 +97,83 @@ export function EmulatorScreen() {
    * cancelled it yet. */
   const teardownTimerRef = useRef<number | null>(null)
 
+  /**
+   * ENG-90's transport pause. Two independent reasons (`pauseReason.ts`)
+   * rather than one boolean: a hidden tab must never be the thing that
+   * un-pauses a game the user paused on purpose. Deliberately *not*
+   * persisted across a reload -- unlike volume/mute, a fresh load always
+   * starts running, per the ticket.
+   *
+   * `document.hidden` seeds the initial state (rather than always `false`)
+   * for the edge case of a session's very first mount happening in a
+   * background tab -- e.g. a link opened into a new background tab.
+   */
+  const [pauseState, dispatchPause] = useReducer(pauseReasonReducer, document.hidden, initialPauseReasonState)
+  const paused = isPaused(pauseState)
+
   /** Drives the ABI's `reset` export -- the emulated console's RESET line,
    * not a reload: WRAM, VRAM and palette survive it exactly as they do on
-   * hardware (see `Ppu.reset`). */
+   * hardware (see `Ppu.reset`). Works, and stays paused, while paused: it
+   * posts straight to the Worker's message handler, which runs off the
+   * message rather than the (frozen) tick loop -- see
+   * `emulatorWorker.ts`'s `paused` doc comment. The new state is real
+   * immediately; it's just not *drawn* until the next real step. */
   const handleReset = useCallback(() => {
     worker?.postMessage({ type: 'reset' })
     canvasRef.current?.focus()
   }, [worker])
+
+  /** Toggles the *user*'s own pause intent -- the app-bar button and the
+   * `P` key binding both call this. Never touches the `hidden` reason, so
+   * a manual pause/resume mid-background just changes what the tab
+   * resumes to once it's visible again (see `pauseReason.ts`'s own tests
+   * for that interaction). */
+  const handlePauseToggle = useCallback(() => {
+    dispatchPause({ kind: 'user', paused: !pauseState.user })
+    canvasRef.current?.focus()
+  }, [pauseState.user])
+
+  // Tells the Worker whenever the *effective* pause state changes -- one
+  // message per real transition, regardless of which reason caused it or
+  // whether both are true at once (`pauseReasonReducer` already collapses
+  // a redundant dispatch into the same object reference, so this effect
+  // doesn't even re-run for those). Fire-and-forget, like `'reset'`: see
+  // `protocol.ts`'s doc comment on why there's no reply to wait for.
+  useEffect(() => {
+    worker?.postMessage({ type: paused ? 'pause' : 'resume' })
+  }, [worker, paused])
+
+  // Auto-pause while hidden (ENG-90's own acceptance note: a backgrounded
+  // tab must stop burning CPU, not just stop being seen). Independent of
+  // the user's own reason -- see `pauseReason.ts`. `document.hidden` at
+  // the moment the event fires is the correct read either way: the
+  // `visibilitychange` event itself doesn't carry the new state.
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      dispatchPause({ kind: 'hidden', paused: document.hidden })
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [])
+
+  // The `P` key binding. Not part of `KeyboardController` (`wasm/
+  // controller.ts`) on purpose -- that maps physical NES-pad buttons, and
+  // `P` is deliberately outside `KEY_MAP` (see that file) so the two
+  // listeners can never fight over the same key. Ignored while a form
+  // control has focus (just the ROM-file `<input>` today) so a future text
+  // field typing the letter P can't accidentally pause the game.
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // `repeat` ignored: holding the key would otherwise flicker the
+      // game in and out of pause at the OS key-repeat rate.
+      if (event.code !== 'KeyP' || event.repeat) return
+      const target = event.target
+      if (target instanceof HTMLElement && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
+      handlePauseToggle()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [handlePauseToggle])
 
   /** Fullscreen the stage, or leave it. Rendered conditionally on
    * `document.fullscreenEnabled` rather than offered-and-failing: iPhone
@@ -265,6 +336,15 @@ export function EmulatorScreen() {
           <button type="button" className="flag reset" onClick={handleReset} disabled={status.kind !== 'running'}>
             --reset
           </button>
+          <button
+            type="button"
+            className="flag pause"
+            onClick={handlePauseToggle}
+            disabled={status.kind !== 'running'}
+            aria-pressed={paused}
+          >
+            {paused ? '--resume' : '--pause'}
+          </button>
           {document.fullscreenEnabled && (
             <button type="button" className="flag" onClick={toggleFullscreen}>
               --fullscreen
@@ -291,6 +371,12 @@ export function EmulatorScreen() {
           />
           {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
+          {/* ENG-90: pause has to be visible on the canvas itself, not only
+              in the app-bar button -- a frozen picture with no label reads
+              as "the emulator hung", not "paused on purpose". Gated on
+              `status.kind === 'running'` so it can never appear stacked
+              over the loading/error overlays above. */}
+          {status.kind === 'running' && paused && <p className="screen-overlay screen-overlay-paused">Paused</p>}
         </div>
         <TouchControls touch={touch} />
       </div>

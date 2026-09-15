@@ -81,6 +81,43 @@ let persistedSram: Uint8Array | null = null
  * its battery has been restored. See the tick loop's guard. */
 let swapPending = false
 
+/**
+ * ENG-90's transport pause. Guards only the tick loop's `stepFrame`/
+ * `stepAudioFrame` calls, not the loop's own `setTimeout` schedule -- see
+ * `scheduleLoop`'s doc comment for why leaving the timer running is what
+ * keeps a resume from ever looking like a stall. Message handlers
+ * (`'reset'`, `'load-rom'`, save-states) are untouched by this flag: they
+ * run off the message, not the loop, so `--reset` and a ROM swap both keep
+ * working while paused (the new state just doesn't get *drawn* until the
+ * loop steps again), and a save/load round-trip is exactly as safe paused
+ * as running.
+ */
+let paused = false
+
+/** The audio ring's shared control-block view and this session's target
+ * fill, captured once in `startAudio` so `beginAudioReprime` (run from an
+ * unrelated `'resume'` message, long after `startAudio`'s own locals have
+ * gone out of scope) can still reach them. */
+let audioControl: Int32Array | null = null
+let audioPrimeTarget = 0
+
+/** Whether `startAudio`'s cold-start priming has finished -- i.e. the
+ * worklet has its `'init'` and the main thread has its `'audio-ready'`.
+ * Distinct from `audioReady`, which flips the moment `startAudio` runs,
+ * long before either message goes out.
+ *
+ * Pause/resume must not touch the audio side until this is true. Before
+ * it, the worklet is still in its pre-init path (no ring, silence, nothing
+ * counted) and the only thing that will ever send it `'init'` is the
+ * cold-start hook in `awaitAudioPrimed`. A `'resume'` that installed
+ * `beginAudioReprime`'s hook over it would drop that handshake for good --
+ * the node never connects and the session stays silent until reload -- and
+ * a `'pause'` forwarded to a worklet that then receives `'init'` with no
+ * matching `'resume'` would leave it paused forever. Pausing the loop
+ * alone is enough pre-handshake: the cold-start hook only advances on a
+ * real tick, so it simply waits out the pause and completes afterwards. */
+let audioHandshakeDone = false
+
 self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
   const message = event.data
   switch (message.type) {
@@ -117,6 +154,28 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       // field (see `audio_ring.zig`'s module doc comment on ownership), so
       // only it can actually perform the resync.
       audioPort?.postMessage({ type: 'resync' })
+      break
+    case 'pause':
+      paused = true
+      // Tell the worklet too, so a drained ring reads as "intentionally
+      // silent" rather than "starved" -- see `audioRingProcessor.js`'s own
+      // `paused` flag. Skipped until the cold-start handshake is done --
+      // see `audioHandshakeDone` for why forwarding it earlier strands the
+      // worklet paused.
+      if (audioHandshakeDone) audioPort?.postMessage({ type: 'pause' })
+      break
+    case 'resume':
+      // Idempotent: `EmulatorScreen` posts `'resume'` on mount as well as
+      // on real transitions, and a reprime against a ring that was never
+      // frozen would resync a playing stream for no reason.
+      if (!paused) break
+      paused = false
+      // Only the audio side needs ceremony on the way back -- see
+      // `beginAudioReprime`'s doc comment for why. Video just resumes
+      // drawing on the very next tick. Pre-handshake there is nothing to
+      // reprime: the cold-start hook is still installed and resumes on its
+      // own (see `audioHandshakeDone`).
+      if (audioHandshakeDone) beginAudioReprime()
       break
   }
 }
@@ -243,6 +302,13 @@ async function start(
     // IndexedDB read is invisible; letting the new game boot against a
     // blank save file it should have had would not be.
     if (swapPending) return
+    // ENG-90: freezes the picture and stops sample production in one place.
+    // `nextTick` above keeps advancing at the real frame period regardless
+    // (this `return` is inside `step`, never touching `scheduleLoop`'s own
+    // bookkeeping), so an arbitrarily long pause never reads as the kind of
+    // stall `RESYNC_THRESHOLD_MS` exists to correct -- there is no backlog
+    // to resync away, because nothing fell behind in the first place.
+    if (paused) return
     renderer.draw(core.stepFrame())
     // Skipped until a user gesture creates the `AudioContext` and this
     // Worker's `startAudio` runs -- no point producing test-tone samples
@@ -292,12 +358,18 @@ function startAudio(sampleRate: number, port: MessagePort): void {
   // counter means what it should: "we were playing and starved", never
   // "we hadn't started yet".
   const primeTarget = targetFillSamples(sampleRate)
+  // Stashed at module scope so `beginAudioReprime` -- run from a later,
+  // unrelated `'resume'` message -- can re-run this same priming wait
+  // without `startAudio`'s locals still being in scope.
+  audioControl = control
+  audioPrimeTarget = primeTarget
   let ticksWaited = 0
   awaitAudioPrimed = () => {
     ticksWaited += 1
     const fill = (Atomics.load(control, WRITE_INDEX) - Atomics.load(control, READ_INDEX)) >>> 0
     if (fill < primeTarget && ticksWaited < MAX_PRIME_TICKS) return
     awaitAudioPrimed = null
+    audioHandshakeDone = true
 
     port.postMessage({ type: 'init', ...handshake })
     // Debug/test hook aside (see `AudioOutput.tsx`), this is the cue to
@@ -311,6 +383,42 @@ function startAudio(sampleRate: number, port: MessagePort): void {
   // see the handshake above; `SharedArrayBuffer`s are shared, not moved.
   const ring = new Float32Array(nesCore.memory.buffer, handshake.ringByteOffset, handshake.capacity)
   scheduleStats(control, ring) // no stop handle kept -- see `start`'s matching comment
+}
+
+/**
+ * ENG-90's resume-side counterpart to `startAudio`'s own priming wait.
+ *
+ * By the time `'resume'` arrives, `'pause'` has already told the worklet to
+ * hold `read_index` still and stop touching `underrun_count` (see
+ * `audioRingProcessor.js`), and the tick loop above has just gone back to
+ * calling `stepAudioFrame`, which resumes advancing `write_index` from
+ * exactly where it froze. Telling the worklet to resume *immediately* would
+ * have it resync to `write - targetFill` before any of those fresh samples
+ * exist -- landing on whatever stale, already-played audio still sits that
+ * far back in the circular buffer, which is a rewind-and-repeat glitch, not
+ * silence and not new. Waiting for a full target's worth of samples
+ * produced *since* the freeze point is what makes the eventual resync land
+ * exactly on fresh audio -- the same reasoning `startAudio`'s own comment
+ * gives for withholding the handshake on cold start, reapplied here because
+ * pause is a cold start in every way that matters to the ring.
+ */
+function beginAudioReprime(): void {
+  if (!audioControl || !audioPort) return // audio never enabled this session -- nothing to reprime
+  const control = audioControl
+  const port = audioPort
+  const primeTarget = audioPrimeTarget
+  const writeAtResume = Atomics.load(control, WRITE_INDEX)
+  let ticksWaited = 0
+  awaitAudioPrimed = () => {
+    ticksWaited += 1
+    const freshSamples = (Atomics.load(control, WRITE_INDEX) - writeAtResume) >>> 0
+    if (freshSamples < primeTarget && ticksWaited < MAX_PRIME_TICKS) return
+    awaitAudioPrimed = null
+    // The worklet's own `resume` handler resyncs `read_index` to `write -
+    // targetFill` and clears its `paused` flag in one step -- see that
+    // file's `handleMessage`.
+    port.postMessage({ type: 'resume' })
+  }
 }
 
 /** Periodically reads the shared control block and pushes a summary to the

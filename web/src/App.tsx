@@ -24,7 +24,8 @@ function App() {
           <kbd>&darr;</kbd>
           <kbd>&rarr;</kbd> move <span className="sep">&middot;</span> <kbd>Z</kbd> B{' '}
           <span className="sep">&middot;</span> <kbd>X</kbd> A <span className="sep">&middot;</span>{' '}
-          <kbd>Enter</kbd> start <span className="sep">&middot;</span> <kbd>Shift</kbd> select
+          <kbd>Enter</kbd> start <span className="sep">&middot;</span> <kbd>Shift</kbd> select{' '}
+          <span className="sep">&middot;</span> <kbd>P</kbd> pause
         </p>
         <p className="colophon-note">Gamepads work too &mdash; plug one in and press a button.</p>
       </footer>

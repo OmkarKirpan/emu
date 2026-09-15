@@ -151,6 +151,14 @@
   background: var(--color-paper-3);
 }
 
+/* `--pause`/`--resume` (ENG-90): pressed reads as "paused right now", the
+   same accent-underline treatment hover already uses elsewhere in the bar,
+   held rather than transient. */
+.flag[aria-pressed='true'] {
+  color: var(--color-accent);
+  text-decoration-color: var(--color-accent);
+}
+
 .flag:disabled,
 .rom-picker:has(input:disabled) {
   opacity: 0.4;
@@ -291,6 +299,17 @@
 
 .screen-overlay-error {
   color: var(--color-danger);
+}
+
+/* Distinct from the error overlay above on purpose: this is not a failure,
+   it reads in the one colour the whole page reserves for "everything is
+   fine, working as intended" -- the same phosphor accent as the app-bar
+   prompt and caret. */
+.screen-overlay-paused {
+  color: var(--color-accent);
+  font-weight: var(--weight-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 /* ------------------------------------------------------------------ *
@@ -628,6 +647,48 @@
     cursor: default;
     border-color: var(--color-accent-dim);
     color: var(--color-muted);
+  }
+
+  /* `--mute`/`--unmute` (ENG-90): pressed reads as "muted right now", the
+     same accent-fill language `TouchControls` uses for a held button --
+     not `:disabled`, since this button stays clickable either way. */
+  button[aria-pressed='true'] {
+    background: var(--color-accent-dim);
+    color: var(--color-ink);
+    border-color: var(--color-accent-dim);
+  }
+}
+
+/* ENG-90: the volume slider sits beside the mute button rather than above
+   it -- one row, so enabling audio, adjusting its level and muting it read
+   as one control group instead of a vertical list of unrelated settings. */
+.audio-volume {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+
+  label {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--color-muted);
+  }
+
+  /* A native range input rather than a custom-built one: it's keyboard-
+     operable and screen-reader-labelled for free, and this control has no
+     visual demand (a game's own audio, not the pixel art) that would
+     justify rebuilding that. `accent-color` is enough to bring it into the
+     phosphor palette instead of the browser default blue. */
+  input[type='range'] {
+    accent-color: var(--color-accent);
+    /* A real tap target on touch, matching `.flag`'s own 44px floor --
+       without an explicit height a range input's native track is a few
+       px tall and effectively unhittable by a thumb. */
+    min-height: 44px;
+    width: 8rem;
   }
 }
 
