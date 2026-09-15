@@ -255,3 +255,48 @@ test('audio enabled while paused starts playing once resumed', async ({ page }) 
   expect(stats!.fill, `ring fill ${stats!.fill} -- the worklet never started reading`).toBeLessThan(8192)
   expect(stats!.rms).toBeGreaterThan(0.005)
 })
+
+/**
+ * ENG-91: audio after a rewind. Unlike a plain ENG-90 pause, rewind keeps
+ * calling `stepFrame` while the worklet is frozen, and `Apu.tick` pushes
+ * samples from inside it -- so the ring runs up to `audio_ring.zig`'s
+ * capacity (8192) and `pushSample` starts dropping writes. An earlier cut of
+ * `beginAudioReprime` then waited for fresh samples that could never arrive
+ * (nothing drains the ring while the worklet is paused), sat out the whole
+ * `MAX_PRIME_TICKS` timeout (~500ms), and resumed onto stale rewind-era audio.
+ *
+ * The saturated fill while held is asserted as the precondition. The
+ * release deadline sits between the two outcomes: the fixed path drains the
+ * ring within one stats push (`STATS_INTERVAL_MS`, 200ms) of the release,
+ * while the broken one held it full for the whole prime timeout.
+ */
+test('releasing rewind brings audio back promptly instead of waiting out the prime timeout', async ({ page }) => {
+  const audioButton = page.locator('.audio-enable')
+  await audioButton.click()
+  await expect(audioButton).toHaveText('Audio playing')
+  await expect
+    .poll(() => readAudioDebug(page), { message: 'no audio debug stats ever arrived from the Worker', timeout: 5000 })
+    .not.toBeNull()
+  await waitForUnderrunsToSettle(page)
+  // Rewind history to spend: the ring captures ~6 snapshots a second, and
+  // saturating the audio ring takes about ten rewind ticks. The settle wait
+  // above can return in well under a second, which isn't enough on its own.
+  await page.waitForTimeout(2500)
+
+  await page.keyboard.down('KeyR')
+  await expect
+    .poll(async () => (await readAudioDebug(page))!.fill, {
+      message: 'precondition: rewinding with the worklet frozen should saturate the ring',
+      timeout: 3000,
+    })
+    .toBe(8192)
+  await page.keyboard.up('KeyR')
+
+  await expect
+    .poll(async () => (await readAudioDebug(page))!.fill, {
+      message: 'the ring stayed saturated after rewind ended -- the reprime is waiting out its timeout',
+      timeout: 400,
+      intervals: [25],
+    })
+    .toBeLessThan(8192)
+})

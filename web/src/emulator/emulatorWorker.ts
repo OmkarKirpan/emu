@@ -666,6 +666,10 @@ function startRewind(): void {
   syncAudioMute()
   const core = nesCore
   rewindTimer = setInterval(() => {
+    // A ROM swap mid-hold: `adoptRom` clears the ring, but not before the
+    // new cartridge is in the machine, so a pop here must never land an
+    // old-cartridge snapshot on it.
+    if (swapPending) return
     const snapshot = rewindRing.pop()
     if (!snapshot) return
     core.loadState(snapshot)
@@ -827,6 +831,19 @@ function beginAudioReprime(): void {
   const control = audioControl
   const port = audioPort
   const primeTarget = audioPrimeTarget
+  // Drain the backlog to target *first*, while the worklet is still paused.
+  // A plain ENG-90 pause steps nothing, so the ring sits wherever it froze;
+  // but ENG-91's muted states (rewind, a non-1x speed, frame-step) keep
+  // calling `stepFrame`, and `Apu.tick` pushes samples from inside it
+  // whether or not anything reads them. With the worklet frozen, the ring
+  // runs up to `audio_ring.zig`'s capacity and `pushSample` starts
+  // dropping writes -- so `write_index` stops moving, the fresh-sample count
+  // below can never reach target, and the hook sat out the whole
+  // `MAX_PRIME_TICKS` timeout before resuming onto stale, rewind-era audio.
+  // Resyncing here frees `capacity - target` of room, so fresh samples
+  // accumulate behind the stale cushion and the worklet's own resync on
+  // `'resume'` lands past it. A no-op for a ring that never saturated.
+  port.postMessage({ type: 'resync' })
   const writeAtResume = Atomics.load(control, WRITE_INDEX)
   let ticksWaited = 0
   awaitAudioPrimed = () => {
