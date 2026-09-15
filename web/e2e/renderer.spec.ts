@@ -8,6 +8,12 @@ import { BACKDROP_RGBA, findSpriteCol, pixelAt, readFramebuffer, SPRITE_RGBA, SP
  * Not using `./fixtures`: these navigate with their own query strings, and
  * the fixture's auto-`goto('/')` would race that.
  *
+ * Both navigations below carry `?debug` (ENG-93): the renderer readout this
+ * suite asserts on is author instrumentation, hidden from a first-time
+ * visitor by default and restored by that flag -- see `debugMode.ts`. That
+ * is preferred over keeping `.renderer-readout`/`data-renderer` rendered
+ * unconditionally just so this suite has something to select.
+ *
  * A caveat worth stating plainly, since it bounds what these prove: which
  * backend the *unforced* case picks depends on the machine. WebGPU is gated
  * by browser, OS and GPU (ENG-57), and CI runners generally have no GPU at
@@ -19,7 +25,7 @@ import { BACKDROP_RGBA, findSpriteCol, pixelAt, readFramebuffer, SPRITE_RGBA, SP
  * something a human or a test can read rather than infer.
  */
 test('reports whichever renderer it stood up, and renders correctly on it', async ({ page }) => {
-  await page.goto('/')
+  await page.goto('/?debug')
   await waitUntilRunning(page)
 
   const readout = page.locator('.renderer-readout')
@@ -35,7 +41,7 @@ test('reports whichever renderer it stood up, and renders correctly on it', asyn
 })
 
 test('?renderer=canvas2d forces the Canvas 2D fallback and it still works', async ({ page }) => {
-  await page.goto('/?renderer=canvas2d')
+  await page.goto('/?renderer=canvas2d&debug')
   await waitUntilRunning(page)
 
   await expect(page.locator('.renderer-readout')).toHaveAttribute('data-renderer', 'canvas2d')

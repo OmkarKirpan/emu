@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
+import { isDebugMode } from './debugMode'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
 import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
+import { FirstRunBanner, FirstRunLoading } from './FirstRun'
+import { Keymap } from './Keymap'
 import { RomLibrary } from './RomLibrary'
 import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
+import { useFirstRun } from './useFirstRun'
 import type { TouchController } from './wasm/touch'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
@@ -92,6 +96,13 @@ export function EmulatorScreen() {
    * (see `useRomLoader.ts`); this component only places the controls and
    * hands the drop handlers to the canvas wrapper. */
   const { romLoad, dismiss, loadFile, dragging, dropHandlers } = useRomLoader(worker)
+  /** ENG-93's first-run banner/loading copy -- see `useFirstRun.ts` for what
+   * "first run" means and what retires it. Kept here rather than inside
+   * `FirstRun.tsx` itself so both the loading-overlay swap-in below and the
+   * `FirstRunBanner` placed in the stage read the same `active` flag; two
+   * independent hook calls would each keep (and could disagree on) their
+   * own `dismissed` state. */
+  const firstRun = useFirstRun(worker)
   /** The one emulator session for this canvas, held across remounts --
    * see the effect below for why it cannot simply be rebuilt. */
   const sessionRef = useRef<EmulatorSession | null>(null)
@@ -514,6 +525,12 @@ export function EmulatorScreen() {
           (ENG-57), and a wrapper-level highlight can outline the whole
           screen without fighting the canvas's own border. */}
       <div className="stage" ref={stageRef}>
+        {/* ENG-93: once the emulator is actually running, the first-run
+            explanation moves from the loading overlay (above) to this
+            dismissible banner ahead of the screen -- the demo playing
+            underneath is a better argument for "cycle-accurate emulator"
+            than more words would be, so nothing here should cover it. */}
+        {status.kind === 'running' && <FirstRunBanner firstRun={firstRun} />}
         <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
           <canvas
             ref={canvasRef}
@@ -522,7 +539,14 @@ export function EmulatorScreen() {
             className="screen-canvas"
             aria-label="NES output"
           />
-          {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
+          {/* ENG-93: a first-time visitor's very first frame is this overlay,
+              not the game -- boot (fetching the demo ROM, instantiating the
+              wasm module) takes real time, and "Loading…" alone said nothing
+              about what was worth waiting for. A returning visitor (or
+              anyone mid-session who already dismissed it) still gets the
+              plain line -- they don't need re-selling on what this is every
+              time the ROM swaps out from under it. */}
+          {status.kind === 'loading' && (firstRun.active ? <FirstRunLoading /> : <p className="screen-overlay">Loading&#8230;</p>)}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
           {/* ENG-90: pause has to be visible on the canvas itself, not only
               in the app-bar button -- a frozen picture with no label reads
@@ -558,15 +582,34 @@ export function EmulatorScreen() {
 
         <div className="status">
           <RomLoadReadout romLoad={romLoad} onDismiss={dismiss} />
-          {/* Which backend actually engaged isn't inferable from the browser
-              (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
-              `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}
-          {status.kind === 'running' && (
+          {/* ENG-93: which backend actually engaged isn't inferable from the
+              browser (WebGPU is gated by OS and GPU too, per ENG-57), so it's
+              stated -- but only behind `?debug` now, per ENG-93's "nothing in
+              the UI names a renderer backend" acceptance criterion. Naming
+              WebGPU vs. Canvas 2D reads as "this is a dev tool" to everyone
+              who isn't debugging ENG-57's fallback path, which is almost
+              everyone. `data-renderer` is still emitted whenever this
+              renders, so `e2e/renderer.spec.ts` (now navigating with
+              `?debug`) has something to assert on. */}
+          {status.kind === 'running' && isDebugMode() && (
             <p className="renderer-readout" data-renderer={status.renderer}>
               renderer &#183; {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
             </p>
           )}
         </div>
+
+        {/* ENG-93: the control map's other home. The footer (`App.tsx`)
+            still states it once, but a footer nobody scrolls to is not
+            "discoverable" -- this is the same list (`Keymap.tsx`, so the two
+            can't drift), placed above the fold like every other rail panel.
+            Hidden on touch by `.controls-panel`'s own media query in
+            `App.css`, same reasoning as `.keymap`'s: `TouchControls.tsx`'s
+            on-screen pad is the real answer there, not a keyboard legend. */}
+        <section className="controls-panel" aria-label="Controls">
+          <h2>Controls</h2>
+          <Keymap />
+          <p className="colophon-note">Gamepads work too.</p>
+        </section>
 
         {/* Rendered unconditionally, enabled only once the ROM is running:
             the panel is part of the page's shape, and having it appear late
