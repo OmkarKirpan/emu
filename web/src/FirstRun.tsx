@@ -1,49 +1,34 @@
 /**
- * ENG-93's first-run surface, in two pieces because it occupies two
- * different moments and can't be one element rendered continuously:
+ * ENG-93's first-run surface: a dismissible card ahead of the screen that
+ * says what this is and how to bring your own game. `useFirstRun.ts` decides
+ * when it shows; this file is presentation only.
  *
- * - `FirstRunLoading` replaces the bare "Loading…" text inside
- *   `EmulatorScreen.tsx`'s `.screen-overlay` for as long as boot takes --
- *   the very first thing a first-time visitor's eyes land on, before there
- *   is even a frame to look at.
- * - `FirstRunBanner` takes over once the emulator is actually running (the
- *   demo, playing itself, is a better argument for "cycle-accurate NES
- *   emulator" than any sentence could be) and stays -- dismissible, not
- *   timed out -- until `useFirstRun.ts` retires it. It sits above the
- *   screen rather than over it: unlike the loading state, there is now a
- *   game worth seeing underneath, and a scrim across it would undercut the
- *   very point of showing it.
+ * It renders from the very first paint, not only once the emulator reports
+ * `running`. Mounting it late pushed `.screen` (and, on a phone, the whole
+ * touch pad) down mid-boot -- the same late reflow `SaveStates.tsx` is
+ * rendered unconditionally to avoid -- and on a short phone that was enough
+ * to shove the pad's lower buttons off the bottom of the viewport. The
+ * loading overlay underneath stays a plain "Loading…": with this card
+ * already on screen above it, repeating the tagline there said it twice.
  *
- * Both read from `useFirstRun.ts` rather than deciding anything themselves
- * -- this file is presentation only.
+ * It sits above the screen rather than over it: once the demo is playing,
+ * the demo itself is the best argument for "cycle-accurate NES emulator",
+ * and a scrim across it would undercut the point of showing it.
  */
 import type { FirstRun } from './useFirstRun'
-
-/** Same tagline in both -- what this *is* has to land before "how do I load
- * my own game" does, and it has to survive on its own in the loading state,
- * where there's nothing else on screen yet to give it context. */
-function Tagline() {
-  return <p className="first-run-tagline">A cycle-accurate NES emulator, running in this browser tab.</p>
-}
-
-export function FirstRunLoading() {
-  return (
-    <div className="screen-overlay first-run-loading">
-      <Tagline />
-      <p>Loading&#8230;</p>
-    </div>
-  )
-}
 
 export function FirstRunBanner({ firstRun }: { firstRun: FirstRun }) {
   if (!firstRun.active) return null
   return (
     <div className="first-run-banner" role="note">
       <div className="first-run-copy">
-        <Tagline />
+        <p className="first-run-tagline">A cycle-accurate NES emulator, running in this browser tab.</p>
         <p>
-          Playing the built-in demo. Bring your own game with <kbd>--rom</kbd> above, or drop a .nes file onto the
-          screen.
+          It starts on a built-in demo. Bring your own game with <kbd>--rom</kbd> above
+          {/* Drag-and-drop has no touch equivalent, so on a phone this clause
+              only adds lines to a card already competing with the touch pad
+              for the viewport. See `.first-run-drop` in `App.css`. */}
+          <span className="first-run-drop">, or drop a .nes file onto the screen</span>.
         </p>
       </div>
       <button type="button" className="first-run-dismiss" onClick={firstRun.dismiss} aria-label="Dismiss">

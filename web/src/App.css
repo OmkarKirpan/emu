@@ -339,20 +339,13 @@
  * First run (ENG-93)
  * ------------------------------------------------------------------ */
 
-/* Stacks `FirstRun.tsx`'s tagline over "Loading…" instead of `.screen-
-   overlay`'s default single centred line. */
-.first-run-loading {
-  flex-direction: column;
-  gap: var(--space-xs);
-}
-
 .first-run-tagline {
   margin: 0;
   color: var(--color-ink);
   font-weight: var(--weight-display);
 }
 
-/* The card `FirstRunBanner` renders once the emulator is running -- ahead of
+/* The card `FirstRunBanner` renders from first paint -- ahead of
    `.screen`, never over it, so the demo playing underneath stays the actual
    argument for what this app is. Capped to `.screen`'s own max-width so it
    never reads as wider than the console it is introducing. */
@@ -403,6 +396,11 @@
   .first-run-dismiss {
     min-width: 44px;
     min-height: 44px;
+  }
+
+  /* Drag-and-drop has no touch equivalent -- see `FirstRun.tsx`. */
+  .first-run-drop {
+    display: none;
   }
 }
 
@@ -869,12 +867,24 @@
     color: var(--color-neutral);
   }
 
-  /* `.keymap` is already `flex-wrap: wrap` for the footer's full-width line;
-     the rail is much narrower, so it wraps a good deal more here, which is
-     fine -- unlike the footer this panel has nothing beside it to line up
-     with. */
+  /* One binding per row, keys in one column and the action in the other.
+     The footer's single wrapped line doesn't survive the rail's width: it
+     broke mid-binding. `display: contents` promotes each binding's keys and
+     action into this grid's cells, and the `·` separators have no job in a
+     list that already has rows. */
   .keymap {
-    gap: var(--space-2xs) var(--space-3xs);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--space-2xs) var(--space-sm);
+    align-items: center;
+  }
+
+  .keymap-binding {
+    display: contents;
+  }
+
+  .sep {
+    display: none;
   }
 }
 
@@ -1195,6 +1205,17 @@
   align-items: center;
   gap: var(--space-3xs);
   font-family: var(--font-mono);
+}
+
+/* Each binding stays whole, so the footer's line wraps *between* bindings
+   rather than stranding a key at the end of one line and its action at the
+   start of the next. */
+.keymap-binding,
+.keymap-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  white-space: nowrap;
 }
 
 /* On a touch device the key map describes hardware that isn't there. The

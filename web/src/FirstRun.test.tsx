@@ -1,19 +1,11 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { FirstRunBanner, FirstRunLoading } from './FirstRun'
+import { FirstRunBanner } from './FirstRun'
 import type { FirstRun } from './useFirstRun'
 
 // See `RomPicker.test.tsx`'s matching comment: automatic cleanup only
 // engages under Vitest's `globals: true`, which this project doesn't enable.
 afterEach(cleanup)
-
-describe('FirstRunLoading', () => {
-  it('says what this is, and that it is loading', () => {
-    render(<FirstRunLoading />)
-    expect(screen.getByText(/cycle-accurate NES emulator/i)).toBeTruthy()
-    expect(screen.getByText(/Loading/)).toBeTruthy()
-  })
-})
 
 describe('FirstRunBanner', () => {
   const active = (dismiss = vi.fn()): FirstRun => ({ active: true, dismiss })

@@ -4,7 +4,7 @@ import { isDebugMode } from './debugMode'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
 import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
-import { FirstRunBanner, FirstRunLoading } from './FirstRun'
+import { FirstRunBanner } from './FirstRun'
 import { Keymap } from './Keymap'
 import { RomLibrary } from './RomLibrary'
 import { SaveStates } from './SaveStates'
@@ -525,12 +525,10 @@ export function EmulatorScreen() {
           (ENG-57), and a wrapper-level highlight can outline the whole
           screen without fighting the canvas's own border. */}
       <div className="stage" ref={stageRef}>
-        {/* ENG-93: once the emulator is actually running, the first-run
-            explanation moves from the loading overlay (above) to this
-            dismissible banner ahead of the screen -- the demo playing
-            underneath is a better argument for "cycle-accurate emulator"
-            than more words would be, so nothing here should cover it. */}
-        {status.kind === 'running' && <FirstRunBanner firstRun={firstRun} />}
+        {/* ENG-93: the first-run card, from first paint rather than once
+            `running` -- see `FirstRun.tsx` for the reflow that mounting it
+            late caused. */}
+        <FirstRunBanner firstRun={firstRun} />
         <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
           <canvas
             ref={canvasRef}
@@ -539,14 +537,7 @@ export function EmulatorScreen() {
             className="screen-canvas"
             aria-label="NES output"
           />
-          {/* ENG-93: a first-time visitor's very first frame is this overlay,
-              not the game -- boot (fetching the demo ROM, instantiating the
-              wasm module) takes real time, and "Loading…" alone said nothing
-              about what was worth waiting for. A returning visitor (or
-              anyone mid-session who already dismissed it) still gets the
-              plain line -- they don't need re-selling on what this is every
-              time the ROM swaps out from under it. */}
-          {status.kind === 'loading' && (firstRun.active ? <FirstRunLoading /> : <p className="screen-overlay">Loading&#8230;</p>)}
+          {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
           {/* ENG-90: pause has to be visible on the canvas itself, not only
               in the app-bar button -- a frozen picture with no label reads
