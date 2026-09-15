@@ -101,6 +101,23 @@ let paused = false
 let audioControl: Int32Array | null = null
 let audioPrimeTarget = 0
 
+/** Whether `startAudio`'s cold-start priming has finished -- i.e. the
+ * worklet has its `'init'` and the main thread has its `'audio-ready'`.
+ * Distinct from `audioReady`, which flips the moment `startAudio` runs,
+ * long before either message goes out.
+ *
+ * Pause/resume must not touch the audio side until this is true. Before
+ * it, the worklet is still in its pre-init path (no ring, silence, nothing
+ * counted) and the only thing that will ever send it `'init'` is the
+ * cold-start hook in `awaitAudioPrimed`. A `'resume'` that installed
+ * `beginAudioReprime`'s hook over it would drop that handshake for good --
+ * the node never connects and the session stays silent until reload -- and
+ * a `'pause'` forwarded to a worklet that then receives `'init'` with no
+ * matching `'resume'` would leave it paused forever. Pausing the loop
+ * alone is enough pre-handshake: the cold-start hook only advances on a
+ * real tick, so it simply waits out the pause and completes afterwards. */
+let audioHandshakeDone = false
+
 self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
   const message = event.data
   switch (message.type) {
@@ -142,16 +159,23 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       paused = true
       // Tell the worklet too, so a drained ring reads as "intentionally
       // silent" rather than "starved" -- see `audioRingProcessor.js`'s own
-      // `paused` flag. Skipped when audio was never enabled (`audioPort`
-      // null); nothing downstream cares either way.
-      audioPort?.postMessage({ type: 'pause' })
+      // `paused` flag. Skipped until the cold-start handshake is done --
+      // see `audioHandshakeDone` for why forwarding it earlier strands the
+      // worklet paused.
+      if (audioHandshakeDone) audioPort?.postMessage({ type: 'pause' })
       break
     case 'resume':
+      // Idempotent: `EmulatorScreen` posts `'resume'` on mount as well as
+      // on real transitions, and a reprime against a ring that was never
+      // frozen would resync a playing stream for no reason.
+      if (!paused) break
       paused = false
       // Only the audio side needs ceremony on the way back -- see
       // `beginAudioReprime`'s doc comment for why. Video just resumes
-      // drawing on the very next tick.
-      if (audioReady) beginAudioReprime()
+      // drawing on the very next tick. Pre-handshake there is nothing to
+      // reprime: the cold-start hook is still installed and resumes on its
+      // own (see `audioHandshakeDone`).
+      if (audioHandshakeDone) beginAudioReprime()
       break
   }
 }
@@ -345,6 +369,7 @@ function startAudio(sampleRate: number, port: MessagePort): void {
     const fill = (Atomics.load(control, WRITE_INDEX) - Atomics.load(control, READ_INDEX)) >>> 0
     if (fill < primeTarget && ticksWaited < MAX_PRIME_TICKS) return
     awaitAudioPrimed = null
+    audioHandshakeDone = true
 
     port.postMessage({ type: 'init', ...handshake })
     // Debug/test hook aside (see `AudioOutput.tsx`), this is the cue to

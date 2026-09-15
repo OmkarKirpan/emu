@@ -157,7 +157,9 @@ export function EmulatorScreen() {
   // field typing the letter P can't accidentally pause the game.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.code !== 'KeyP') return
+      // `repeat` ignored: holding the key would otherwise flicker the
+      // game in and out of pause at the OS key-repeat rate.
+      if (event.code !== 'KeyP' || event.repeat) return
       const target = event.target
       if (target instanceof HTMLElement && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return
       handlePauseToggle()
