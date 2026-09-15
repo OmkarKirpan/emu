@@ -1,7 +1,7 @@
 import { resolve } from 'node:path'
 import type { Page } from '@playwright/test'
 import { expect, test } from './fixtures'
-import { BACKDROP_RGBA, readSpriteCol, SPRITE_INITIAL_COL, SPRITE_ROW } from './helpers'
+import { BACKDROP_RGBA, readSpriteCol, SPRITE_INITIAL_COL, SPRITE_ROW, waitUntilRunning } from './helpers'
 
 /**
  * ENG-89's session continuity, end to end: the ROM library, the Worker's
@@ -82,11 +82,15 @@ test('hiding the tab autosaves the resume point, and a reload restores position 
 
   await page.reload()
 
-  // No `waitUntilRunning` here on purpose: that helper only asserts the
+  // `waitUntilRunning` first, but not as the proof: it only asserts the
   // sprite appears *somewhere*, which the power-on column would also
-  // satisfy. Polling straight for the saved column is what proves the
-  // resume state -- not just the cartridge -- came back with no click at
-  // all, numbered Load button included.
+  // satisfy. It is here because the poll below cannot stand in for it --
+  // until the reloaded Worker's `'video-ready'` lands, `spriteCol` throws
+  // rather than returning a value, and `expect.poll` gives up on a thrown
+  // callback instead of retrying it. Polling for the saved column
+  // afterwards is what proves the resume state -- not just the cartridge --
+  // came back with no click at all, numbered Load button included.
+  await waitUntilRunning(page)
   await expect
     .poll(() => spriteCol(page), { ...RESUME_UPDATE_TIMEOUT, message: 'the session did not resume its saved position' })
     .toBe(saved)
@@ -98,7 +102,7 @@ test('hiding the tab autosaves the resume point, and a reload restores position 
  * point is the identity, not 24KB of near-zero PRG. */
 function otherNromRom(): Buffer {
   const header = Buffer.alloc(16)
-  header.write('NES', 0, 'latin1')
+  header.write('NES\x1a', 0, 'latin1') // the full iNES magic -- 'NES' alone is rejected as a bad header
   header[4] = 1 // 16KB PRG
   header[5] = 1 // 8KB CHR-ROM
   const prg = Buffer.alloc(0x4000)
