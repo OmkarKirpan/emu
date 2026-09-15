@@ -76,9 +76,7 @@ export type EmulatorWorkerInbound =
   // forget, the same way `'reset'` is.
   | { type: 'pause' }
   | { type: 'resume' }
-  // ENG-91's transport additions -- rewind, frame-step, speed -- appended
-  // here rather than reorganizing the union, per this ticket's ownership
-  // boundary with the parallel ENG-93 work.
+  // ENG-91's transport additions -- rewind, frame-step, speed.
   //
   // Hold-to-rewind: `'rewind-start'` on keydown/pointerdown, `'rewind-end'`
   // on keyup/pointerup (or a pointer leaving the button mid-hold -- see

@@ -737,7 +737,18 @@ function syncAudioMute(): void {
   const shouldMute = paused || rewinding || speedMultiplier !== 1
   if (shouldMute === audioMuted) return
   audioMuted = shouldMute
-  if (shouldMute) audioPort?.postMessage({ type: 'pause' })
+  if (shouldMute) {
+    // Cancel any re-prime still in flight from the last un-mute. The tick
+    // loop keeps calling `awaitAudioPrimed` at a non-1x speed (only
+    // `paused`/`rewinding` stop it), so a pending hook would finish at 2x
+    // and post the worklet a `'resume'` -- un-muting it while
+    // `audioMuted` still says muted, with nothing left to correct it.
+    // 0.5x -> 1x -> 2x inside the priming window did exactly that. Safe
+    // against the cold-start hook: this function returns above until
+    // `audioHandshakeDone`, and that hook is only ever pending before it.
+    awaitAudioPrimed = null
+    audioPort?.postMessage({ type: 'pause' })
+  }
   else beginAudioReprime()
 }
 

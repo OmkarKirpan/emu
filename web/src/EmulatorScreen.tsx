@@ -164,8 +164,10 @@ export function EmulatorScreen() {
   /** ENG-91's frame-step (`K`): a no-op unless the transport is actually
    * paused, matching the ticket's own "only while paused" rule and the
    * app-bar button's `disabled` state below -- re-checked worker-side too
-   * (`handleFrameStep` in `emulatorWorker.ts`) for the same defense-in-depth
-   * reason every other transport message gets it. */
+   * (`handleFrameStep` in `emulatorWorker.ts`), because a frame-advance
+   * racing a resume is the one transport message where acting on this
+   * thread's possibly-stale `paused` would be wrong (see `protocol.ts`'s
+   * `'frame-step'` note). */
   const handleFrameStep = useCallback(() => {
     if (!paused) return
     worker?.postMessage({ type: 'frame-step' })
@@ -240,9 +242,9 @@ export function EmulatorScreen() {
    * ENG-91's key bindings: `R` (held) rewinds, `K` frame-steps, `-`/`=`
    * (`Minus`/`Equal`, not `KeyMinus`/`KeyEqual` -- neither exists) step the
    * speed down/up. None of these are in `KEY_MAP` (`wasm/controller.ts`) or
-   * `P`'s own binding, and stay that way -- see this file's own module
-   * comment on the ownership split with ENG-93's control-map documentation.
-   * Ignored the same way `P` is while a form control has focus.
+   * `P`'s own binding, and stay that way; the control map that tells the
+   * player about them lives in `Keymap.tsx`. Ignored the same way `P` is
+   * while a form control has focus.
    *
    * `blur` also ends a rewind hold: alt-tabbing (or anything else that
    * steals focus) away mid-hold fires no `keyup` at all, and without this
