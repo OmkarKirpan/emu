@@ -49,7 +49,10 @@ async function waitForUnderrunsToSettle(page: Page): Promise<number> {
  * something that no longer says what it means (ENG-85).
  */
 test('audio output reaches a stable ring fill with no steady-state underruns', async ({ page }) => {
-  const button = page.locator('.audio-output button')
+  // `.audio-enable`, not `.audio-output button`: ENG-90 added a second
+  // button to `.audio-output` (the mute toggle), so the old locator would
+  // now match two elements.
+  const button = page.locator('.audio-enable')
   await button.click() // a real Playwright click is a trusted gesture, satisfying the autoplay policy `AudioContext` needs
   await expect(button).toHaveText('Audio playing')
 
@@ -120,7 +123,7 @@ test('audio output reaches a stable ring fill with no steady-state underruns', a
  * `core/tests/roms/nrom_demo/README.md`.
  */
 test('the ring carries real, non-silent, non-clipping audio from the emulated APU', async ({ page }) => {
-  const button = page.locator('.audio-output button')
+  const button = page.locator('.audio-enable')
   await button.click()
   await expect(button).toHaveText('Audio playing')
 
@@ -149,4 +152,63 @@ test('the ring carries real, non-silent, non-clipping audio from the emulated AP
   // to -1.0..1.0 (ENG-62), so anything at or beyond full scale means the
   // mixer or the filters are producing something the worklet cannot play.
   expect(audio!.peak).toBeLessThan(1.0)
+})
+
+/**
+ * ENG-90's own acceptance criterion, stated in audio terms: "a paused game
+ * must not register as underruns in the stats". Without
+ * `audioRingProcessor.js`'s `paused` bypass (see that file and
+ * `emulatorWorker.ts`'s `beginAudioReprime`), a drained ring would look
+ * indistinguishable from a genuinely starved one -- `underrunCount`
+ * climbing continuously for as long as the pause lasts, exactly the signal
+ * `waitForUnderrunsToSettle` above exists to catch as a real regression.
+ *
+ * Runs in this file's `timing` project for the same reason the two tests
+ * above do: it reads the same shared, real-time-sensitive control block.
+ */
+test('pausing does not register as audio underruns, and resume re-primes without one either', async ({ page }) => {
+  const audioButton = page.locator('.audio-enable')
+  await audioButton.click()
+  await expect(audioButton).toHaveText('Audio playing')
+
+  await expect
+    .poll(() => readAudioDebug(page), { message: 'no audio debug stats ever arrived from the Worker', timeout: 5000 })
+    .not.toBeNull()
+  const baselineUnderruns = await waitForUnderrunsToSettle(page)
+
+  const pauseButton = page.locator('.flag.pause')
+  await pauseButton.click()
+  await expect(pauseButton).toHaveText('--resume')
+
+  // Comfortably longer than the ~64ms ring cushion (ENG-62's target fill):
+  // long enough that, without the `paused` bypass, the ring would have
+  // drained and then sat in the ordinary starved-ring branch counting an
+  // underrun on every render quantum for the whole wait.
+  await page.waitForTimeout(1500)
+  const pausedStats = await readAudioDebug(page)
+  expect(pausedStats).not.toBeNull()
+  expect(
+    pausedStats!.underrunCount,
+    `pausing should not move the underrun counter (was ${baselineUnderruns}, now ${pausedStats!.underrunCount})`,
+  ).toBe(baselineUnderruns)
+
+  await pauseButton.click()
+  await expect(pauseButton).toHaveText('--pause')
+
+  // The re-prime wait (`beginAudioReprime`) withholds the worklet's
+  // `'resume'` until a fresh target's worth of samples exists, so this
+  // should clear well within a couple of NES frames' worth of real time --
+  // generous headroom here is about tolerating a loaded CI box, not about
+  // the mechanism being slow.
+  await page.waitForTimeout(1000)
+  const resumedStats = await readAudioDebug(page)
+  expect(resumedStats).not.toBeNull()
+  expect(
+    resumedStats!.underrunCount,
+    `resume should re-prime cleanly, not crackle (was ${baselineUnderruns}, now ${resumedStats!.underrunCount})`,
+  ).toBe(baselineUnderruns)
+  // And genuinely producing sound again, not just quietly staying silent
+  // forever -- the same non-silence bar `readAudioDebug`'s other caller
+  // above uses.
+  expect(resumedStats!.rms).toBeGreaterThan(0.005)
 })
