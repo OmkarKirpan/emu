@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
+import { isDebugMode } from './debugMode'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
+import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
+import { FirstRunBanner } from './FirstRun'
+import { Keymap } from './Keymap'
 import { RomLibrary } from './RomLibrary'
 import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
+import { useFirstRun } from './useFirstRun'
 import type { TouchController } from './wasm/touch'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
@@ -91,6 +96,13 @@ export function EmulatorScreen() {
    * (see `useRomLoader.ts`); this component only places the controls and
    * hands the drop handlers to the canvas wrapper. */
   const { romLoad, dismiss, loadFile, dragging, dropHandlers } = useRomLoader(worker)
+  /** ENG-93's first-run banner/loading copy -- see `useFirstRun.ts` for what
+   * "first run" means and what retires it. Kept here rather than inside
+   * `FirstRun.tsx` itself so both the loading-overlay swap-in below and the
+   * `FirstRunBanner` placed in the stage read the same `active` flag; two
+   * independent hook calls would each keep (and could disagree on) their
+   * own `dismissed` state. */
+  const firstRun = useFirstRun(worker)
   /** The one emulator session for this canvas, held across remounts --
    * see the effect below for why it cannot simply be rebuilt. */
   const sessionRef = useRef<EmulatorSession | null>(null)
@@ -111,6 +123,67 @@ export function EmulatorScreen() {
    */
   const [pauseState, dispatchPause] = useReducer(pauseReasonReducer, document.hidden, initialPauseReasonState)
   const paused = isPaused(pauseState)
+
+  /**
+   * ENG-91's rewind hold. A ref, not just the mirrored `rewinding` state
+   * below, because the keydown/keyup and pointerdown/pointerup handlers
+   * that drive it need a synchronous "is a hold already in progress?"
+   * check to swallow both key-repeat and a duplicate pointer event (a
+   * `pointerdown` that fires again before React re-renders with the state
+   * this same handler just set) -- reading `rewinding` state directly here
+   * could still observe the pre-update value. The state exists purely to
+   * re-render the canvas indicator and the button's `aria-pressed`.
+   */
+  const rewindHeldRef = useRef(false)
+  const [rewinding, setRewinding] = useState(false)
+
+  const startRewind = useCallback(() => {
+    if (rewindHeldRef.current) return
+    rewindHeldRef.current = true
+    setRewinding(true)
+    worker?.postMessage({ type: 'rewind-start' })
+  }, [worker])
+
+  const stopRewind = useCallback(() => {
+    if (!rewindHeldRef.current) return
+    rewindHeldRef.current = false
+    setRewinding(false)
+    worker?.postMessage({ type: 'rewind-end' })
+  }, [worker])
+
+  /** ENG-91's speed control: 0.5x/1x/2x. Always starts at 1x on a fresh
+   * mount -- like `paused`, this is transport state a reload should not
+   * remember (unlike, say, volume/mute). */
+  const [speed, setSpeed] = useState<Speed>(DEFAULT_SPEED)
+
+  const applySpeed = useCallback(
+    (next: Speed) => {
+      setSpeed(next)
+      worker?.postMessage({ type: 'set-speed', multiplier: next })
+    },
+    [worker],
+  )
+
+  /** The app-bar button's own click behaviour -- cycling forward, not the
+   * `-`/`=` keys' up/down stepping. See `speedControl.ts`'s `cycleSpeed` for
+   * why a single button reads correctly wrapping where the keys should not. */
+  const handleSpeedCycle = useCallback(() => {
+    applySpeed(cycleSpeed(speed))
+    canvasRef.current?.focus()
+  }, [applySpeed, speed])
+
+  /** ENG-91's frame-step (`K`): a no-op unless the transport is actually
+   * paused, matching the ticket's own "only while paused" rule and the
+   * app-bar button's `disabled` state below -- re-checked worker-side too
+   * (`handleFrameStep` in `emulatorWorker.ts`), because a frame-advance
+   * racing a resume is the one transport message where acting on this
+   * thread's possibly-stale `paused` would be wrong (see `protocol.ts`'s
+   * `'frame-step'` note). */
+  const handleFrameStep = useCallback(() => {
+    if (!paused) return
+    worker?.postMessage({ type: 'frame-step' })
+    canvasRef.current?.focus()
+  }, [paused, worker])
 
   /** Drives the ABI's `reset` export -- the emulated console's RESET line,
    * not a reload: WRAM, VRAM and palette survive it exactly as they do on
@@ -175,6 +248,58 @@ export function EmulatorScreen() {
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [handlePauseToggle])
+
+  /**
+   * ENG-91's key bindings: `R` (held) rewinds, `K` frame-steps, `-`/`=`
+   * (`Minus`/`Equal`, not `KeyMinus`/`KeyEqual` -- neither exists) step the
+   * speed down/up. None of these are in `KEY_MAP` (`wasm/controller.ts`) or
+   * `P`'s own binding, and stay that way; the control map that tells the
+   * player about them lives in `Keymap.tsx`. Ignored the same way `P` is
+   * while a form control has focus.
+   *
+   * `blur` also ends a rewind hold: alt-tabbing (or anything else that
+   * steals focus) away mid-hold fires no `keyup` at all, and without this
+   * the game would stay frozen and muted until some *other* key event
+   * happened to arrive on `KeyR`.
+   */
+  useEffect(() => {
+    const isFormTarget = (target: EventTarget | null): boolean =>
+      target instanceof HTMLElement && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isFormTarget(event.target)) return
+      switch (event.code) {
+        case 'KeyR':
+          if (event.repeat) return
+          event.preventDefault()
+          startRewind()
+          break
+        case 'KeyK':
+          if (event.repeat) return
+          handleFrameStep()
+          break
+        case 'Minus':
+          if (event.repeat) return
+          applySpeed(stepSpeed(speed, -1))
+          break
+        case 'Equal':
+          if (event.repeat) return
+          applySpeed(stepSpeed(speed, 1))
+          break
+      }
+    }
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'KeyR') stopRewind()
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    window.addEventListener('blur', stopRewind)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+      window.removeEventListener('blur', stopRewind)
+    }
+  }, [startRewind, stopRewind, handleFrameStep, applySpeed, speed])
 
   /** Fullscreen the stage, or leave it. Rendered conditionally on
    * `document.fullscreenEnabled` rather than offered-and-failing: iPhone
@@ -346,6 +471,44 @@ export function EmulatorScreen() {
           >
             {paused ? '--resume' : '--pause'}
           </button>
+          {/* ENG-91: hold-to-rewind. Pointer events, not `onClick` --
+              `onPointerDown`/`onPointerUp` are what let this work as a
+              press-and-hold on touch the same way the keyboard's `R`
+              keydown/keyup does; `onPointerLeave`/`onPointerCancel` end the
+              hold too, so a drag off the button (or the OS interrupting the
+              gesture) can't leave rewind stuck on the way a missed `keyup`
+              could -- see the `blur` listener alongside the keyboard
+              handler for that same failure mode. */}
+          <button
+            type="button"
+            className="flag rewind"
+            onPointerDown={(event) => {
+              event.preventDefault()
+              startRewind()
+            }}
+            onPointerUp={stopRewind}
+            onPointerLeave={stopRewind}
+            onPointerCancel={stopRewind}
+            disabled={status.kind !== 'running'}
+            aria-pressed={rewinding}
+          >
+            --rewind
+          </button>
+          <button
+            type="button"
+            className="flag step"
+            onClick={handleFrameStep}
+            disabled={status.kind !== 'running' || !paused}
+          >
+            --step
+          </button>
+          {/* ENG-91's speed control: one button, cycling forward through
+              every level on click (`cycleSpeed`) -- `-`/`=` are the
+              up/down steppers, this is the "next" affordance for a mouse or
+              a thumb. */}
+          <button type="button" className="flag speed" onClick={handleSpeedCycle} disabled={status.kind !== 'running'}>
+            --speed {speed}x
+          </button>
           {document.fullscreenEnabled && (
             <button type="button" className="flag" onClick={toggleFullscreen}>
               --fullscreen
@@ -362,6 +525,10 @@ export function EmulatorScreen() {
           (ENG-57), and a wrapper-level highlight can outline the whole
           screen without fighting the canvas's own border. */}
       <div className="stage" ref={stageRef}>
+        {/* ENG-93: the first-run card, from first paint rather than once
+            `running` -- see `FirstRun.tsx` for the reflow that mounting it
+            late caused. */}
+        <FirstRunBanner firstRun={firstRun} />
         <div className={dragging ? 'screen screen-dragging' : 'screen'} {...dropHandlers}>
           <canvas
             ref={canvasRef}
@@ -378,6 +545,22 @@ export function EmulatorScreen() {
               `status.kind === 'running'` so it can never appear stacked
               over the loading/error overlays above. */}
           {status.kind === 'running' && paused && <p className="screen-overlay screen-overlay-paused">Paused</p>}
+          {/* ENG-91: a small, non-covering readout -- deliberately not the
+              full-screen `.screen-overlay` treatment above, since both of
+              these describe the picture still actively changing underneath
+              them (a rewind hold visibly plays frames backward; a non-1x
+              speed visibly plays them forward faster/slower), unlike
+              Paused/Loading/error which describe a frozen or absent one.
+              Rewind wins when both are true: `speedMultiplier` doesn't even
+              apply while `rewinding` gates the tick loop worker-side (see
+              `emulatorWorker.ts`), so showing "2x" during a hold would be
+              stating something not currently in effect. */}
+          {status.kind === 'running' && rewinding && (
+            <p className="screen-indicator screen-indicator-rewind">Rewinding</p>
+          )}
+          {status.kind === 'running' && !rewinding && speed !== 1 && (
+            <p className="screen-indicator screen-indicator-speed">{speed}x</p>
+          )}
         </div>
         <TouchControls touch={touch} />
       </div>
@@ -390,15 +573,34 @@ export function EmulatorScreen() {
 
         <div className="status">
           <RomLoadReadout romLoad={romLoad} onDismiss={dismiss} />
-          {/* Which backend actually engaged isn't inferable from the browser
-              (WebGPU is gated by OS and GPU too, per ENG-57), so it's stated.
-              `data-renderer` is what `e2e/renderer.spec.ts` asserts on. */}
-          {status.kind === 'running' && (
+          {/* ENG-93: which backend actually engaged isn't inferable from the
+              browser (WebGPU is gated by OS and GPU too, per ENG-57), so it's
+              stated -- but only behind `?debug` now, per ENG-93's "nothing in
+              the UI names a renderer backend" acceptance criterion. Naming
+              WebGPU vs. Canvas 2D reads as "this is a dev tool" to everyone
+              who isn't debugging ENG-57's fallback path, which is almost
+              everyone. `data-renderer` is still emitted whenever this
+              renders, so `e2e/renderer.spec.ts` (now navigating with
+              `?debug`) has something to assert on. */}
+          {status.kind === 'running' && isDebugMode() && (
             <p className="renderer-readout" data-renderer={status.renderer}>
               renderer &#183; {status.renderer === 'webgpu' ? 'WebGPU' : 'Canvas 2D'}
             </p>
           )}
         </div>
+
+        {/* ENG-93: the control map's other home. The footer (`App.tsx`)
+            still states it once, but a footer nobody scrolls to is not
+            "discoverable" -- this is the same list (`Keymap.tsx`, so the two
+            can't drift), placed above the fold like every other rail panel.
+            Hidden on touch by `.controls-panel`'s own media query in
+            `App.css`, same reasoning as `.keymap`'s: `TouchControls.tsx`'s
+            on-screen pad is the real answer there, not a keyboard legend. */}
+        <section className="controls-panel" aria-label="Controls">
+          <h2>Controls</h2>
+          <Keymap />
+          <p className="colophon-note">Gamepads work too.</p>
+        </section>
 
         {/* Rendered unconditionally, enabled only once the ROM is running:
             the panel is part of the page's shape, and having it appear late

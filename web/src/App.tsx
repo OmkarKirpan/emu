@@ -1,4 +1,5 @@
 import { EmulatorScreen } from './EmulatorScreen'
+import { Keymap } from './Keymap'
 import './App.css'
 
 /**
@@ -8,6 +9,14 @@ import './App.css'
  * the same worker reference video does), and it emits the app bar, the
  * stage and the rail as siblings of this layout's grid. What is left here
  * is the frame around them and the colophon.
+ *
+ * ENG-93: the keymap this footer prints is no longer the *only* place it
+ * lives -- `EmulatorScreen.tsx`'s rail now carries the same list (via
+ * `Keymap.tsx`) above the fold, on the reasoning that a control map only the
+ * footer states is a control map most players never scroll to. This line
+ * stays anyway: a colophon is the conventional place a page states what it
+ * is one last time, and removing it would have made the rail's copy the
+ * *only* one, one component away from being buried again.
  */
 function App() {
   return (
@@ -18,15 +27,7 @@ function App() {
           sitemap to catalogue; the only thing worth closing the page with
           is the control map, and even that is worth saying once. */}
       <footer className="colophon">
-        <p className="keymap">
-          <kbd>&larr;</kbd>
-          <kbd>&uarr;</kbd>
-          <kbd>&darr;</kbd>
-          <kbd>&rarr;</kbd> move <span className="sep">&middot;</span> <kbd>Z</kbd> B{' '}
-          <span className="sep">&middot;</span> <kbd>X</kbd> A <span className="sep">&middot;</span>{' '}
-          <kbd>Enter</kbd> start <span className="sep">&middot;</span> <kbd>Shift</kbd> select{' '}
-          <span className="sep">&middot;</span> <kbd>P</kbd> pause
-        </p>
+        <Keymap />
         <p className="colophon-note">Gamepads work too &mdash; plug one in and press a button.</p>
       </footer>
     </div>

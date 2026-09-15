@@ -31,8 +31,13 @@ const chromium = {
  * an "allow a couple" bound would quietly stop noticing the regression it
  * was written to catch. Giving the measurement a quiet machine is the fix,
  * so these run in their own project below instead.
+ *
+ * `speed.spec.ts` joins this list for ENG-91: it measures 0.5x/2x fps the
+ * same real-clock way `pacing.spec.ts` measures 1x, and its own audio test
+ * polls the same shared control block `audio.spec.ts` does -- both exactly
+ * as sensitive to CPU contention from parallel workers.
  */
-const TIMING_SENSITIVE = [/audio\.spec\.ts/, /pacing\.spec\.ts/]
+const TIMING_SENSITIVE = [/audio\.spec\.ts/, /pacing\.spec\.ts/, /speed\.spec\.ts/]
 
 export default defineConfig({
   testDir: './e2e',

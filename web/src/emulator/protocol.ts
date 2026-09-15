@@ -7,11 +7,16 @@
  * comment for why those two libs can't both be active in one project).
  */
 import type { RomLibraryEntry, SaveSlot, SlotSummary } from '../persistence/saveStore'
+import type { Speed } from './speedControl'
 
 // Re-exported so the Worker and its callers can name a slot, or describe a
 // library entry, without either of them reaching into the persistence layer
 // directly.
 export type { RomLibraryEntry, SaveSlot, SlotSummary }
+// Re-exported for the same reason: `EmulatorScreen.tsx` names a `Speed` when
+// posting `'set-speed'` without importing `speedControl.ts` under a second
+// path.
+export type { Speed }
 
 /** Which backend `renderer.ts` stood up. Reported back so the UI (and
  * `e2e/renderer.spec.ts`) can state it rather than infer it -- WebGPU
@@ -71,6 +76,28 @@ export type EmulatorWorkerInbound =
   // forget, the same way `'reset'` is.
   | { type: 'pause' }
   | { type: 'resume' }
+  // ENG-91's transport additions -- rewind, frame-step, speed.
+  //
+  // Hold-to-rewind: `'rewind-start'` on keydown/pointerdown, `'rewind-end'`
+  // on keyup/pointerup (or a pointer leaving the button mid-hold -- see
+  // `EmulatorScreen.tsx`). Independent of `'pause'`/`'resume'`: the Worker
+  // gates its tick loop on `rewinding` the same way it already gates on
+  // `paused` (see `emulatorWorker.ts`'s two-flag comment), so rewind works
+  // whether the transport was running or already paused, and releasing it
+  // leaves the loop exactly where `paused` already said it should be --
+  // no third message needed to say "resume" or "stay paused".
+  | { type: 'rewind-start' }
+  | { type: 'rewind-end' }
+  // Single-step while paused (`K`) -- a no-op main-thread-side otherwise
+  // (see `EmulatorScreen.tsx`'s key handler), but the Worker re-checks
+  // `paused` itself too, the same defense-in-depth `'reset'` doesn't need
+  // (nothing about `reset` is unsafe while running) but a manual single
+  // frame-advance racing a resume genuinely is.
+  | { type: 'frame-step' }
+  // 0.5x/1x/2x, applied to `scheduleLoop`'s period -- see that function's
+  // own doc comment for why a live period change mid-run needs no special
+  // handling to avoid a catch-up burst.
+  | { type: 'set-speed'; multiplier: Speed }
   // ROM library (ENG-89). The Worker owns IndexedDB, so -- same shape of
   // division as the save-state messages above -- these carry only a hash,
   // never ROM bytes; the bytes for a `'resume-rom'` are already sitting in

@@ -312,6 +312,98 @@
   text-transform: uppercase;
 }
 
+/* ENG-91: rewind/speed's on-canvas readout. A small corner badge, not the
+   full-cover `.screen-overlay` treatment above -- both of these describe a
+   picture that's still actively changing underneath them (see
+   `EmulatorScreen.tsx`'s own comment on why that rules out reusing the
+   overlay), so covering the screen to say so would hide the very thing
+   being described. */
+.screen-indicator {
+  position: absolute;
+  right: var(--space-xs);
+  bottom: var(--space-xs);
+  margin: 0;
+  padding: var(--space-2xs) var(--space-xs);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-display);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+  background: var(--color-scrim);
+  border-radius: var(--radius-sm);
+  pointer-events: none;
+}
+
+/* ------------------------------------------------------------------ *
+ * First run (ENG-93)
+ * ------------------------------------------------------------------ */
+
+.first-run-tagline {
+  margin: 0;
+  color: var(--color-ink);
+  font-weight: var(--weight-display);
+}
+
+/* The card `FirstRunBanner` renders from first paint -- ahead of
+   `.screen`, never over it, so the demo playing underneath stays the actual
+   argument for what this app is. Capped to `.screen`'s own max-width so it
+   never reads as wider than the console it is introducing. */
+.first-run-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  width: 100%;
+  max-width: min(100%, 46rem);
+  padding: var(--space-sm) var(--space-md);
+  border: var(--rule-hair) solid var(--color-rule);
+  border-radius: var(--radius-md);
+  background: var(--color-paper-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-muted);
+}
+
+.first-run-copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2xs);
+  min-width: 0;
+
+  p {
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+}
+
+.first-run-dismiss {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1;
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  background: none;
+  border: var(--rule-hair) solid currentColor;
+  cursor: pointer;
+}
+
+/* Same WCAG-floor reasoning as `.flag`'s own coarse-pointer rule: the visual
+   size stays small, the tap target does not. */
+@media (pointer: coarse) {
+  .first-run-dismiss {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  /* Drag-and-drop has no touch equivalent -- see `FirstRun.tsx`. */
+  .first-run-drop {
+    display: none;
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Touch controls
  * ------------------------------------------------------------------ */
@@ -752,6 +844,62 @@
 }
 
 /* ------------------------------------------------------------------ *
+ * Controls (ENG-93)
+ * ------------------------------------------------------------------ */
+
+/* Same shape as `.save-states`/`.rom-library` immediately below: a small
+   rail panel, not a new visual language. What's new is only that this one
+   exists at all -- before ENG-93 the keymap (`Keymap.tsx`) had exactly one
+   home, the footer colophon, which is the definition of "buried" on any
+   page taller than one screen. */
+.controls-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  min-width: 0;
+
+  h2 {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: var(--weight-display);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--color-neutral);
+  }
+
+  /* One binding per row, keys in one column and the action in the other.
+     The footer's single wrapped line doesn't survive the rail's width: it
+     broke mid-binding. `display: contents` promotes each binding's keys and
+     action into this grid's cells, and the `·` separators have no job in a
+     list that already has rows. */
+  .keymap {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: var(--space-2xs) var(--space-sm);
+    align-items: center;
+  }
+
+  .keymap-binding {
+    display: contents;
+  }
+
+  .sep {
+    display: none;
+  }
+}
+
+/* Same reasoning as `.keymap`'s own coarse-pointer rule (`App.css`, footer
+   section): a touchscreen has no keyboard, and `TouchControls.tsx` is
+   already the answer to "how do I play this" there. Hiding the whole panel,
+   not just the inner `.keymap` line, so a touch visitor doesn't get a bare
+   "Controls" heading over nothing. */
+@media (pointer: coarse) {
+  .controls-panel {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * Save states
  * ------------------------------------------------------------------ */
 
@@ -1057,6 +1205,17 @@
   align-items: center;
   gap: var(--space-3xs);
   font-family: var(--font-mono);
+}
+
+/* Each binding stays whole, so the footer's line wraps *between* bindings
+   rather than stranding a key at the end of one line and its action at the
+   start of the next. */
+.keymap-binding,
+.keymap-keys {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3xs);
+  white-space: nowrap;
 }
 
 /* On a touch device the key map describes hardware that isn't there. The

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { isDebugMode } from '../debugMode'
 import { clampVolume, effectiveGain, loadVolumeSettings, saveVolumeSettings, type VolumeSettings } from './volumeStore'
 
 type Status = { kind: 'idle' } | { kind: 'starting' } | { kind: 'running' } | { kind: 'error'; message: string }
@@ -231,7 +232,13 @@ export function AudioOutput({ worker }: AudioOutputProps) {
       </div>
 
       {status.kind === 'error' && <p className="audio-error">{status.message}</p>}
-      {status.kind === 'running' && debugInfo && (
+      {/* ENG-93: ring fill / underrun count / peak are author instrumentation,
+          not something a player needed to see -- gated behind `?debug` the
+          same way `EmulatorScreen.tsx`'s renderer readout is. `debugInfo`
+          itself (and `window.__audioDebug__`, above) stay unconditional:
+          `e2e/audio.spec.ts` reads the debug hook directly and never renders
+          this paragraph at all. */}
+      {status.kind === 'running' && debugInfo && isDebugMode() && (
         <p className="audio-debug">
           ring fill: {debugInfo.fill} samples · underruns: {debugInfo.underrunCount} · peak:{' '}
           {debugInfo.peak.toFixed(3)}
