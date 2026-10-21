@@ -19,6 +19,7 @@
 import { NesCore, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from '../wasm/core'
 import { CONTROL_INT32_LENGTH, READ_INDEX, targetFillSamples, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
 import { NTSC_FRAME_MS } from '../timing'
+import { DEFAULT_DISPLAY_FILTER, type DisplayFilterSettings } from './displayFilter'
 import { createRenderer, type FrameRenderer } from './renderer'
 import { CAPTURE_INTERVAL_FRAMES, RewindRing } from './rewindRing'
 import { DEFAULT_SPEED, type Speed } from './speedControl'
@@ -180,6 +181,13 @@ let speedMultiplier: Speed = DEFAULT_SPEED
  */
 let renderer: FrameRenderer | null = null
 
+/** The latest display filter and on-screen canvas width the main thread
+ * sent. Kept here, not only handed straight to `renderer`, because both
+ * normally arrive before `start()` has a renderer to give them to -- it
+ * applies them as soon as it does. */
+let displayFilter: DisplayFilterSettings = DEFAULT_DISPLAY_FILTER
+let displayWidth: number | null = null
+
 /**
  * Rewind holds and non-1x speeds mute the worklet by reusing ENG-90's own
  * `paused` bypass (`audioRingProcessor.js`'s `paused` branch) rather than
@@ -305,6 +313,14 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       break
     case 'set-speed':
       setSpeed(message.multiplier)
+      break
+    case 'set-display-filter':
+      displayFilter = message.settings
+      renderer?.setDisplay(displayFilter, displayWidth)
+      break
+    case 'set-display-width':
+      displayWidth = message.width
+      renderer?.setDisplay(displayFilter, displayWidth)
       break
   }
 }
@@ -490,6 +506,7 @@ async function start(
     post({ type: 'status', status: 'error', message })
     return
   }
+  renderer.setDisplay(displayFilter, displayWidth)
 
   // ENG-89: boot the last-played library entry instead of unconditionally
   // booting the vendored demo. `romBytes` (the demo, fetched by

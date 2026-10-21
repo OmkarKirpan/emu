@@ -9,7 +9,8 @@
 //
 // Worker-only (hence the `OffscreenCanvas` parameters, and its exclusion
 // from `tsconfig.app.json` -- see `tsconfig.worker.json`).
-import { FRAME_SHADER, SHADER_INTERFACE } from './shader'
+import { DISPLAY_FILTERS, filteredCanvasSize, type DisplayFilterKind, type DisplayFilterSettings } from './displayFilter'
+import { CRT_PARAMS_FLOATS, FRAME_SHADER, packCrtParams, SHADER_INTERFACE } from './shader'
 import type { RendererKind } from './protocol'
 
 export interface FrameRenderer {
@@ -30,6 +31,13 @@ export interface FrameRenderer {
    * to be rediscovered.
    */
   draw(frame: Uint8ClampedArray<ArrayBuffer>): void
+  /**
+   * Applies a display filter (`displayFilter.ts`) and the canvas's current
+   * on-screen width in device pixels -- `null` until the main thread has
+   * measured it -- then repaints the last frame, so a change shows at once
+   * even while the transport is paused and nothing else is drawing.
+   */
+  setDisplay(settings: DisplayFilterSettings, displayWidth: number | null): void
 }
 
 /**
@@ -80,6 +88,10 @@ function createCanvas2dRenderer(canvas: OffscreenCanvas, width: number, height: 
     draw(frame) {
       ctx.putImageData(new ImageData(frame, width, height), 0, 0)
     },
+    // Filters are WebGPU-only: curvature and colour fringing are per-pixel
+    // resampling, which Canvas 2D has no way to express. The UI disables
+    // the setting on this backend rather than offering a partial version.
+    setDisplay() {},
   }
 }
 
@@ -100,12 +112,38 @@ async function tryCreateWebGpuRenderer(
 
     const format = navigator.gpu.getPreferredCanvasFormat()
     const module = device.createShaderModule({ code: FRAME_SHADER })
-    const pipeline = await device.createRenderPipelineAsync({
-      layout: 'auto',
-      vertex: { module, entryPoint: SHADER_INTERFACE.vertexEntryPoint },
-      fragment: { module, entryPoint: SHADER_INTERFACE.fragmentEntryPoint, targets: [{ format }] },
-      primitive: { topology: 'triangle-list' },
+    // An explicit layout rather than `'auto'`: there is one pipeline per
+    // display filter, and they all share one bind group, which only works if
+    // they share one layout. `'auto'` would derive a different layout per
+    // pipeline from just the bindings each entry point happens to touch.
+    const bindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: SHADER_INTERFACE.samplerBinding, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: SHADER_INTERFACE.textureBinding, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+        { binding: SHADER_INTERFACE.crtParamsBinding, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
+        { binding: SHADER_INTERFACE.smoothSamplerBinding, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+      ],
     })
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] })
+    // Every filter's pipeline is compiled up front, here in the fallible
+    // section: a broken CRT shader has to fall back to Canvas 2D at startup,
+    // not fail the first time someone switches the filter on.
+    const pipelines = Object.fromEntries(
+      await Promise.all(
+        DISPLAY_FILTERS.map(
+          async (filter) =>
+            [
+              filter,
+              await device.createRenderPipelineAsync({
+                layout,
+                vertex: { module, entryPoint: SHADER_INTERFACE.vertexEntryPoint },
+                fragment: { module, entryPoint: SHADER_INTERFACE.fragmentEntryPoints[filter], targets: [{ format }] },
+                primitive: { topology: 'triangle-list' },
+              }),
+            ] as const,
+        ),
+      ),
+    ) as Record<DisplayFilterKind, GPURenderPipeline>
 
     const texture = device.createTexture({
       size: [width, height],
@@ -116,11 +154,21 @@ async function tryCreateWebGpuRenderer(
     // CSS side already commits to `image-rendering: pixelated`. Filtering
     // here would blur exactly what that's there to keep crisp.
     const sampler = device.createSampler({ magFilter: 'nearest', minFilter: 'nearest' })
+    // The CRT path's sampler. Linear, but only ever read through the
+    // shader's `sampleSharp`, which keeps pixel edges crisp anyway -- see
+    // that function.
+    const smoothSampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' })
+    const crtParams = device.createBuffer({
+      size: CRT_PARAMS_FLOATS * Float32Array.BYTES_PER_ELEMENT,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    })
     const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+      layout: bindGroupLayout,
       entries: [
         { binding: SHADER_INTERFACE.samplerBinding, resource: sampler },
         { binding: SHADER_INTERFACE.textureBinding, resource: texture.createView() },
+        { binding: SHADER_INTERFACE.crtParamsBinding, resource: { buffer: crtParams } },
+        { binding: SHADER_INTERFACE.smoothSamplerBinding, resource: smoothSampler },
       ],
     })
 
@@ -138,6 +186,29 @@ async function tryCreateWebGpuRenderer(
       console.error(`WebGPU device lost (${info.reason}): ${info.message}`)
     })
 
+    let pipeline = pipelines.none
+
+    /** Draws whatever `texture` holds now -- the last frame `draw` uploaded,
+     * or black before the first -- through the current filter. */
+    const present = () => {
+      const encoder = device.createCommandEncoder()
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: context.getCurrentTexture().createView(),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          },
+        ],
+      })
+      pass.setPipeline(pipeline)
+      pass.setBindGroup(0, bindGroup)
+      pass.draw(3)
+      pass.end()
+      device.queue.submit([encoder.finish()])
+    }
+
     return {
       kind: 'webgpu',
       draw(frame) {
@@ -153,23 +224,23 @@ async function tryCreateWebGpuRenderer(
           { bytesPerRow: width * 4, rowsPerImage: height },
           { width, height },
         )
-
-        const encoder = device.createCommandEncoder()
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [
-            {
-              view: context.getCurrentTexture().createView(),
-              loadOp: 'clear',
-              storeOp: 'store',
-              clearValue: { r: 0, g: 0, b: 0, a: 1 },
-            },
-          ],
-        })
-        pass.setPipeline(pipeline)
-        pass.setBindGroup(0, bindGroup)
-        pass.draw(3)
-        pass.end()
-        device.queue.submit([encoder.finish()])
+        present()
+      },
+      setDisplay(settings, displayWidth) {
+        // Unfiltered stays at the framebuffer's own size, with CSS doing the
+        // upscale exactly as before filters existed. A filter needs a canvas
+        // pixel per screen pixel -- see `filteredCanvasSize`. Resizing is
+        // safe here, after `getContext('webgpu')`: the configured context
+        // just hands out textures of the new size from `getCurrentTexture`.
+        const size =
+          settings.filter === 'none'
+            ? { width, height }
+            : filteredCanvasSize(displayWidth, width, height, device.limits.maxTextureDimension2D)
+        if (canvas.width !== size.width) canvas.width = size.width
+        if (canvas.height !== size.height) canvas.height = size.height
+        pipeline = pipelines[settings.filter]
+        device.queue.writeBuffer(crtParams, 0, packCrtParams(settings.crt, size.width, size.height, width, height))
+        present()
       },
     }
   } catch (err: unknown) {

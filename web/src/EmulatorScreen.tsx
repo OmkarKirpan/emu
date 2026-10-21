@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { isDebugMode } from './debugMode'
+import { DisplaySettings } from './display/DisplaySettings'
+import { useDisplayFilter } from './display/useDisplayFilter'
+import { useDisplayWidth } from './display/useDisplayWidth'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
 import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
@@ -103,6 +106,10 @@ export function EmulatorScreen() {
    * independent hook calls would each keep (and could disagree on) their
    * own `dismissed` state. */
   const firstRun = useFirstRun(worker)
+  /** The display filter (CRT, or none): restored from the last visit, sent
+   * to the Worker, and reflected on the canvas element below. */
+  const [displayFilter, setDisplayFilter] = useDisplayFilter(worker)
+  useDisplayWidth(canvasRef, worker)
   /** The one emulator session for this canvas, held across remounts --
    * see the effect below for why it cannot simply be rebuilt. */
   const sessionRef = useRef<EmulatorSession | null>(null)
@@ -447,6 +454,8 @@ export function EmulatorScreen() {
     }
   }, [])
 
+  const renderer = status.kind === 'running' ? status.renderer : null
+
   return (
     <>
       {/* N8 terminal-command nav. The flags are real controls, not links
@@ -536,6 +545,10 @@ export function EmulatorScreen() {
             height={FRAMEBUFFER_HEIGHT}
             className="screen-canvas"
             aria-label="NES output"
+            // The filter actually in effect, not just the one selected:
+            // Canvas 2D can't run filters, and its 256x240 canvas still needs
+            // the `pixelated` upscale this attribute switches off (`App.css`).
+            data-filter={renderer === 'webgpu' ? displayFilter.filter : 'none'}
           />
           {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
@@ -588,6 +601,10 @@ export function EmulatorScreen() {
             </p>
           )}
         </div>
+
+        {/* Next to audio: both are about how the game comes out, where
+            everything below is about playing it or keeping it. */}
+        <DisplaySettings settings={displayFilter} onChange={setDisplayFilter} renderer={renderer} />
 
         {/* ENG-93: the control map's other home. The footer (`App.tsx`)
             still states it once, but a footer nobody scrolls to is not
