@@ -99,4 +99,61 @@ describe('useDisplayWidth', () => {
     renderHook(() => useDisplayWidth(canvasRef, null))
     expect(FakeResizeObserver.instances).toHaveLength(0)
   })
+
+  it('rounds CSS widths at fractional pixel ratios and deduplicates the resulting device width', () => {
+    vi.stubGlobal('devicePixelRatio', 1.25)
+    renderHook(() => useDisplayWidth(canvasRef, worker))
+    // The browser can accept the box option and still omit its measurement.
+    observer().deliver({ cssWidth: 100.1 })
+    observer().deliver({ cssWidth: 100.2 })
+    observer().deliver({ cssWidth: 100.4 })
+    expect(postMessage.mock.calls.map(([message]) => message.width)).toEqual([125, 126])
+  })
+
+  it('does not replace the last useful size when a measured canvas becomes hidden', () => {
+    renderHook(() => useDisplayWidth(canvasRef, worker))
+    observer().deliver({ cssWidth: 736, devicePixelWidth: 920 })
+    observer().deliver({ cssWidth: 0, devicePixelWidth: 0 })
+    observer().deliver({ cssWidth: 736, devicePixelWidth: 920 })
+    expect(postMessage).toHaveBeenCalledExactlyOnceWith({ type: 'set-display-width', width: 920 })
+  })
+
+  it('starts observing when a Worker appears after mount', () => {
+    const { rerender } = renderHook(({ w }) => useDisplayWidth(canvasRef, w), {
+      initialProps: { w: null as Worker | null },
+    })
+    rerender({ w: worker })
+    expect(FakeResizeObserver.instances).toHaveLength(1)
+    observer().deliver({ cssWidth: 736, devicePixelWidth: 920 })
+    expect(postMessage).toHaveBeenCalledWith({ type: 'set-display-width', width: 920 })
+  })
+
+  it('disconnects an old Worker and sends the same size to its replacement', () => {
+    const { rerender } = renderHook(({ w }) => useDisplayWidth(canvasRef, w), {
+      initialProps: { w: worker as Worker | null },
+    })
+    const first = observer()
+    first.deliver({ cssWidth: 736, devicePixelWidth: 920 })
+    const nextPostMessage = vi.fn()
+    rerender({ w: { postMessage: nextPostMessage } as unknown as Worker })
+    expect(first.disconnected).toBe(true)
+    expect(FakeResizeObserver.instances).toHaveLength(2)
+    FakeResizeObserver.instances[1].deliver({ cssWidth: 736, devicePixelWidth: 920 })
+    expect(nextPostMessage).toHaveBeenCalledExactlyOnceWith({ type: 'set-display-width', width: 920 })
+    expect(postMessage).toHaveBeenCalledTimes(1)
+    rerender({ w: null })
+    expect(FakeResizeObserver.instances[1].disconnected).toBe(true)
+  })
+
+  it('does nothing when the canvas has not mounted', () => {
+    renderHook(() => useDisplayWidth({ current: null }, worker))
+    expect(FakeResizeObserver.instances).toHaveLength(0)
+    expect(postMessage).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when ResizeObserver is unavailable', () => {
+    vi.stubGlobal('ResizeObserver', undefined)
+    renderHook(() => useDisplayWidth(canvasRef, worker))
+    expect(postMessage).not.toHaveBeenCalled()
+  })
 })

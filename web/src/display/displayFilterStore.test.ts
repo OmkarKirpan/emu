@@ -31,6 +31,32 @@ describe('loadDisplayFilter / saveDisplayFilter', () => {
     expect(loadDisplayFilter()).toEqual({ filter: 'crt', crt: DEFAULT_DISPLAY_FILTER.crt })
   })
 
+  it('keeps customized CRT options across an Off-to-CRT round trip', () => {
+    saveDisplayFilter({ ...CRT_SOME_OFF, filter: 'none' })
+    const off = loadDisplayFilter()
+    expect(off).toEqual({ ...CRT_SOME_OFF, filter: 'none' })
+    saveDisplayFilter({ ...off, filter: 'crt' })
+    expect(loadDisplayFilter()).toEqual(CRT_SOME_OFF)
+  })
+
+  it('retains known options when a newer stored filter is unavailable', () => {
+    localStorage.setItem('emu.display.filter', JSON.stringify({ ...CRT_SOME_OFF, filter: 'ntsc' }))
+    expect(loadDisplayFilter()).toEqual({ ...CRT_SOME_OFF, filter: 'none' })
+  })
+
+  it('does not rewrite an unreadable stored value during loading', () => {
+    localStorage.setItem('emu.display.filter', '{broken')
+    expect(loadDisplayFilter()).toEqual(DEFAULT_DISPLAY_FILTER)
+    expect(localStorage.getItem('emu.display.filter')).toBe('{broken')
+  })
+
+  it('does not share default options between independent loads', () => {
+    const first = loadDisplayFilter()
+    first.crt.scanlines = false
+    expect(loadDisplayFilter()).toEqual(DEFAULT_DISPLAY_FILTER)
+    expect(DEFAULT_DISPLAY_FILTER.crt.scanlines).toBe(true)
+  })
+
   describe('when localStorage throws', () => {
     beforeEach(() => {
       vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {

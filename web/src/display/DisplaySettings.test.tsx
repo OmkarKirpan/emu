@@ -87,11 +87,57 @@ describe('DisplaySettings', () => {
     render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} filters={PLAIN_ONLY} />)
     expect(document.body.textContent).not.toMatch(/webgpu|canvas ?2d/i)
   })
+
+  it.each([
+    ['Scanlines', 'scanlines'],
+    ['Screen curvature', 'curvature'],
+    ['Chromatic aberration', 'chromaticAberration'],
+    ['Vignette', 'vignette'],
+  ] as const)('can enable %s without changing the other preferences', (label, option) => {
+    const onChange = vi.fn()
+    const settings: DisplayFilterSettings = {
+      filter: 'crt',
+      crt: { scanlines: false, curvature: false, chromaticAberration: false, vignette: false },
+    }
+    render(<DisplaySettings settings={settings} onChange={onChange} filters={ALL} />)
+    fireEvent.click(screen.getByRole('checkbox', { name: label }))
+    expect(onChange).toHaveBeenCalledExactlyOnceWith({
+      filter: 'crt', crt: { ...settings.crt, [option]: true },
+    })
+    expect(settings.crt[option]).toBe(false)
+  })
+
+  it('can switch a stored unavailable CRT filter off without losing its preferences', () => {
+    const onChange = vi.fn()
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={onChange} filters={PLAIN_ONLY} />)
+    fireEvent.click(screen.getByRole('radio', { name: 'Off' }))
+    expect(onChange).toHaveBeenCalledExactlyOnceWith({ ...CRT_ALL_ON, filter: 'none' })
+  })
+
+  it('enables a stored selection when capabilities arrive without changing the preference', () => {
+    const onChange = vi.fn()
+    const { rerender } = render(
+      <DisplaySettings settings={CRT_ALL_ON} onChange={onChange} filters={null} />,
+    )
+    expect(disabled(screen.getByRole('radio', { name: 'Off' }))).toBe(true)
+    rerender(<DisplaySettings settings={CRT_ALL_ON} onChange={onChange} filters={PLAIN_ONLY} />)
+    expect(checked(screen.getByRole('radio', { name: 'CRT' }))).toBe(true)
+    screen.getByText('Not available in this browser: CRT.')
+    rerender(<DisplaySettings settings={CRT_ALL_ON} onChange={onChange} filters={ALL} />)
+    expect(disabled(screen.getByRole('radio', { name: 'CRT' }))).toBe(false)
+    expect(disabled(screen.getByRole('checkbox', { name: 'Scanlines' }))).toBe(false)
+    expect(screen.queryByText(/not available/i)).toBeNull()
+    expect(onChange).not.toHaveBeenCalled()
+  })
 })
 
 describe('useDisplayFilter', () => {
   beforeEach(() => {
     localStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
   })
 
   function fakeWorker() {
@@ -129,5 +175,53 @@ describe('useDisplayFilter', () => {
     act(() => result.current[1](CRT_ALL_ON))
     expect(postMessage).toHaveBeenLastCalledWith({ type: 'set-display-filter', settings: CRT_ALL_ON })
     expect(loadDisplayFilter()).toEqual(CRT_ALL_ON)
+  })
+
+  it('persists a change made before a Worker exists, then sends only the latest settings', () => {
+    const { worker, postMessage } = fakeWorker()
+    const { result, rerender } = renderHook(({ w }) => useDisplayFilter(w), {
+      initialProps: { w: null as Worker | null },
+    })
+    const settings = { ...CRT_ALL_ON, crt: { ...CRT_ALL_ON.crt, vignette: false } }
+    act(() => result.current[1](settings))
+    expect(loadDisplayFilter()).toEqual(settings)
+    expect(postMessage).not.toHaveBeenCalled()
+    rerender({ w: worker })
+    expect(postMessage).toHaveBeenCalledExactlyOnceWith({ type: 'set-display-filter', settings })
+  })
+
+  it('sends current preferences to a replacement Worker without notifying the previous one', () => {
+    const first = fakeWorker()
+    const second = fakeWorker()
+    const { result, rerender } = renderHook(({ w }) => useDisplayFilter(w), {
+      initialProps: { w: first.worker },
+    })
+    act(() => result.current[1](CRT_ALL_ON))
+    first.postMessage.mockClear()
+    rerender({ w: second.worker })
+    expect(second.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: 'set-display-filter', settings: CRT_ALL_ON,
+    })
+    expect(first.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('does not resend settings on an unrelated rerender or reload storage after mounting', () => {
+    const { worker, postMessage } = fakeWorker()
+    const { result, rerender } = renderHook(() => useDisplayFilter(worker))
+    localStorage.setItem('emu.display.filter', JSON.stringify(CRT_ALL_ON))
+    rerender()
+    expect(result.current[0]).toEqual(DEFAULT_DISPLAY_FILTER)
+    expect(postMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps updating the active session if persistence is blocked', () => {
+    const { worker, postMessage } = fakeWorker()
+    const { result } = renderHook(() => useDisplayFilter(worker))
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('blocked')
+    })
+    act(() => result.current[1](CRT_ALL_ON))
+    expect(result.current[0]).toEqual(CRT_ALL_ON)
+    expect(postMessage).toHaveBeenLastCalledWith({ type: 'set-display-filter', settings: CRT_ALL_ON })
   })
 })

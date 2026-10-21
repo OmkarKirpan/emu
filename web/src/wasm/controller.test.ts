@@ -145,4 +145,41 @@ describe('KeyboardController with a focused control', () => {
     keyOn(control, 'keyup', 'ArrowDown')
     expect(controller.read()).toBe(0)
   })
+
+  it.each(['radio', 'range'])('leaves all four arrow presses to a tabbed-to %s', (type) => {
+    setup(type)
+    press('Tab')
+    for (const code of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']) {
+      expect(keyOn(control, 'keydown', code).defaultPrevented).toBe(false)
+    }
+    expect(controller.read()).toBe(0)
+  })
+
+  it('returns arrows to the control when Tab is pressed again after a pointer interaction', () => {
+    setup('range')
+    control.dispatchEvent(new Event('pointerdown', { bubbles: true }))
+    expect(keyOn(control, 'keydown', 'ArrowRight').defaultPrevented).toBe(true)
+    keyOn(control, 'keyup', 'ArrowRight')
+    keyOn(control, 'keydown', 'Tab')
+    expect(keyOn(control, 'keydown', 'ArrowLeft').defaultPrevented).toBe(false)
+    expect(controller.read()).toBe(0)
+  })
+
+  it('keeps gameplay arrows working outside a control after tabbing', () => {
+    setup('radio')
+    press('Tab')
+    expect(keyOn(window, 'keydown', 'ArrowUp').defaultPrevented).toBe(true)
+    expect(controller.read()).toBe(Button.Up)
+  })
+
+  it('releases a held game arrow on a tabbed-to slider without clearing other held buttons', () => {
+    setup('range')
+    press('ArrowRight')
+    press('KeyX')
+    press('Tab')
+    expect(keyOn(control, 'keyup', 'ArrowRight').defaultPrevented).toBe(true)
+    expect(controller.read()).toBe(Button.A)
+    expect(keyOn(control, 'keydown', 'ArrowDown').defaultPrevented).toBe(false)
+    expect(controller.read()).toBe(Button.A)
+  })
 })

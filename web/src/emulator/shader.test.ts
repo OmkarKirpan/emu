@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { WgslReflect } from 'wgsl_reflect'
-import { DISPLAY_FILTERS } from './displayFilter'
+import { CRT_OPTIONS, DEFAULT_DISPLAY_FILTER, DISPLAY_FILTERS } from './displayFilter'
 import { CRT_PARAMS_FLOATS, CRT_PARAMS_LAYOUT, FILTER_SHADERS, packCrtParams, SHADER_INTERFACE } from './shader'
 
 /**
@@ -94,5 +94,28 @@ describe('packCrtParams', () => {
     expect(packed[CRT_PARAMS_LAYOUT.curvature]).toBe(0)
     expect(packed[CRT_PARAMS_LAYOUT.chromaticAberration]).toBe(1)
     expect(packed[CRT_PARAMS_LAYOUT.vignette]).toBe(0)
+  })
+
+  it.each(CRT_OPTIONS)('can enable %s independently of every other effect', (option) => {
+    const options = { scanlines: false, curvature: false, chromaticAberration: false, vignette: false }
+    options[option] = true
+    const packed = packCrtParams(options, 1024, 960, 256, 240)
+    for (const key of CRT_OPTIONS) {
+      expect(packed[CRT_PARAMS_LAYOUT[key]], key).toBe(key === option ? 1 : 0)
+    }
+  })
+
+  it('allocates an independent buffer on each call without changing the options', () => {
+    const options = Object.freeze({ ...DEFAULT_DISPLAY_FILTER.crt })
+    const first = packCrtParams(options, 1024, 960, 256, 240)
+    const second = packCrtParams(options, 512, 480, 256, 240)
+    expect(first).toBeInstanceOf(Float32Array)
+    expect(first.buffer).toBeInstanceOf(ArrayBuffer)
+    expect(first.buffer).not.toBe(second.buffer)
+    expect(first[CRT_PARAMS_LAYOUT.outputSize]).toBe(1024)
+    expect(second[CRT_PARAMS_LAYOUT.outputSize]).toBe(512)
+    first[CRT_PARAMS_LAYOUT.scanlines] = 0
+    expect(second[CRT_PARAMS_LAYOUT.scanlines]).toBe(1)
+    expect(options).toEqual(DEFAULT_DISPLAY_FILTER.crt)
   })
 })

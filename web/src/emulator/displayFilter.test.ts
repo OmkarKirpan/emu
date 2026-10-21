@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_DISPLAY_FILTER, filteredCanvasSize, sanitizeDisplayFilter } from './displayFilter'
+import { CRT_OPTIONS, DEFAULT_DISPLAY_FILTER, filteredCanvasSize, sanitizeDisplayFilter } from './displayFilter'
 
 describe('DEFAULT_DISPLAY_FILTER', () => {
   it('is off, so a first visit sees the picture exactly as it has always looked', () => {
@@ -44,6 +44,39 @@ describe('sanitizeDisplayFilter', () => {
     expect(settings).not.toBe(DEFAULT_DISPLAY_FILTER)
     expect(settings.crt).not.toBe(DEFAULT_DISPLAY_FILTER.crt)
   })
+
+  it.each([undefined, false, 0, 42, [], {}])('defaults safely for %j', (value) => {
+    expect(sanitizeDisplayFilter(value)).toEqual(DEFAULT_DISPLAY_FILTER)
+  })
+
+  it.each([null, 'off', false, 0, []])('keeps the chosen filter when CRT options are malformed: %j', (crt) => {
+    expect(sanitizeDisplayFilter({ filter: 'crt', crt })).toEqual({ ...DEFAULT_DISPLAY_FILTER, filter: 'crt' })
+  })
+
+  it.each(CRT_OPTIONS)('preserves false for %s while defaulting the other options', (option) => {
+    expect(sanitizeDisplayFilter({ filter: 'crt', crt: { [option]: false } })).toEqual({
+      filter: 'crt',
+      crt: { ...DEFAULT_DISPLAY_FILTER.crt, [option]: false },
+    })
+  })
+
+  it('preserves CRT preferences for an unknown filter and discards extra fields', () => {
+    const crt = { scanlines: false, curvature: false, chromaticAberration: false, vignette: false }
+    expect(sanitizeDisplayFilter({ filter: 'ntsc', crt: { ...crt, brightness: 0.5 }, version: 2 }))
+      .toEqual({ filter: 'none', crt })
+  })
+
+  it('returns independent settings without mutating or retaining the input options', () => {
+    const crt = Object.freeze({ scanlines: false, curvature: true, chromaticAberration: false, vignette: true })
+    const input = Object.freeze({ filter: 'crt', crt })
+    const first = sanitizeDisplayFilter(input)
+    const second = sanitizeDisplayFilter(input)
+    expect(first).toEqual(input)
+    expect(first.crt).not.toBe(crt)
+    first.crt.curvature = false
+    expect(second.crt.curvature).toBe(true)
+    expect(crt.curvature).toBe(true)
+  })
 })
 
 describe('filteredCanvasSize', () => {
@@ -66,5 +99,25 @@ describe('filteredCanvasSize', () => {
   it('treats a missing or nonsense width as four times the framebuffer', () => {
     expect(filteredCanvasSize(null, 256, 240, 8192)).toEqual({ width: 1024, height: 960 })
     expect(filteredCanvasSize(NaN, 256, 240, 8192)).toEqual({ width: 1024, height: 960 })
+  })
+
+  it.each([Infinity, -Infinity])('uses the fallback for a non-finite width of %s', (width) => {
+    expect(filteredCanvasSize(width, 256, 240, 8192)).toEqual({ width: 1024, height: 960 })
+  })
+
+  it.each([0, -100, 255.49, 256])('keeps the source resolution at a width of %s', (width) => {
+    expect(filteredCanvasSize(width, 256, 240, 8192)).toEqual({ width: 256, height: 240 })
+  })
+
+  it('rounds half a device pixel up and derives height from the rounded width', () => {
+    expect(filteredCanvasSize(256.5, 256, 240, 8192)).toEqual({ width: 257, height: 241 })
+  })
+
+  it('caps the fallback size at the GPU limit too', () => {
+    expect(filteredCanvasSize(null, 256, 240, 512)).toEqual({ width: 512, height: 480 })
+  })
+
+  it('derives scale and aspect ratio from the provided source dimensions', () => {
+    expect(filteredCanvasSize(null, 320, 200, 8192)).toEqual({ width: 1280, height: 800 })
   })
 })
