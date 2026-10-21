@@ -481,6 +481,14 @@ async function publishLibrary(): Promise<void> {
   post({ type: 'library', roms })
 }
 
+/** Boots the most recently played library ROM, using `romBytes` as the
+ * demo fallback, and starts rendering and autosave timers. `inputSab`
+ * supplies controller 0's packed button byte in its first Int32 slot.
+ *
+ * Renderer or demo ROM failures post an error status and resolve early;
+ * library read or stored-ROM load failures fall back to the demo. Wasm
+ * initialization and uncaught `adoptRom` errors reject the promise.
+ * Resolves after setup, without waiting for the running session to end. */
 async function start(
   canvas: OffscreenCanvas,
   romBytes: ArrayBuffer,

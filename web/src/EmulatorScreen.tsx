@@ -78,12 +78,12 @@ declare global {
  * The M5 (ENG-70) wasm host: transfers its `<canvas>` to a dedicated Worker
  * (`emulator/emulatorWorker.ts`) via `OffscreenCanvas`, which owns the one
  * wasm instance for the whole pipeline -- video, and (once `AudioOutput`
- * enables it) audio -- and paints via `putImageData` on its own ~60Hz timer.
+ * enables it) audio -- and paints through WebGPU or Canvas 2D on its own
+ * ~60Hz timer.
  * No more `requestAnimationFrame`-driven stepping on this thread; see
  * `emulatorWorker.ts`'s `scheduleLoop` for why that's not a loss. Keyboard
  * and Gamepad input still originate here (`InputBridge`), published into
- * shared memory rather than message-passed. Still Canvas 2D only -- a
- * WebGPU renderer (ENG-57) is unimplemented follow-up work.
+ * shared memory rather than message-passed.
  */
 export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)

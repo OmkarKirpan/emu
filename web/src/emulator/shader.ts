@@ -175,7 +175,9 @@ export const CRT_PARAMS_LAYOUT = {
 export const CRT_PARAMS_FLOATS = 8
 
 /** The `CrtParams` uniform for one canvas size and set of options. Each
- * option becomes a 0/1 strength (see `CrtOptions`). */
+ * option becomes a 0/1 strength (see `CrtOptions`). Output dimensions are
+ * canvas backing-store pixels; source dimensions are framebuffer pixels.
+ * Returns a new array in `CRT_PARAMS_LAYOUT` order. */
 export function packCrtParams(
   options: CrtOptions,
   outputWidth: number,

@@ -41,6 +41,8 @@ export interface FrameRenderer {
    * measured it. On WebGPU it then repaints the last frame, so a change
    * shows at once even while the transport is paused and nothing else is
    * drawing; on Canvas 2D, which has no filters, it does nothing.
+   * An unavailable filter uses the plain picture at framebuffer size.
+   * Synchronous rendering errors propagate to the caller.
    */
   setDisplay(settings: DisplayFilterSettings, displayWidth: number | null): void
 }
@@ -86,6 +88,9 @@ export async function createRenderer(
   throw new Error('Neither WebGPU nor Canvas 2D is available in this browser.')
 }
 
+/** Creates a renderer at the supplied framebuffer dimensions in pixels,
+ * with no display filtering. Returns `null` if no 2D context is available;
+ * errors thrown by context acquisition propagate. */
 function createCanvas2dRenderer(canvas: OffscreenCanvas, width: number, height: number): FrameRenderer | null {
   const ctx = canvas.getContext('2d')
   if (!ctx) return null
@@ -103,6 +108,10 @@ function createCanvas2dRenderer(canvas: OffscreenCanvas, width: number, height: 
   }
 }
 
+/** Returns a WebGPU renderer for the framebuffer's pixel dimensions, or
+ * `null` if WebGPU is unavailable or setup fails. A filter whose pipeline
+ * fails is omitted while the plain renderer remains available. Errors in
+ * later `draw` or `setDisplay` calls are outside the setup fallback. */
 async function tryCreateWebGpuRenderer(
   canvas: OffscreenCanvas,
   width: number,

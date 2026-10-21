@@ -16,6 +16,9 @@ import { useEffect, type RefObject } from 'react'
  * Edge, Firefox). Safari rejects that box type outright, so there it falls
  * back to the CSS width times `devicePixelRatio`, which is the same number
  * up to rounding but isn't re-reported when only the pixel ratio changes.
+ *
+ * Skips zero and repeated widths. Does nothing without a canvas, Worker,
+ * or `ResizeObserver`, and disconnects the observer on cleanup.
  */
 export function useDisplayWidth(canvasRef: RefObject<HTMLCanvasElement | null>, worker: Worker | null): void {
   useEffect(() => {

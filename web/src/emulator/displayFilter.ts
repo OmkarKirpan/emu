@@ -90,6 +90,11 @@ const FALLBACK_SCALE = 4
  * The height is derived from the width at the framebuffer's 256:240 -- the
  * same ratio `App.css` gives the canvas's box -- so only the width needs
  * measuring.
+ *
+ * All dimensions are in pixels. A `null` or non-finite `displayWidth` uses
+ * four times `sourceWidth`. The requested width is rounded, raised to at
+ * least `sourceWidth`, then capped at `maxDimension`. Height is rounded
+ * from the source aspect ratio; `maxDimension` caps only the width.
  */
 export function filteredCanvasSize(
   displayWidth: number | null,

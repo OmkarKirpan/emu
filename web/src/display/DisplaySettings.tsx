@@ -25,6 +25,8 @@ interface OptionsPanelProps {
   disabled: boolean
 }
 
+/** Shows the four CRT toggles, reporting a full settings value with only
+ * the chosen option changed. `disabled` disables the whole fieldset. */
 function CrtOptionsPanel({ settings, onChange, disabled }: OptionsPanelProps) {
   return (
     <fieldset className="display-options" disabled={disabled}>

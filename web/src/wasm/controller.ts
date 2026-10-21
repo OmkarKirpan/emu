@@ -47,6 +47,8 @@ export class KeyboardController {
    * a pointer. See `apply` for what it decides. */
   private tabbing = false
 
+  /** Starts tracking key and pointer events on `window`; call `dispose`
+   * when the controller is no longer needed. */
   constructor() {
     window.addEventListener('keydown', this.handleKeyDown)
     window.addEventListener('keyup', this.handleKeyUp)
@@ -59,6 +61,7 @@ export class KeyboardController {
     return this.buttons
   }
 
+  /** Stops tracking events without clearing the current button byte. */
   dispose(): void {
     window.removeEventListener('keydown', this.handleKeyDown)
     window.removeEventListener('keyup', this.handleKeyUp)
@@ -67,18 +70,20 @@ export class KeyboardController {
 
   // Arrow properties, not methods: `removeEventListener` needs the same
   // function identity `addEventListener` was given.
+  /** Treats Tab as keyboard navigation so radios and sliders keep arrows. */
   private handleKeyDown = (event: KeyboardEvent): void => {
     if (event.code === 'Tab') this.tabbing = true
     this.apply(event, true)
   }
   private handleKeyUp = (event: KeyboardEvent): void => this.apply(event, false)
+  /** Returns arrow keys to the game even if a page control retains focus. */
   private handlePointerDown = (): void => {
     this.tabbing = false
   }
 
-  /** Both directions differ only in which way the bit moves, so the mapped-key
-   * policy (what counts as mapped, and that mapped keys are swallowed) lives
-   * in one place rather than being kept in sync across two handlers. */
+  /** Sets or clears a mapped button bit and prevents the key's default
+   * action. Unmapped keys and arrow presses on a radio or range input after
+   * Tab navigation are left alone; mapped releases always clear the bit. */
   private apply(event: KeyboardEvent, pressed: boolean): void {
     const bit = KEY_MAP[event.code]
     if (bit === undefined) return
