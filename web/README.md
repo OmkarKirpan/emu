@@ -82,15 +82,22 @@ is kept in `localStorage`, like volume. A filter only changes how the frame
 is shown: the framebuffer in wasm memory, and so rewind, save states and
 the e2e suite's pixel reads, always see the unfiltered picture.
 
-Filters are fragment shaders on the WebGPU renderer (`src/emulator/
-shader.ts`, one entry point per filter). A filtered canvas is rendered at
-its on-screen size in device pixels rather than at 256x240, because a
-scanline is thinner than one NES row. The main thread measures that size
+Filters are shaders on the WebGPU renderer (`src/emulator/shader.ts`, one
+shader module per filter). A filtered canvas is rendered at its on-screen
+size in device pixels rather than at 256x240, because a scanline is thinner
+than one NES row. The main thread measures that size
 (`src/display/useDisplayWidth.ts`), since the Worker's `OffscreenCanvas` has
-no layout. Canvas 2D can't do per-pixel resampling, so on that fallback the
-panel is disabled and says so. Adding a filter means a new entry in
-`DISPLAY_FILTERS` (`src/emulator/displayFilter.ts`), and the type system
-then asks for its shader entry point and its label.
+no layout. The renderer reports which filters it can apply, and the panel
+offers only those. Canvas 2D has no per-pixel shader stage, so on that
+fallback there are none. A filter whose shader fails to compile on some GPU
+is dropped on its own, with a console error, and the plain picture stays on
+WebGPU.
+
+To add a filter, add an entry to `DISPLAY_FILTERS`
+(`src/emulator/displayFilter.ts`). The type checker then asks for its
+shader, its entry point, its label and its options panel. Its options are
+not prompted for: their settings field, their sanitizing, and their uniform
+upload in `renderer.ts` follow CRT's by hand.
 
 ## Running it
 

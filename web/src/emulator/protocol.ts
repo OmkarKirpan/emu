@@ -7,7 +7,7 @@
  * comment for why those two libs can't both be active in one project).
  */
 import type { RomLibraryEntry, SaveSlot, SlotSummary } from '../persistence/saveStore'
-import type { DisplayFilterSettings } from './displayFilter'
+import type { DisplayFilterKind, DisplayFilterSettings } from './displayFilter'
 import type { Speed } from './speedControl'
 
 // Re-exported so the Worker and its callers can name a slot, or describe a
@@ -128,7 +128,9 @@ export interface RingHandshake {
 /** Worker -> main thread. */
 export type EmulatorWorkerOutbound =
   | { type: 'video-ready'; sab: SharedArrayBuffer; framebufferPtr: number; width: number; height: number }
-  | { type: 'status'; status: 'running'; renderer: RendererKind }
+  /** `filters`: the display filters this renderer can actually apply --
+   * see `FrameRenderer.filters`. The Display panel offers only these. */
+  | { type: 'status'; status: 'running'; renderer: RendererKind; filters: DisplayFilterKind[] }
   | { type: 'status'; status: 'error'; message: string }
   /** Result of a `'load-rom'`. Deliberately *not* folded into the
    * `'status'` error above: that one means "the emulator never came up"

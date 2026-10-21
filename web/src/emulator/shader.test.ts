@@ -1,26 +1,38 @@
 import { describe, expect, it } from 'vitest'
 import { WgslReflect } from 'wgsl_reflect'
 import { DISPLAY_FILTERS } from './displayFilter'
-import { CRT_PARAMS_FLOATS, CRT_PARAMS_LAYOUT, FRAME_SHADER, packCrtParams, SHADER_INTERFACE } from './shader'
+import { CRT_PARAMS_FLOATS, CRT_PARAMS_LAYOUT, FILTER_SHADERS, packCrtParams, SHADER_INTERFACE } from './shader'
 
 /**
- * The WebGPU renderer's shader is the one piece of this codebase that no
- * test environment here can actually run: CI runners have no GPU, and even
- * locally `navigator.gpu` is absent from the sandboxed Chromium this repo's
- * e2e suite drives. A broken shader would therefore surface only as
- * `renderer.ts` quietly falling back to Canvas 2D on a real machine --
- * correct behaviour, and completely silent.
+ * The WebGPU renderer's shaders are the one piece of this codebase that no
+ * test environment here can actually run: CI runners have no GPU, and the
+ * Chromium Playwright bundles doesn't expose `navigator.gpu` either. A
+ * shader that fails to compile surfaces only on a real machine, as
+ * `renderer.ts` falling back -- to Canvas 2D for the plain shader, to "this
+ * filter is unavailable" for a filter's -- with nothing but a console
+ * message to say why.
  *
- * So this parses it instead. `wgsl_reflect` is a pure-JS WGSL parser, which
- * catches the failure mode that actually matters here -- a syntax error, a
- * renamed entry point, a moved binding -- and asserts the shader's declared
- * interface still matches the pipeline and bind group `renderer.ts` builds
- * around it. What it can't tell you is whether the *image* comes out right
- * (orientation, colour, how strong the CRT effects look); that needs eyes on
- * a GPU.
+ * So this parses them instead. `wgsl_reflect` is a pure-JS WGSL parser, which
+ * catches a syntax error, a renamed entry point or a moved binding, and lets
+ * each shader's declared interface be checked against the pipelines and bind
+ * group `renderer.ts` builds around it. It does *not* type-check: a type
+ * error parses fine and only fails on a GPU. Nor can it tell you whether the
+ * *image* comes out right (orientation, colour, how strong the CRT effects
+ * look); that needs eyes on a GPU.
  */
-describe('FRAME_SHADER', () => {
-  const reflect = new WgslReflect(FRAME_SHADER)
+
+/** The name the WGSL gives each slot of the one bind group every filter
+ * shares. A shader declaring any other slot is one `renderer.ts`'s bind
+ * group layout doesn't provide. */
+const BINDING_NAMES: Record<number, string> = {
+  [SHADER_INTERFACE.samplerBinding]: 'frameSampler',
+  [SHADER_INTERFACE.textureBinding]: 'frameTexture',
+  [SHADER_INTERFACE.crtParamsBinding]: 'crt',
+  [SHADER_INTERFACE.smoothSamplerBinding]: 'smoothSampler',
+}
+
+describe.each(DISPLAY_FILTERS)("the '%s' filter's shader", (filter) => {
+  const reflect = new WgslReflect(FILTER_SHADERS[filter])
 
   it('is syntactically valid WGSL', () => {
     // Constructing `WgslReflect` throws on a parse error, so reaching here
@@ -29,41 +41,33 @@ describe('FRAME_SHADER', () => {
     expect(reflect.entry.vertex.length + reflect.entry.fragment.length).toBeGreaterThan(0)
   })
 
-  it('declares exactly the entry points the render pipelines name', () => {
+  it('declares the shared vertex stage and exactly its own fragment entry point', () => {
     expect(reflect.entry.vertex.map((entry) => entry.name)).toEqual([SHADER_INTERFACE.vertexEntryPoint])
-    expect(reflect.entry.fragment.map((entry) => entry.name).sort()).toEqual(
-      Object.values(SHADER_INTERFACE.fragmentEntryPoints).sort(),
-    )
+    expect(reflect.entry.fragment.map((entry) => entry.name)).toEqual([SHADER_INTERFACE.fragmentEntryPoints[filter]])
   })
 
-  it('has a fragment entry point for every display filter', () => {
-    const declared = reflect.entry.fragment.map((entry) => entry.name)
-    for (const filter of DISPLAY_FILTERS) {
-      expect(declared).toContain(SHADER_INTERFACE.fragmentEntryPoints[filter])
-    }
-  })
-
-  it('binds every resource where the bind group puts it', () => {
+  it('binds only slots the shared bind group provides, each under its own name', () => {
     const groups = reflect.getBindGroups()
     expect(groups.length, 'shader should declare exactly one bind group').toBe(1)
-
-    const group = groups[0]
-    expect(group[SHADER_INTERFACE.samplerBinding]?.name).toBe('frameSampler')
-    expect(group[SHADER_INTERFACE.textureBinding]?.name).toBe('frameTexture')
-    expect(group[SHADER_INTERFACE.crtParamsBinding]?.name).toBe('crt')
-    expect(group[SHADER_INTERFACE.smoothSamplerBinding]?.name).toBe('smoothSampler')
+    groups[0].forEach((variable, binding) => {
+      if (variable) expect(variable.name, `binding ${binding}`).toBe(BINDING_NAMES[binding])
+    })
   })
+})
 
-  it("sizes the CRT uniform buffer exactly as large as the shader's struct", () => {
-    const crt = reflect.uniforms.find((u) => u.binding === SHADER_INTERFACE.crtParamsBinding)
+describe("the CRT shader's uniform", () => {
+  const crt = new WgslReflect(FILTER_SHADERS.crt).uniforms.find(
+    (u) => u.binding === SHADER_INTERFACE.crtParamsBinding,
+  )
+
+  it('is exactly as large as the buffer the renderer allocates', () => {
     expect(crt?.size).toBe(CRT_PARAMS_FLOATS * 4)
   })
 
   // The drift this file exists to catch: reorder a field in the WGSL struct
   // and forget `CRT_PARAMS_LAYOUT`, and scanlines would quietly start
   // reading the curvature flag.
-  it("packs each CRT field at the struct member's own offset", () => {
-    const crt = reflect.uniforms.find((u) => u.binding === SHADER_INTERFACE.crtParamsBinding)
+  it("packs each field at the struct member's own offset", () => {
     const members = crt?.members ?? []
     expect(members.map((m) => m.name).sort()).toEqual(Object.keys(CRT_PARAMS_LAYOUT).sort())
     for (const member of members) {

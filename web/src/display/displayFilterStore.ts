@@ -25,7 +25,8 @@ export function loadDisplayFilter(): DisplayFilterSettings {
 }
 
 /** A failure here costs the setting surviving a reload, never the running
- * session -- the caller's state, and the Worker, already have the new value. */
+ * session -- the caller's state, and through it the Worker, get the new
+ * value regardless. */
 export function saveDisplayFilter(settings: DisplayFilterSettings): void {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(settings))

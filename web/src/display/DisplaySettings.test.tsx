@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { DEFAULT_DISPLAY_FILTER, type DisplayFilterSettings } from '../emulator/displayFilter'
+import { DEFAULT_DISPLAY_FILTER, type DisplayFilterKind, type DisplayFilterSettings } from '../emulator/displayFilter'
 import { DisplaySettings } from './DisplaySettings'
 import { loadDisplayFilter } from './displayFilterStore'
 import { useDisplayFilter } from './useDisplayFilter'
@@ -16,16 +16,20 @@ const checked = (el: HTMLElement) => (el as HTMLInputElement).checked
 const disabled = (el: HTMLElement) => el.matches(':disabled')
 
 const CRT_ALL_ON: DisplayFilterSettings = { ...DEFAULT_DISPLAY_FILTER, filter: 'crt' }
+/** What the Worker reports on WebGPU with every shader compiled. */
+const ALL: DisplayFilterKind[] = ['none', 'crt']
+/** What it reports on Canvas 2D, or when the CRT shader didn't compile. */
+const PLAIN_ONLY: DisplayFilterKind[] = ['none']
 
 describe('DisplaySettings', () => {
   it('offers Off and CRT, with the current filter selected', () => {
-    render(<DisplaySettings settings={DEFAULT_DISPLAY_FILTER} onChange={vi.fn()} renderer="webgpu" />)
+    render(<DisplaySettings settings={DEFAULT_DISPLAY_FILTER} onChange={vi.fn()} filters={ALL} />)
     expect(checked(screen.getByRole('radio', { name: 'Off' }))).toBe(true)
     expect(checked(screen.getByRole('radio', { name: 'CRT' }))).toBe(false)
   })
 
   it("hides CRT's options while the filter is off", () => {
-    render(<DisplaySettings settings={DEFAULT_DISPLAY_FILTER} onChange={vi.fn()} renderer="webgpu" />)
+    render(<DisplaySettings settings={DEFAULT_DISPLAY_FILTER} onChange={vi.fn()} filters={ALL} />)
     expect(screen.queryByRole('checkbox')).toBeNull()
   })
 
@@ -35,7 +39,7 @@ describe('DisplaySettings', () => {
       filter: 'none',
       crt: { scanlines: false, curvature: true, chromaticAberration: false, vignette: true },
     }
-    render(<DisplaySettings settings={settings} onChange={onChange} renderer="webgpu" />)
+    render(<DisplaySettings settings={settings} onChange={onChange} filters={ALL} />)
     fireEvent.click(screen.getByRole('radio', { name: 'CRT' }))
     expect(onChange).toHaveBeenCalledWith({ ...settings, filter: 'crt' })
   })
@@ -45,7 +49,7 @@ describe('DisplaySettings', () => {
       filter: 'crt',
       crt: { scanlines: true, curvature: false, chromaticAberration: true, vignette: false },
     }
-    render(<DisplaySettings settings={settings} onChange={vi.fn()} renderer="webgpu" />)
+    render(<DisplaySettings settings={settings} onChange={vi.fn()} filters={ALL} />)
     expect(checked(screen.getByRole('checkbox', { name: 'Scanlines' }))).toBe(true)
     expect(checked(screen.getByRole('checkbox', { name: 'Screen curvature' }))).toBe(false)
     expect(checked(screen.getByRole('checkbox', { name: 'Chromatic aberration' }))).toBe(true)
@@ -54,26 +58,33 @@ describe('DisplaySettings', () => {
 
   it('toggling one option changes that option and nothing else', () => {
     const onChange = vi.fn()
-    render(<DisplaySettings settings={CRT_ALL_ON} onChange={onChange} renderer="webgpu" />)
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={onChange} filters={ALL} />)
     fireEvent.click(screen.getByRole('checkbox', { name: 'Chromatic aberration' }))
     expect(onChange).toHaveBeenCalledWith({ ...CRT_ALL_ON, crt: { ...CRT_ALL_ON.crt, chromaticAberration: false } })
   })
 
-  it('is disabled until the emulator reports which renderer it is on', () => {
-    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} renderer={null} />)
+  it('is disabled, with no note, until the emulator reports which filters it can apply', () => {
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} filters={null} />)
     expect(disabled(screen.getByRole('radio', { name: 'CRT' }))).toBe(true)
     expect(disabled(screen.getByRole('checkbox', { name: 'Scanlines' }))).toBe(true)
+    expect(screen.queryByText(/not available/i)).toBeNull()
   })
 
-  it("is disabled, and says so, on the renderer that can't run filters", () => {
-    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} renderer="canvas2d" />)
+  it('disables a filter the emulator cannot apply, and names it', () => {
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} filters={PLAIN_ONLY} />)
     expect(disabled(screen.getByRole('radio', { name: 'CRT' }))).toBe(true)
     expect(disabled(screen.getByRole('checkbox', { name: 'Vignette' }))).toBe(true)
-    screen.getByText(/not available in this browser/i)
+    expect(disabled(screen.getByRole('radio', { name: 'Off' }))).toBe(false)
+    screen.getByText('Not available in this browser: CRT.')
   })
 
-  it("never names a renderer backend (ENG-93)", () => {
-    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} renderer="canvas2d" />)
+  it('says nothing about availability when everything is available', () => {
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} filters={ALL} />)
+    expect(screen.queryByText(/not available/i)).toBeNull()
+  })
+
+  it('never names a renderer backend (ENG-93)', () => {
+    render(<DisplaySettings settings={CRT_ALL_ON} onChange={vi.fn()} filters={PLAIN_ONLY} />)
     expect(document.body.textContent).not.toMatch(/webgpu|canvas ?2d/i)
   })
 })
@@ -98,6 +109,18 @@ describe('useDisplayFilter', () => {
     const { worker, postMessage } = fakeWorker()
     renderHook(() => useDisplayFilter(worker))
     expect(postMessage).toHaveBeenCalledWith({ type: 'set-display-filter', settings: DEFAULT_DISPLAY_FILTER })
+  })
+
+  // How `EmulatorScreen` actually uses it: `worker` is null on the first
+  // render and only set once the session exists. A stored setting has to
+  // reach the Worker then, with nobody touching the controls.
+  it('sends a restored setting to a Worker that only appears after mount', () => {
+    localStorage.setItem('emu.display.filter', JSON.stringify(CRT_ALL_ON))
+    const { worker, postMessage } = fakeWorker()
+    const { rerender } = renderHook(({ w }) => useDisplayFilter(w), { initialProps: { w: null as Worker | null } })
+    expect(postMessage).not.toHaveBeenCalled()
+    rerender({ w: worker })
+    expect(postMessage).toHaveBeenCalledWith({ type: 'set-display-filter', settings: CRT_ALL_ON })
   })
 
   it('a change is both sent to the Worker and persisted', () => {

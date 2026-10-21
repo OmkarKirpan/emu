@@ -6,22 +6,25 @@
  * either way.
  *
  * Global-free on purpose, like `protocol.ts`: the Worker (`renderer.ts`)
- * and the main thread (`display/DisplaySettings.tsx`) both import it, and
- * `tsconfig.worker.json`'s `WebWorker` lib and `tsconfig.app.json`'s `DOM`
- * lib can't both be active in one file. Persistence lives in
- * `display/displayFilterStore.ts`, on the `localStorage` side of that line.
+ * and the main thread (`display/DisplaySettings.tsx`) both import it, so it
+ * is type-checked in both TypeScript projects, and `tsconfig.worker.json`'s
+ * `WebWorker` lib and `tsconfig.app.json`'s `DOM` lib can't both be active in
+ * one project. Persistence lives in `display/displayFilterStore.ts`, on the
+ * `localStorage` side of that line.
  */
 
-/** Every filter kind, `'none'` included. Adding a filter means a new entry
- * here, a fragment entry point in `shader.ts` (its `SHADER_INTERFACE` is
- * typed against this list, so forgetting one is a type error), and a label
- * in `DisplaySettings.tsx`. */
+/** Every filter kind, `'none'` included. A new entry here is a type error
+ * until it has a shader and an entry point (`shader.ts`) and a label and an
+ * options panel (`DisplaySettings.tsx`). Its options are not prompted for:
+ * a settings field below, its sanitizing, and its uniform upload in
+ * `renderer.ts`'s `setDisplay` are written by hand, following CRT's. */
 export const DISPLAY_FILTERS = ['none', 'crt'] as const
 export type DisplayFilterKind = (typeof DISPLAY_FILTERS)[number]
 
 /** The CRT filter's four independently switchable effects. Booleans for
- * now; `shader.ts` already treats each as a 0..1 strength, so turning one
- * into a slider later changes this type and the UI, not the shader. */
+ * now; the WGSL already treats each as a 0..1 strength, so turning one into
+ * a slider later changes this type, its sanitizing, `packCrtParams` and the
+ * UI, but not the shader. */
 export interface CrtOptions {
   scanlines: boolean
   curvature: boolean
@@ -44,6 +47,10 @@ export const DEFAULT_DISPLAY_FILTER: DisplayFilterSettings = {
   crt: { scanlines: true, curvature: true, chromaticAberration: true, vignette: true },
 }
 
+/** Every CRT option, in display order. Read off the defaults, which the
+ * compiler holds to exactly `CrtOptions`'s fields. */
+export const CRT_OPTIONS = Object.keys(DEFAULT_DISPLAY_FILTER.crt) as (keyof CrtOptions)[]
+
 /**
  * Folds anything -- a stored value from an older or newer build, a hand-
  * edited one, garbage -- into valid settings, field by field. An unknown
@@ -51,10 +58,9 @@ export const DEFAULT_DISPLAY_FILTER: DisplayFilterSettings = {
  * thrown away with it, and each CRT option falls back independently.
  */
 export function sanitizeDisplayFilter(value: unknown): DisplayFilterSettings {
-  const defaults = DEFAULT_DISPLAY_FILTER
   const raw = value && typeof value === 'object' ? (value as Partial<Record<keyof DisplayFilterSettings, unknown>>) : {}
   const crt = raw.crt && typeof raw.crt === 'object' ? (raw.crt as Partial<Record<keyof CrtOptions, unknown>>) : {}
-  const flag = (key: keyof CrtOptions) => (typeof crt[key] === 'boolean' ? crt[key] : defaults.crt[key])
+  const flag = (key: keyof CrtOptions) => (typeof crt[key] === 'boolean' ? crt[key] : DEFAULT_DISPLAY_FILTER.crt[key])
   return {
     filter: DISPLAY_FILTERS.includes(raw.filter as DisplayFilterKind) ? (raw.filter as DisplayFilterKind) : 'none',
     crt: {
@@ -81,9 +87,9 @@ const FALLBACK_SCALE = 4
  * invocation per physical pixel, nothing for the browser to rescale, and so
  * no moire between the scanlines and a resampling grid.
  *
- * The height comes from the framebuffer's aspect rather than being measured
- * separately, so the canvas's own aspect (and the CSS height derived from
- * it) can't drift by a rounding step on every resize.
+ * The height is derived from the width at the framebuffer's 256:240 -- the
+ * same ratio `App.css` gives the canvas's box -- so only the width needs
+ * measuring.
  */
 export function filteredCanvasSize(
   displayWidth: number | null,

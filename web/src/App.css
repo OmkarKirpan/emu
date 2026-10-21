@@ -273,9 +273,10 @@
 
 /* A filtered picture is rendered at the canvas's on-screen size in device
    pixels (`displayFilter.ts`), so there is normally nothing left to scale.
-   When there briefly is -- mid-resize, before the Worker has caught up --
-   nearest-neighbour would chop the scanlines into uneven bands; smooth
-   scaling just softens them for a frame. */
+   When there is -- mid-resize before the Worker catches up, before the
+   first measurement arrives, or on Safari after a pixel-ratio-only change
+   it can't observe (`useDisplayWidth.ts`) -- nearest-neighbour would chop
+   the scanlines into uneven bands, where smooth scaling only softens them. */
 .screen-canvas:not([data-filter='none']) {
   image-rendering: auto;
 }
@@ -909,7 +910,9 @@
     cursor: inherit;
   }
 
-  fieldset:disabled label {
+  /* `:has`, not `fieldset:disabled`: a radio for a filter the emulator
+     can't apply is disabled on its own, beside one that isn't. */
+  label:has(input:disabled) {
     color: var(--color-muted);
     cursor: default;
   }

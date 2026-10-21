@@ -1,26 +1,61 @@
-import { DISPLAY_FILTERS, type CrtOptions, type DisplayFilterKind, type DisplayFilterSettings } from '../emulator/displayFilter'
-import type { RendererKind } from '../emulator/protocol'
+import type { ComponentType } from 'react'
+import {
+  CRT_OPTIONS,
+  DISPLAY_FILTERS,
+  type CrtOptions,
+  type DisplayFilterKind,
+  type DisplayFilterSettings,
+} from '../emulator/displayFilter'
 
 const FILTER_LABELS: Record<DisplayFilterKind, string> = {
   none: 'Off',
   crt: 'CRT',
 }
 
-/** In the order they're listed. Keyed by `CrtOptions`, so a new option
- * without a label here is a type error. */
 const CRT_OPTION_LABELS: Record<keyof CrtOptions, string> = {
   scanlines: 'Scanlines',
   curvature: 'Screen curvature',
   chromaticAberration: 'Chromatic aberration',
   vignette: 'Vignette',
 }
-const CRT_OPTIONS = Object.keys(CRT_OPTION_LABELS) as (keyof CrtOptions)[]
+
+interface OptionsPanelProps {
+  settings: DisplayFilterSettings
+  onChange: (next: DisplayFilterSettings) => void
+  disabled: boolean
+}
+
+function CrtOptionsPanel({ settings, onChange, disabled }: OptionsPanelProps) {
+  return (
+    <fieldset className="display-options" disabled={disabled}>
+      <legend>CRT</legend>
+      {CRT_OPTIONS.map((option) => (
+        <label key={option}>
+          <input
+            type="checkbox"
+            checked={settings.crt[option]}
+            onChange={(event) => onChange({ ...settings, crt: { ...settings.crt, [option]: event.target.checked } })}
+          />
+          {CRT_OPTION_LABELS[option]}
+        </label>
+      ))}
+    </fieldset>
+  )
+}
+
+/** Each filter's own options, shown while it is selected. Keyed by every
+ * filter kind, so a new filter has to say whether it has any. */
+const OPTIONS_PANELS: Record<DisplayFilterKind, ComponentType<OptionsPanelProps> | null> = {
+  none: null,
+  crt: CrtOptionsPanel,
+}
 
 interface DisplaySettingsProps {
   settings: DisplayFilterSettings
   onChange: (next: DisplayFilterSettings) => void
-  /** Which renderer the emulator stood up, or `null` until it says. */
-  renderer: RendererKind | null
+  /** The filters the emulator reported it can apply (`FrameRenderer.
+   * filters`), or `null` until it has said. */
+  filters: readonly DisplayFilterKind[] | null
 }
 
 /**
@@ -33,18 +68,22 @@ interface DisplaySettingsProps {
  * the panel -- but only below the radio that was just clicked, so nothing
  * moves under the pointer.
  *
- * Filters only exist on the WebGPU renderer (see `renderer.ts`'s Canvas 2D
- * `setDisplay`), so on Canvas 2D the panel stays visible but disabled, with
- * a line saying why. That line names no backend: ENG-93 keeps renderer
- * names out of the UI except behind `?debug`.
+ * Everything is disabled, with no explanation, until the emulator reports
+ * which filters it can apply -- a moment during boot. After that, a filter
+ * it can't apply (all of them on Canvas 2D; one whose shader didn't compile
+ * on this GPU) stays visible but disabled, with a line naming it. That line
+ * names no backend: ENG-93 keeps renderer names out of the UI except behind
+ * `?debug`.
  */
-export function DisplaySettings({ settings, onChange, renderer }: DisplaySettingsProps) {
-  const enabled = renderer === 'webgpu'
+export function DisplaySettings({ settings, onChange, filters }: DisplaySettingsProps) {
+  const available = (filter: DisplayFilterKind) => filters?.includes(filter) ?? false
+  const unavailable = filters ? DISPLAY_FILTERS.filter((filter) => !available(filter)) : []
+  const OptionsPanel = OPTIONS_PANELS[settings.filter]
 
   return (
     <section className="display-settings" aria-label="Display">
       <h2>Display</h2>
-      <fieldset className="display-filter" disabled={!enabled}>
+      <fieldset className="display-filter">
         <legend>Filter</legend>
         {DISPLAY_FILTERS.map((filter) => (
           <label key={filter}>
@@ -53,28 +92,21 @@ export function DisplaySettings({ settings, onChange, renderer }: DisplaySetting
               name="display-filter"
               value={filter}
               checked={settings.filter === filter}
+              disabled={!available(filter)}
               onChange={() => onChange({ ...settings, filter })}
             />
             {FILTER_LABELS[filter]}
           </label>
         ))}
       </fieldset>
-      {settings.filter === 'crt' && (
-        <fieldset className="display-options" disabled={!enabled}>
-          <legend>CRT</legend>
-          {CRT_OPTIONS.map((option) => (
-            <label key={option}>
-              <input
-                type="checkbox"
-                checked={settings.crt[option]}
-                onChange={(event) => onChange({ ...settings, crt: { ...settings.crt, [option]: event.target.checked } })}
-              />
-              {CRT_OPTION_LABELS[option]}
-            </label>
-          ))}
-        </fieldset>
+      {OptionsPanel && (
+        <OptionsPanel settings={settings} onChange={onChange} disabled={!available(settings.filter)} />
       )}
-      {renderer === 'canvas2d' && <p className="display-note">Filters are not available in this browser.</p>}
+      {unavailable.length > 0 && (
+        <p className="display-note">
+          Not available in this browser: {unavailable.map((filter) => FILTER_LABELS[filter]).join(', ')}.
+        </p>
+      )}
     </section>
   )
 }

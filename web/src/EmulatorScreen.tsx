@@ -14,6 +14,7 @@ import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
 import { useFirstRun } from './useFirstRun'
 import type { TouchController } from './wasm/touch'
+import type { DisplayFilterKind } from './emulator/displayFilter'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
 import { useRomLoader } from './useRomLoader'
@@ -28,7 +29,7 @@ import demoRomUrl from './roms/sprite_input_demo.nes?url'
 
 type Status =
   | { kind: 'loading' }
-  | { kind: 'running'; renderer: RendererKind }
+  | { kind: 'running'; renderer: RendererKind; filters: DisplayFilterKind[] }
   | { kind: 'error'; message: string }
 
 /** Everything that can only be built once per `<canvas>` element, kept
@@ -376,7 +377,7 @@ export function EmulatorScreen() {
       } else if (message.type === 'status') {
         setStatus(
           message.status === 'running'
-            ? { kind: 'running', renderer: message.renderer }
+            ? { kind: 'running', renderer: message.renderer, filters: message.filters }
             : { kind: 'error', message: message.message },
         )
       }
@@ -454,7 +455,7 @@ export function EmulatorScreen() {
     }
   }, [])
 
-  const renderer = status.kind === 'running' ? status.renderer : null
+  const filters = status.kind === 'running' ? status.filters : null
 
   return (
     <>
@@ -545,10 +546,11 @@ export function EmulatorScreen() {
             height={FRAMEBUFFER_HEIGHT}
             className="screen-canvas"
             aria-label="NES output"
-            // The filter actually in effect, not just the one selected:
-            // Canvas 2D can't run filters, and its 256x240 canvas still needs
-            // the `pixelated` upscale this attribute switches off (`App.css`).
-            data-filter={renderer === 'webgpu' ? displayFilter.filter : 'none'}
+            // The filter actually in effect, not just the one selected: one
+            // the renderer can't apply (any, on Canvas 2D) leaves a 256x240
+            // canvas that still needs the `pixelated` upscale this attribute
+            // switches off (`App.css`).
+            data-filter={filters?.includes(displayFilter.filter) ? displayFilter.filter : 'none'}
           />
           {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
@@ -602,9 +604,9 @@ export function EmulatorScreen() {
           )}
         </div>
 
-        {/* Next to audio: both are about how the game comes out, where
+        {/* Below audio: both are about how the game comes out, where
             everything below is about playing it or keeping it. */}
-        <DisplaySettings settings={displayFilter} onChange={setDisplayFilter} renderer={renderer} />
+        <DisplaySettings settings={displayFilter} onChange={setDisplayFilter} filters={filters} />
 
         {/* ENG-93: the control map's other home. The footer (`App.tsx`)
             still states it once, but a footer nobody scrolls to is not

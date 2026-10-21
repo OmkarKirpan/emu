@@ -1,4 +1,4 @@
-import type { CrtOptions, DisplayFilterKind } from './displayFilter'
+import { CRT_OPTIONS, type CrtOptions, type DisplayFilterKind } from './displayFilter'
 
 /**
  * The WGSL the WebGPU renderer draws with: one oversized triangle covering
@@ -6,21 +6,25 @@ import type { CrtOptions, DisplayFilterKind } from './displayFilter'
  * two triangles for a quad and needs no vertex buffer at all -- the
  * positions come from the vertex index.
  *
- * One fragment entry point per display filter (`displayFilter.ts`), all
- * sharing the vertex stage and one bind group: `fs` is the plain picture,
- * `fs_crt` the CRT filter. `renderer.ts` builds a pipeline per entry point
- * and switches between them, so the unfiltered path is exactly the shader
- * it always was rather than a CRT shader with everything turned off.
+ * One shader module per display filter (`displayFilter.ts`), each the shared
+ * vertex stage plus that filter's fragment stage, all drawing through one
+ * bind group. Separate modules rather than one module with several entry
+ * points, because WGSL compiles per module: a filter whose shader doesn't
+ * compile on some GPU can then be dropped on its own (see `renderer.ts`),
+ * instead of taking the plain picture -- `'none'`, exactly the shader there
+ * was before filters existed -- down with it.
  *
  * Kept in its own module, apart from `renderer.ts`, for two reasons. It's
  * plain text with no WebGPU types in it, so it can be imported by
  * `shader.test.ts` (which runs in the app/`DOM` TypeScript project and
  * under jsdom) without dragging `renderer.ts`'s `GPUDevice`-and-friends
  * into a project that has no `@webgpu/types`. And that test is the only
- * automated check this shader can get: CI has no GPU, so nothing there can
- * ever run it -- parsing it and asserting its interface is the substitute.
+ * automated check these shaders can get: CI has no GPU, so nothing there can
+ * ever run them -- parsing them and asserting their interface is the
+ * substitute.
  */
-export const FRAME_SHADER = /* wgsl */ `
+
+const VERTEX_STAGE = /* wgsl */ `
 struct VertexOutput {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
@@ -43,7 +47,9 @@ fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
   out.uv = vec2f((pos.x + 1.0) * 0.5, (1.0 - pos.y) * 0.5);
   return out;
 }
+`
 
+const PLAIN_FRAGMENT = /* wgsl */ `
 @group(0) @binding(0) var frameSampler: sampler;
 @group(0) @binding(1) var frameTexture: texture_2d<f32>;
 
@@ -51,15 +57,15 @@ fn vs(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
 fn fs(in: VertexOutput) -> @location(0) vec4f {
   return textureSample(frameTexture, frameSampler, in.uv);
 }
+`
 
-// ---- CRT filter --------------------------------------------------------
-//
 // Runs at the canvas's on-screen resolution, not the framebuffer's (see
-// displayFilter.ts's filteredCanvasSize). Each effect is scaled by its own
-// 0..1 strength, so a switched-off effect costs a multiply, not a branch.
-// textureSampleLevel throughout rather than textureSample: the sampling
-// coordinates are warped per pixel, and the explicit level sidesteps
-// WGSL's uniform-control-flow rule for implicit-derivative sampling.
+// displayFilter.ts's filteredCanvasSize). Each effect is weighted by its own
+// 0..1 strength rather than branched around: a switched-off effect still
+// computes, then contributes nothing -- three texture reads and some
+// arithmetic per pixel, which doesn't register.
+const CRT_FRAGMENT = /* wgsl */ `
+@group(0) @binding(1) var frameTexture: texture_2d<f32>;
 
 struct CrtParams {
   outputSize: vec2f,
@@ -87,6 +93,9 @@ fn crtWarp(uv: vec2f) -> vec2f {
 // a linear blend only over the last device pixel or so at its edges.
 // Nearest alone would stair-step once curvature and fringing move the
 // picture by fractions of a pixel; bilinear alone would blur the pixel art.
+// textureSampleLevel, not textureSample: the floor() here makes the
+// coordinates jump at every texel edge, so implicit derivatives would be
+// meaningless -- and there is only one mip level to pick anyway.
 fn sampleSharp(uv: vec2f) -> vec3f {
   let texel = uv * crt.sourceSize;
   let scale = max(crt.outputSize / crt.sourceSize, vec2f(1.0));
@@ -109,8 +118,9 @@ fn fs_crt(in: VertexOutput) -> @location(0) vec4f {
   // Scanlines: each NES row drawn as a beam, brightest along its centre and
   // dimming into the gap above and below it. Divided back up by the
   // average darkening, so the picture gains texture rather than just
-  // getting dimmer. Faded out below ~3 device pixels per row, where there
-  // aren't enough pixels to draw a beam and the pattern would only alias.
+  // getting dimmer. Full depth from 3 device pixels per row, gone by 2,
+  // where there aren't enough pixels to draw a beam and the pattern would
+  // only alias.
   let beam = 0.5 + 0.5 * cos(6.2831853 * (fract(uv.y * crt.sourceSize.y) - 0.5));
   let depth = 0.45 * crt.scanlines * smoothstep(2.0, 3.0, crt.outputSize.y / crt.sourceSize.y);
   color *= (1.0 - depth * (1.0 - beam)) / (1.0 - 0.5 * depth);
@@ -129,12 +139,17 @@ fn fs_crt(in: VertexOutput) -> @location(0) vec4f {
 }
 `
 
+/** Each filter's complete shader module source. Typed against
+ * `DisplayFilterKind`, so a new filter without a shader is a type error. */
+export const FILTER_SHADERS: Record<DisplayFilterKind, string> = {
+  none: VERTEX_STAGE + PLAIN_FRAGMENT,
+  crt: VERTEX_STAGE + CRT_FRAGMENT,
+}
+
 /** Entry point names and binding slots `renderer.ts`'s pipelines and bind
- * group hard-code. Exported so `shader.test.ts` asserts the shader and the
+ * group hard-code. Exported so `shader.test.ts` asserts the shaders and the
  * pipelines agree, rather than the two drifting into a mismatch that only a
- * GPU-having machine would ever notice. `fragmentEntryPoints` is checked
- * against `DISPLAY_FILTERS`, so a new filter kind without a shader is a type
- * error here. */
+ * GPU-having machine would ever notice. */
 export const SHADER_INTERFACE = {
   vertexEntryPoint: 'vs',
   fragmentEntryPoints: { none: 'fs', crt: 'fs_crt' } satisfies Record<DisplayFilterKind, string>,
@@ -145,8 +160,9 @@ export const SHADER_INTERFACE = {
 } as const
 
 /** Float index of each `CrtParams` field in the buffer `packCrtParams`
- * writes. `shader.test.ts` checks every one against the WGSL struct's real
- * member offsets. */
+ * writes. Checked both ways: the `satisfies` makes a `CrtOptions` field
+ * without a slot a type error, and `shader.test.ts` checks every slot
+ * against the WGSL struct's real member offsets. */
 export const CRT_PARAMS_LAYOUT = {
   outputSize: 0,
   sourceSize: 2,
@@ -154,7 +170,7 @@ export const CRT_PARAMS_LAYOUT = {
   curvature: 5,
   chromaticAberration: 6,
   vignette: 7,
-} as const
+} as const satisfies Record<keyof CrtOptions | 'outputSize' | 'sourceSize', number>
 
 export const CRT_PARAMS_FLOATS = 8
 
@@ -172,9 +188,6 @@ export function packCrtParams(
   params[CRT_PARAMS_LAYOUT.outputSize + 1] = outputHeight
   params[CRT_PARAMS_LAYOUT.sourceSize] = sourceWidth
   params[CRT_PARAMS_LAYOUT.sourceSize + 1] = sourceHeight
-  params[CRT_PARAMS_LAYOUT.scanlines] = options.scanlines ? 1 : 0
-  params[CRT_PARAMS_LAYOUT.curvature] = options.curvature ? 1 : 0
-  params[CRT_PARAMS_LAYOUT.chromaticAberration] = options.chromaticAberration ? 1 : 0
-  params[CRT_PARAMS_LAYOUT.vignette] = options.vignette ? 1 : 0
+  for (const option of CRT_OPTIONS) params[CRT_PARAMS_LAYOUT[option]] = options[option] ? 1 : 0
   return params
 }
