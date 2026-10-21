@@ -73,6 +73,32 @@ battery-backed RAM. The battery row is shown, not driven: `sram` is loaded
 on boot and written as cartridge RAM changes, so offering Save/Load buttons
 for it would invite you to fight the mechanism already doing it.
 
+## Display filters
+
+The rail's **Display** panel draws the picture through a filter. There is
+one so far, **CRT**, with four effects that switch on and off independently:
+scanlines, screen curvature, chromatic aberration and vignette. The choice
+is kept in `localStorage`, like volume. A filter only changes how the frame
+is shown: the framebuffer in wasm memory, and so rewind, save states and
+the e2e suite's pixel reads, always see the unfiltered picture.
+
+Filters are shaders on the WebGPU renderer (`src/emulator/shader.ts`, one
+shader module per filter). A filtered canvas is rendered at its on-screen
+size in device pixels rather than at 256x240, because a scanline is thinner
+than one NES row. The main thread measures that size
+(`src/display/useDisplayWidth.ts`), since the Worker's `OffscreenCanvas` has
+no layout. The renderer reports which filters it can apply, and the panel
+offers only those. Canvas 2D has no per-pixel shader stage, so on that
+fallback there are none. A filter whose shader fails to compile on some GPU
+is dropped on its own, with a console error, and the plain picture stays on
+WebGPU.
+
+To add a filter, add an entry to `DISPLAY_FILTERS`
+(`src/emulator/displayFilter.ts`). The type checker then asks for its
+shader, its entry point, its label and its options panel. Its options are
+not prompted for: their settings field, their sanitizing, and their uniform
+upload in `renderer.ts` follow CRT's by hand.
+
 ## Running it
 
 ```bash

@@ -7,6 +7,7 @@
  * comment for why those two libs can't both be active in one project).
  */
 import type { RomLibraryEntry, SaveSlot, SlotSummary } from '../persistence/saveStore'
+import type { DisplayFilterKind, DisplayFilterSettings } from './displayFilter'
 import type { Speed } from './speedControl'
 
 // Re-exported so the Worker and its callers can name a slot, or describe a
@@ -105,6 +106,14 @@ export type EmulatorWorkerInbound =
   | { type: 'list-library' }
   | { type: 'resume-rom'; romHash: string }
   | { type: 'remove-rom'; romHash: string }
+  // Display filters (`displayFilter.ts`). Both are plain "here is the latest
+  // value" messages the Worker keeps and hands to the renderer, so neither
+  // depends on arriving after `'start'` -- and both usually arrive before
+  // it, since `'start'` waits on the demo ROM's fetch. `width` is the
+  // canvas's on-screen width in device pixels, which only the main thread
+  // can measure; a filtered picture is rendered at that size.
+  | { type: 'set-display-filter'; settings: DisplayFilterSettings }
+  | { type: 'set-display-width'; width: number }
 
 /** The ENG-62 ring handshake: forwarded down the transferred worklet port
  * as-is, and posted to the main thread (debug/test hook only, see
@@ -119,7 +128,9 @@ export interface RingHandshake {
 /** Worker -> main thread. */
 export type EmulatorWorkerOutbound =
   | { type: 'video-ready'; sab: SharedArrayBuffer; framebufferPtr: number; width: number; height: number }
-  | { type: 'status'; status: 'running'; renderer: RendererKind }
+  /** `filters`: the display filters this renderer can actually apply --
+   * see `FrameRenderer.filters`. The Display panel offers only these. */
+  | { type: 'status'; status: 'running'; renderer: RendererKind; filters: DisplayFilterKind[] }
   | { type: 'status'; status: 'error'; message: string }
   /** Result of a `'load-rom'`. Deliberately *not* folded into the
    * `'status'` error above: that one means "the emulator never came up"

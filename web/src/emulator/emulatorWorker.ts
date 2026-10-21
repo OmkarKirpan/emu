@@ -19,6 +19,7 @@
 import { NesCore, FRAMEBUFFER_HEIGHT, FRAMEBUFFER_WIDTH } from '../wasm/core'
 import { CONTROL_INT32_LENGTH, READ_INDEX, targetFillSamples, UNDERRUN_COUNT, WRITE_INDEX } from '../audio/ringLayout'
 import { NTSC_FRAME_MS } from '../timing'
+import { DEFAULT_DISPLAY_FILTER, type DisplayFilterSettings } from './displayFilter'
 import { createRenderer, type FrameRenderer } from './renderer'
 import { CAPTURE_INTERVAL_FRAMES, RewindRing } from './rewindRing'
 import { DEFAULT_SPEED, type Speed } from './speedControl'
@@ -180,6 +181,26 @@ let speedMultiplier: Speed = DEFAULT_SPEED
  */
 let renderer: FrameRenderer | null = null
 
+/** The latest display filter and on-screen canvas width the main thread
+ * sent. Kept here, not only handed straight to `renderer`, because both
+ * normally arrive before `start()` has a renderer to give them to -- it
+ * applies them as soon as it does. */
+let displayFilter: DisplayFilterSettings = DEFAULT_DISPLAY_FILTER
+let displayWidth: number | null = null
+
+/** Hands the latest display settings to the renderer, if there is one yet.
+ * A failure is logged and goes no further: a filter is cosmetic, and an
+ * exception escaping here would either reject `start()` before it posts
+ * `'running'` (stuck on "Loading…") or reach `onerror`, which
+ * `EmulatorScreen.tsx` treats as the emulator having died. */
+function applyDisplay(): void {
+  try {
+    renderer?.setDisplay(displayFilter, displayWidth)
+  } catch (err: unknown) {
+    console.error('Could not apply the display filter:', err)
+  }
+}
+
 /**
  * Rewind holds and non-1x speeds mute the worklet by reusing ENG-90's own
  * `paused` bypass (`audioRingProcessor.js`'s `paused` branch) rather than
@@ -305,6 +326,14 @@ self.onmessage = (event: MessageEvent<EmulatorWorkerInbound>) => {
       break
     case 'set-speed':
       setSpeed(message.multiplier)
+      break
+    case 'set-display-filter':
+      displayFilter = message.settings
+      applyDisplay()
+      break
+    case 'set-display-width':
+      displayWidth = message.width
+      applyDisplay()
       break
   }
 }
@@ -452,6 +481,14 @@ async function publishLibrary(): Promise<void> {
   post({ type: 'library', roms })
 }
 
+/** Boots the most recently played library ROM, using `romBytes` as the
+ * demo fallback, and starts rendering and autosave timers. `inputSab`
+ * supplies controller 0's packed button byte in its first Int32 slot.
+ *
+ * Renderer or demo ROM failures post an error status and resolve early;
+ * library read or stored-ROM load failures fall back to the demo. Wasm
+ * initialization and uncaught `adoptRom` errors reject the promise.
+ * Resolves after setup, without waiting for the running session to end. */
 async function start(
   canvas: OffscreenCanvas,
   romBytes: ArrayBuffer,
@@ -490,6 +527,7 @@ async function start(
     post({ type: 'status', status: 'error', message })
     return
   }
+  applyDisplay()
 
   // ENG-89: boot the last-played library entry instead of unconditionally
   // booting the vendored demo. `romBytes` (the demo, fetched by
@@ -546,7 +584,7 @@ async function start(
   await adoptRom(core, resumed && mostRecent ? { name: mostRecent.name } : undefined)
   if (resumed && mostRecent) post({ type: 'boot-rom', name: mostRecent.name })
 
-  post({ type: 'status', status: 'running', renderer: renderer.kind })
+  post({ type: 'status', status: 'running', renderer: renderer.kind, filters: [...renderer.filters] })
   scheduleSramAutosave(core)
   scheduleResumeAutosave(core)
   if (pendingAudioStart) {

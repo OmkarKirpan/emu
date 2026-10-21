@@ -28,6 +28,12 @@ const KEY_MAP: Readonly<Record<string, number>> = {
   ShiftRight: Button.Select,
 }
 
+/** Page controls whose arrow keys change their own value: a radio group's
+ * selection (the Display panel's filter) and a range slider (volume). */
+function usesArrowKeys(target: EventTarget | null): boolean {
+  return target instanceof HTMLInputElement && (target.type === 'radio' || target.type === 'range')
+}
+
 /**
  * Tracks which mapped keys are currently held and exposes the live packed
  * byte `NesCore.setInput` wants for controller 0. Listens on `window`
@@ -37,9 +43,16 @@ const KEY_MAP: Readonly<Record<string, number>> = {
 export class KeyboardController {
   private buttons = 0
 
+  /** Whether the player last moved focus with the keyboard (Tab) rather than
+   * a pointer. See `apply` for what it decides. */
+  private tabbing = false
+
+  /** Starts tracking key and pointer events on `window`; call `dispose`
+   * when the controller is no longer needed. */
   constructor() {
     window.addEventListener('keydown', this.handleKeyDown)
     window.addEventListener('keyup', this.handleKeyUp)
+    window.addEventListener('pointerdown', this.handlePointerDown)
   }
 
   /** Current controller-0 byte, in the exact bit layout `set_input` and
@@ -48,22 +61,39 @@ export class KeyboardController {
     return this.buttons
   }
 
+  /** Stops tracking events without clearing the current button byte. */
   dispose(): void {
     window.removeEventListener('keydown', this.handleKeyDown)
     window.removeEventListener('keyup', this.handleKeyUp)
+    window.removeEventListener('pointerdown', this.handlePointerDown)
   }
 
   // Arrow properties, not methods: `removeEventListener` needs the same
   // function identity `addEventListener` was given.
-  private handleKeyDown = (event: KeyboardEvent): void => this.apply(event, true)
+  /** Treats Tab as keyboard navigation so radios and sliders keep arrows. */
+  private handleKeyDown = (event: KeyboardEvent): void => {
+    if (event.code === 'Tab') this.tabbing = true
+    this.apply(event, true)
+  }
   private handleKeyUp = (event: KeyboardEvent): void => this.apply(event, false)
+  /** Returns arrow keys to the game even if a page control retains focus. */
+  private handlePointerDown = (): void => {
+    this.tabbing = false
+  }
 
-  /** Both directions differ only in which way the bit moves, so the mapped-key
-   * policy (what counts as mapped, and that mapped keys are swallowed) lives
-   * in one place rather than being kept in sync across two handlers. */
+  /** Sets or clears a mapped button bit and prevents the key's default
+   * action. Unmapped keys and arrow presses on a radio or range input after
+   * Tab navigation are left alone; mapped releases always clear the bit. */
   private apply(event: KeyboardEvent, pressed: boolean): void {
     const bit = KEY_MAP[event.code]
     if (bit === undefined) return
+    // A radio group or slider the player tabbed to moves its own value with
+    // the arrows -- for a radio group that is the *only* keyboard way to
+    // change the selection -- so those presses are left to it. Only when
+    // tabbed to: after a click, the control keeps focus and the arrows have
+    // to keep reaching the game. Releases always go through, so a button
+    // held from play can't stick.
+    if (pressed && this.tabbing && event.code.startsWith('Arrow') && usesArrowKeys(event.target)) return
     event.preventDefault() // mapped keys (esp. arrows) shouldn't scroll the page
     this.buttons = pressed ? this.buttons | bit : this.buttons & ~bit
   }
