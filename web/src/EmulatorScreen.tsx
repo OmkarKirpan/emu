@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react'
 import { AudioOutput } from './audio/AudioOutput'
 import { isDebugMode } from './debugMode'
+import { DisplaySettings } from './display/DisplaySettings'
+import { useDisplayFilter } from './display/useDisplayFilter'
+import { useDisplayWidth } from './display/useDisplayWidth'
 import { InputBridge } from './emulator/InputBridge'
 import { initialPauseReasonState, isPaused, pauseReasonReducer } from './emulator/pauseReason'
 import { cycleSpeed, DEFAULT_SPEED, stepSpeed, type Speed } from './emulator/speedControl'
@@ -11,6 +14,7 @@ import { SaveStates } from './SaveStates'
 import { TouchControls } from './TouchControls'
 import { useFirstRun } from './useFirstRun'
 import type { TouchController } from './wasm/touch'
+import type { DisplayFilterKind } from './emulator/displayFilter'
 import type { EmulatorWorkerOutbound, RendererKind } from './emulator/protocol'
 import { RomLoadReadout, RomPicker } from './RomPicker'
 import { useRomLoader } from './useRomLoader'
@@ -25,7 +29,7 @@ import demoRomUrl from './roms/sprite_input_demo.nes?url'
 
 type Status =
   | { kind: 'loading' }
-  | { kind: 'running'; renderer: RendererKind }
+  | { kind: 'running'; renderer: RendererKind; filters: DisplayFilterKind[] }
   | { kind: 'error'; message: string }
 
 /** Everything that can only be built once per `<canvas>` element, kept
@@ -74,12 +78,12 @@ declare global {
  * The M5 (ENG-70) wasm host: transfers its `<canvas>` to a dedicated Worker
  * (`emulator/emulatorWorker.ts`) via `OffscreenCanvas`, which owns the one
  * wasm instance for the whole pipeline -- video, and (once `AudioOutput`
- * enables it) audio -- and paints via `putImageData` on its own ~60Hz timer.
+ * enables it) audio -- and paints through WebGPU or Canvas 2D on its own
+ * ~60Hz timer.
  * No more `requestAnimationFrame`-driven stepping on this thread; see
  * `emulatorWorker.ts`'s `scheduleLoop` for why that's not a loss. Keyboard
  * and Gamepad input still originate here (`InputBridge`), published into
- * shared memory rather than message-passed. Still Canvas 2D only -- a
- * WebGPU renderer (ENG-57) is unimplemented follow-up work.
+ * shared memory rather than message-passed.
  */
 export function EmulatorScreen() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -103,6 +107,10 @@ export function EmulatorScreen() {
    * independent hook calls would each keep (and could disagree on) their
    * own `dismissed` state. */
   const firstRun = useFirstRun(worker)
+  /** The display filter (CRT, or none): restored from the last visit, sent
+   * to the Worker, and reflected on the canvas element below. */
+  const [displayFilter, setDisplayFilter] = useDisplayFilter(worker)
+  useDisplayWidth(canvasRef, worker)
   /** The one emulator session for this canvas, held across remounts --
    * see the effect below for why it cannot simply be rebuilt. */
   const sessionRef = useRef<EmulatorSession | null>(null)
@@ -369,7 +377,7 @@ export function EmulatorScreen() {
       } else if (message.type === 'status') {
         setStatus(
           message.status === 'running'
-            ? { kind: 'running', renderer: message.renderer }
+            ? { kind: 'running', renderer: message.renderer, filters: message.filters }
             : { kind: 'error', message: message.message },
         )
       }
@@ -446,6 +454,8 @@ export function EmulatorScreen() {
       }, 0)
     }
   }, [])
+
+  const filters = status.kind === 'running' ? status.filters : null
 
   return (
     <>
@@ -536,6 +546,11 @@ export function EmulatorScreen() {
             height={FRAMEBUFFER_HEIGHT}
             className="screen-canvas"
             aria-label="NES output"
+            // The filter actually in effect, not just the one selected: one
+            // the renderer can't apply (any, on Canvas 2D) leaves a 256x240
+            // canvas that still needs the `pixelated` upscale this attribute
+            // switches off (`App.css`).
+            data-filter={filters?.includes(displayFilter.filter) ? displayFilter.filter : 'none'}
           />
           {status.kind === 'loading' && <p className="screen-overlay">Loading&#8230;</p>}
           {status.kind === 'error' && <p className="screen-overlay screen-overlay-error">{status.message}</p>}
@@ -588,6 +603,10 @@ export function EmulatorScreen() {
             </p>
           )}
         </div>
+
+        {/* Below audio: both are about how the game comes out, where
+            everything below is about playing it or keeping it. */}
+        <DisplaySettings settings={displayFilter} onChange={setDisplayFilter} filters={filters} />
 
         {/* ENG-93: the control map's other home. The footer (`App.tsx`)
             still states it once, but a footer nobody scrolls to is not
